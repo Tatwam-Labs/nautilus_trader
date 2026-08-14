@@ -1,0 +1,149 @@
+{
+  "header": {
+    "_comment": "RAW frames captured from a live Zerodha WebSocket, recorded BEFORE any decode. Unlike fixtures.json these are ground truth from the venue, not constructed from the published layout. NO DECODED VALUES ARE STORED HERE, DELIBERATELY: a corpus that carries one implementation's reading hands that reading to every fixture derived from it, which re-closes the circle live capture exists to break. Expected values must be derived downstream by an oracle named with its version. STRUCTURE: a record is one WebSocket MESSAGE, not one packet. A message carries several packets and 'shapes' lists them, so the record count is NOT the packet count -- a deriver written against records will get the framing wrong.",
+    "captured_with": "kiteconnect 5.2.1 (transport only, not an oracle)",
+    "subscriptions": {
+      "full": [
+        143610119,
+        143610375,
+        145622279,
+        146628359
+      ]
+    },
+    "captured_tokens": [
+      143610119,
+      143610375,
+      145622279,
+      146628359
+    ],
+    "mode": "full",
+    "stats": {
+      "frames": 505,
+      "heartbeats": 79,
+      "kept": 1,
+      "text_frames": 1,
+      "text_frames_discarded": 0
+    },
+    "heartbeat_intervals_secs": [
+      3.001,
+      3.105,
+      2.894,
+      3.001,
+      3.001,
+      2.999,
+      3.001,
+      2.998,
+      3.023,
+      2.977,
+      3.007,
+      3.003,
+      3.074,
+      2.917,
+      3.003,
+      2.999,
+      2.997,
+      3.003,
+      2.999,
+      3.053,
+      2.946,
+      3.003,
+      3.003,
+      3.005,
+      2.991,
+      3.002,
+      3.024,
+      2.973,
+      3.003,
+      2.997,
+      3.085,
+      2.916,
+      2.999,
+      3.0,
+      3.0,
+      3.0,
+      2.999,
+      3.055,
+      2.981,
+      3.001,
+      2.966,
+      3.0,
+      2.997,
+      3.0,
+      3.029,
+      2.972,
+      2.999,
+      3.002,
+      3.084,
+      2.917,
+      3.002,
+      2.996,
+      3.021,
+      2.979,
+      3.0,
+      3.059,
+      2.942,
+      2.999,
+      3.044,
+      2.969,
+      2.987,
+      3.003,
+      3.026,
+      2.972,
+      3.0,
+      3.005,
+      2.995,
+      3.001,
+      3.0,
+      2.999,
+      3.002,
+      3.057,
+      2.94,
+      3.1,
+      2.918,
+      2.985,
+      2.999,
+      3.0
+    ],
+    "shape_coverage": [
+      {
+        "packet_len": 184,
+        "segment": 7,
+        "count": 4
+      }
+    ]
+  },
+  "records": [
+    {
+      "captured_at": "2026-08-14T10:05:11.863561+00:00",
+      "frame_hex": "000400b8088f5107000bf10800000005000bf5f8000030e6000002b300000287000bd740000c1750000bd22c000bef146a7ee85300001ee900001fc100001e286a7ee85700000001000bf1080001000000000001000bf0a40001000000000015000bf0400005000000000015000befdc0005000000000011000bef78000800000000001d000bf16c0006000000000017000bf1d00008000000000018000bf234000b000000000008000bf298000600000000001b000bf2fc0008000000b8088f5207000bf0a400000002000bf72e00008aa80000084300000765000bdb8c000c1750000bd1c8000bef786a7ee851000060330000636d00005d686a7ee85700000017000bf040000600000000001a000befdc000d000000000024000bef78001c000000000024000bef14000e000000000054000beeb0001b00000000001e000bf16c000900000000001f000bf1d00012000000000034000bf2340008000000000020000bf298000b00000000002a000bf2fc0008000000b808ae050700026e760000000100026f49000000800000000d00000029000271c80002729000026d18000272906a7ee855000000df0000012d000000df6a7ee8550000000100026e76000100000000000100026aca000100000000000100026ab60001000000000001000267a0000100000000000100026750000100000000000100026ea8000100000000000100026f020001000000000001000270f60001000000000003000271000002000000000001000271b40001000000b808bd5f0700254824000000000000000000000000000000000000000000000000000000000000000000251f20000000000000000000000000000000006a7e8bb8000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "frame_len": 746,
+      "shapes": [
+        {
+          "packet_len": 184,
+          "segment": 7
+        },
+        {
+          "packet_len": 184,
+          "segment": 7
+        },
+        {
+          "packet_len": 184,
+          "segment": 7
+        },
+        {
+          "packet_len": 184,
+          "segment": 7
+        }
+      ]
+    }
+  ],
+  "text_records": [
+    {
+      "captured_at": "2026-08-14T10:05:11.613272+00:00",
+      "type": "instruments_meta",
+      "raw": "{\"type\": \"instruments_meta\", \"data\": {\"count\": 114823, \"etag\": \"W/\\\"6a7e998c-9757\\\"\"}}",
+      "parses_as_json": true,
+      "review_before_publication": false
+    }
+  ]
+}
