@@ -257,6 +257,20 @@ pub fn trade_tick_from(
         .or_else(|| venue_time_to_unix_nanos(tick.exchange_timestamp))
         .unwrap_or(ts_init);
 
+    // ⚠️ THE `{token}-{cumulative_volume}` SHAPE IS LOAD-BEARING. DO NOT "SIMPLIFY" IT.
+    //
+    // Determinism across a replay is the stated reason, but it is not the only one. Because the ID
+    // carries the running total and `size` is the delta between consecutive prints, **the two
+    // verify each other**: for successive trades on one instrument, the difference between the ID
+    // suffixes must equal the later trade's size.
+    //
+    // That is a free consistency check on the delta arithmetic, and it fired on live MCX data on
+    // 2026-08-14 — IDs `…33223`, `…33229`, `…33232` against sizes 1, 6, 3, where 33229−33223 = 6
+    // and 33232−33229 = 3. Had the differencing been wrong, the sizes and the IDs would have
+    // disagreed visibly.
+    //
+    // Replacing this with a counter, a UUID or a clock keeps every test in this file green and
+    // **silently removes the only cross-check the trade path has**.
     let trade_id =
         TradeId::new_checked(format!("{}-{}", tick.instrument_token, cumulative_volume))?;
 
