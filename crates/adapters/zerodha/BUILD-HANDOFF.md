@@ -13,9 +13,18 @@
 16/17 tests passing.** Details in §4. Rust builds remain prohibited on the Mac mini (16 GB, runs the
 live/paper stack), so this file is still the route for every build.
 
-**Fixes made since that build have NOT been compiled** — the decoder ordering fix (§4b) and the six
-conventions-hook fixes were authored on the mini and are reasoned, not verified. The next run should
-expect **17/17**; if it does not get that, the fix is wrong, not the test.
+**Second build, `e8e65a4b61`, 2026-08-14 — everything authored without a compiler now VERIFIED:**
+
+| Check | Result |
+|---|---|
+| `cargo test -p nautilus-zerodha` — decoder | **17/17** (the ordering fix is correct) |
+| `credential` module — first ever compile | **13/13** |
+| `cargo clippy --features python --all-targets` | **exit 0, 0 warnings** |
+| `check_nautilus_conventions.sh` | **exit 0** |
+| `pytest test_public_exports.py` | **121 passed** |
+| Registration surface #11 | **closed** — stub generated and committed |
+
+**Anything committed after `e8e65a4b61` is again unverified** unless this table says otherwise.
 
 > ## 🛑 A GREEN BUILD IS NOT EVIDENCE THIS DECODER MATCHES ZERODHA
 >
@@ -108,9 +117,16 @@ MacBook Pro build produced a **32 GB `target/`** (the aborted mini attempt had r
 it was killed, which understated it). **40 GB+ free is the right guidance and should not be
 relaxed.**
 
-**Timing, measured:** 8m17s on an M2 Pro — but that is a **floor**, because `cargo check` and
-`clippy` had already warmed the dependency graph. **A true cold-build figure still does not exist.**
-If you happen to build from an empty `target/`, report it; that is the number nobody has.
+**Timings, measured on an M2 Pro — none of them is a cold build:**
+
+| Run | Wall | What it actually measures |
+|---|---|---|
+| First full build @ `84d2bcb079` | 8m 17s | **Floor, not cold** — `cargo check`/`clippy` had pre-warmed the graph |
+| Rebuild @ `e8e65a4b61` | 2m 16s | Warm `target/`, 5 commits of delta |
+| Rebuild after a venv wipe | 3s | Rust unchanged; only the editable reinstall ran |
+
+**A genuinely cold first build is still unmeasured.** None of the three is that number. If you ever
+build from an empty `target/`, report it — and do not let any of the above be quoted as it.
 
 ## 3. Run the tests that matter
 
@@ -149,6 +165,34 @@ cd python && VIRTUAL_ENV= uv run --no-sync pytest -rfE tests/unit/adapters/test_
 >
 > *(Side effect worth knowing: non-project mode **creates a `.venv`** wherever it is run from.)*
 
+> ### ⚠️ CHECK THIS BEFORE BELIEVING ANY `pytest` RESULT
+>
+> ```bash
+> cd python && VIRTUAL_ENV= uv run --no-sync which pytest    # MUST print .venv/bin/pytest
+> ```
+>
+> **If that prints anything outside `.venv/`, every result after it is meaningless.**
+>
+> The `cd python && VIRTUAL_ENV=` form above fixes *non-project mode*. It does **not** protect
+> against a **second door into the same hazard**, measured on the build host and worth 40 minutes of
+> someone's afternoon:
+>
+> `--no-sync` guarantees the venv is **not repaired**. If `pytest` is missing from it, `uv run` falls
+> through to **whatever `pytest` is on `PATH`** — a system Python, in that case 3.13 — which then
+> cannot import a `cp314` extension and fails with:
+>
+> ```
+> ModuleNotFoundError: No module named 'nautilus_trader._libnautilus.common'
+> ```
+>
+> **That reads as a broken extension. The extension was fine** — all 38 submodules present, every
+> import working under plain `python`. The error names a missing *submodule*, so it points at the
+> build rather than at the environment that could not load it. Recovery was
+> `rm -rf python/.venv && make sync`, then 121 passed.
+>
+> Same class as the non-project hazard, arriving by a different door: **a command reporting on an
+> environment other than the one you meant.**
+
 ## 4. Where the first errors were predicted — and what actually happened
 
 > ### ✅ First compile: **0 errors, 0 warnings**, at `84d2bcb079` on an M2 Pro. **All six predictions below were wrong.**
@@ -183,21 +227,23 @@ result, not a code defect — say which, so it is not reported as "the adapter d
 
 ### 4a. What the first build actually found
 
-Four defects, none of them compile failures. All four are fixed on this branch **except** #4, which
-needs a build host:
+Four defects, none of them compile failures. **All four are now closed**, #4 by the second build:
 
 | # | Defect | Status |
 |---|---|---|
 | 1 | `parse_packet` read two fields *before* validating the layout, so any packet under 8 bytes reported `Truncated` instead of `UnknownPacketLength` — the function contradicted its own doc comment | **Fixed.** Length now resolves to a `PacketLayout` before any read; see §4b |
 | 2 | Conventions hook: 6 violations (3 `, got` phrasing + 3 `std::fmt` in `credential.rs`) | **Fixed**, hook exits 0, verified with a negative control |
 | 3 | §0 of this file gave the wrong `uv` constraint | **Fixed** — and it turned out to be the cause of the `uv.lock` churn |
-| 4 | Registration surface #11, the generated `adapters/zerodha/__init__.pyi`, had **never been committed** | **Open** — needs regenerating on a build host |
+| 4 | Registration surface #11, the generated `adapters/zerodha/__init__.pyi`, had **never been committed** | **Fixed** — regenerated at `e8e65a4b61` and committed, along with surface #12 |
 
-**#4 is the one to carry forward.** It is exactly the failure §6 predicts: one of the eleven
-unhooked surfaces was incomplete, the conventions hook reported "registrations unchanged" because
-#11 is outside what it checks, and **only a real build revealed it**. Nothing went red. The
-execution client under ADR-097 touches the same thirteen surfaces and can lose the same file the
-same way.
+**#4 is the one to carry forward even though it is closed.** It is exactly the failure §6 predicts:
+one of the eleven unhooked surfaces was incomplete, the conventions hook reported "registrations
+unchanged" because #11 is outside what it checks, and **only a real build revealed it**. Nothing
+went red. The execution client under ADR-097 touches the same thirteen surfaces and can lose the
+same file the same way.
+
+*(Cross-checked on landing: the generated stub's `__all__` matches the hand-written shim's exactly —
+four symbols, no `*_VENUE` constants — so the multi-venue decision in §5 survived generation.)*
 
 ### 4b. The ordering fix, and what it changed
 
