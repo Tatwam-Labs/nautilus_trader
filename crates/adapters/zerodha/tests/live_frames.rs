@@ -174,7 +174,10 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
             assert_eq!(
                 tick.mode.to_string(),
                 want["mode"].as_str().expect("mode"),
-                "{}", disagreement("mode", hex, &tick.mode.to_string(), &want["mode"].to_string()),
+                // `.as_ref()`, not `.to_string()`: ZerodhaTickMode derives `strum::AsRefStr`, so it
+                // already IS a `&str`. The `want[...]` side stays allocated -- `serde_json::Value`
+                // has no `AsRef<str>`.
+                "{}", disagreement("mode", hex, tick.mode.as_ref(), &want["mode"].to_string()),
             );
 
             let lp = want["last_price"].as_f64().expect("last_price");
