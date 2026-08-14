@@ -397,7 +397,8 @@ sandbox nautilus_sandbox::python::sandbox
 serialization nautilus_serialization::python::serialization
 tardis nautilus_tardis::python::tardis
 testkit nautilus_testkit::python::testkit
-trading nautilus_trading::python::trading"
+trading nautilus_trading::python::trading
+zerodha nautilus_zerodha::python::zerodha"
 
 PYO3_LIB="crates/pyo3/src/lib.rs"
 MODULE_VIOLATIONS=0

@@ -148,6 +148,9 @@ audit-as-crates-io = false
 [policy.nautilus-testkit]
 audit-as-crates-io = false
 
+[policy.nautilus-zerodha]
+audit-as-crates-io = false
+
 [policy.nautilus-trader]
 audit-as-crates-io = false
 

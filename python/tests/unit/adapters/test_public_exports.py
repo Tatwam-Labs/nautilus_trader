@@ -29,7 +29,8 @@ ADAPTERS = sorted(p.name for p in ADAPTERS_ROOT.iterdir() if (p / "__init__.py")
 
 # Venue adapters expose canonical <VENUE>, <VENUE>_CLIENT_ID, <VENUE>_VENUE constants.
 # Data providers (databento, tardis), the blockchain data client, the sandbox exec
-# client, and the multi-venue interactive_brokers broker intentionally omit them.
+# client, and the multi-venue brokers (interactive_brokers, zerodha) intentionally
+# omit them — a multi-venue broker has no single venue to name.
 VENUE_ADAPTERS = {
     "architect_ax": "AX",
     "betfair": "BETFAIR",
@@ -182,5 +183,6 @@ def test_known_adapter_set_is_complete():
         "polymarket",
         "sandbox",
         "tardis",
+        "zerodha",
     }
     assert set(ADAPTERS) == expected
