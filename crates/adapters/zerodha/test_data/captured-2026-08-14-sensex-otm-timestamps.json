@@ -1,0 +1,58 @@
+{
+  "header": {
+    "_comment": "RAW frames captured from a live Zerodha WebSocket, recorded BEFORE any decode. Unlike fixtures.json these are ground truth from the venue, not constructed from the published layout. NO DECODED VALUES ARE STORED HERE, DELIBERATELY: a corpus that carries one implementation's reading hands that reading to every fixture derived from it, which re-closes the circle live capture exists to break. Expected values must be derived downstream by an oracle named with its version. STRUCTURE: a record is one WebSocket MESSAGE, not one packet. A message carries several packets and 'shapes' lists them, so the record count is NOT the packet count -- a deriver written against records will get the framing wrong.",
+    "captured_with": "kiteconnect 5.2.1 (transport only, not an oracle)",
+    "subscriptions": {
+      "full": [
+        218986757,
+        219005445,
+        218998021,
+        218974213
+      ]
+    },
+    "captured_tokens": [
+      218974213,
+      218986757,
+      218998021,
+      219005445
+    ],
+    "mode": "full",
+    "stats": {
+      "frames": 952,
+      "heartbeats": 100,
+      "kept": 1
+    },
+    "shape_coverage": [
+      {
+        "packet_len": 184,
+        "segment": 5,
+        "count": 4
+      }
+    ]
+  },
+  "records": [
+    {
+      "captured_at": "2026-08-14T08:13:20.705630+00:00",
+      "frame_hex": "000400b80d0d7905000003c5000000280000047f000744dc00014d9800005898000005af000005af0000034d000005a06a7ece1b0000e5c40001230400006d106a7ece2000000690000003c0000e000000000a8c000003bb000f000000000460000003b600080000000003c0000003b10006000000000320000003ac0003000000000384000003cf0002000000000668000003d400070000000002d0000003d90009000000000384000003de000a000000000424000003e30006000000b80d0dc205000007bc000001cc00000882001105580000f76c000047e000000af000000af00000064a00000c8f6a7ece18000195c800023af000013e486a7ece2000000708000007b7000c000000000280000007b200070000000003ac000007ad0008000000000258000007a800040000000002d0000007a30005000000000140000007d000040000000001a4000007d500040000000004c4000007da00060000000000b4000007df0002000000000104000007e40004000000b80d0da505000003e300000014000004b90003a0200000f8e80000300c000004ce00000591000003700000045b6a7ece17000079b80000990c000017c06a7ece2000000424000003de00020000000002f8000003d900030000000004ec000003d40005000000000064000003cf0001000000000118000003ca000300000000012c000003e80003000000000bb8000003ed000e000000000618000003f200090000000001f4000003f70005000000000654000003fc000a000000b80d0d4805000005c3000000a0000007de0007e4c80000e2a400005d2000000460000009dd00000460000006b86a7ece200000c6480000dc64000083f46a7ece2000000014000005be0001000000000190000005b400020000000002a8000005af0004000000000514000005aa0007000000000154000005a50004000000000640000005c80006000000000668000005cd00060000000006e0000005d200060000000001cc000005d7000500000000026c000005dc00050000",
+      "frame_len": 746,
+      "shapes": [
+        {
+          "packet_len": 184,
+          "segment": 5
+        },
+        {
+          "packet_len": 184,
+          "segment": 5
+        },
+        {
+          "packet_len": 184,
+          "segment": 5
+        },
+        {
+          "packet_len": 184,
+          "segment": 5
+        }
+      ]
+    }
+  ]
+}
