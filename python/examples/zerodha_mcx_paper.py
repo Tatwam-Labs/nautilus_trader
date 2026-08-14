@@ -70,11 +70,10 @@ from nautilus_trader.adapters.zerodha import (
     ZerodhaDataClientFactory,
 )
 from nautilus_trader.common import Environment
-from nautilus_trader.live import LiveNode
+from nautilus_trader.live import LiveNode, RoutingConfig
 from nautilus_trader.model import (
     AccountId,
     BarType,
-    ClientId,
     Currency,
     InstrumentId,
     Money,
@@ -154,24 +153,21 @@ class MinimalRoundTrip(Strategy):
             f"Subscribing {INSTRUMENT_ID}, venue lot_size={instrument.lot_size!r}, "
             f"using {self.lot} (fallback fired: {not instrument.lot_size})"
         )
-        # ⚠️ client_id is REQUIRED here, and the reason is a real adapter limitation.
+        # No client_id needed: the node registers this client for every Zerodha exchange via
+        # RoutingConfig (see `build_node`), so the engine's venue routing resolves MCX on its own.
         #
-        # The engine resolves a client by client_id first, then by a venue routing map, then
-        # by the default client. Our data client declares `venue() -> NSE` while the adapter
-        # actually serves NINE exchanges (NSE, NFO, MCX, BSE, BFO, CDS, BCD, NCO, NSEIX), so
-        # an MCX subscription finds no client and the engine logs
-        # `no client found for client_id=None, venue=Some("MCX")`. Observed on the
-        # 2026-08-14 paper run.
-        #
-        # Naming the client bypasses venue routing entirely. The proper fix is on the Rust
-        # side -- a multi-venue client should return None from `venue()` -- and is filed.
-        self.subscribe_quotes(INSTRUMENT_ID, client_id=ClientId("ZERODHA"))
+        # It was needed until 2026-08-14. The data client's `venue()` returns NSE while the adapter
+        # serves nine exchanges, so the engine registered routing for NSE alone and an MCX
+        # subscription failed with `no client found for client_id=None, venue=Some("MCX")`. Naming
+        # the client bypassed venue routing entirely -- which worked, and hid the fact that the
+        # builder already had a supported way to declare multiple venues.
+        self.subscribe_quotes(INSTRUMENT_ID)
         # Trades as well as quotes, and they are NOT redundant. A quote is the BOOK (what you could
         # trade at); a trade print is what ACTUALLY TRADED. Validating a simulated fill against the
         # book shows the sandbox picked the right SIDE of the spread; validating it against prints
         # shows the price was one the venue really dealt at. The second is the stronger claim and
         # the book alone cannot make it.
-        self.subscribe_trades(INSTRUMENT_ID, client_id=ClientId("ZERODHA"))
+        self.subscribe_trades(INSTRUMENT_ID)
         # ⭐ THE ARCHITECTURE QUESTION, ASKED AS A MEASUREMENT.
         #
         # This adapter emits no bars, so the sandbox had to run bar_execution=False. That leaves
@@ -186,7 +182,7 @@ class MinimalRoundTrip(Strategy):
         #
         # LAST means aggregated from TRADE ticks (subscribed above), not from the book.
         self.bar_type = BarType.from_str(f"{INSTRUMENT_ID}-1-SECOND-LAST-INTERNAL")
-        self.subscribe_bars(self.bar_type, client_id=ClientId("ZERODHA"))
+        self.subscribe_bars(self.bar_type)
 
     def on_quote(self, tick) -> None:
         self.quotes += 1
@@ -291,6 +287,20 @@ def build_node() -> tuple[LiveNode, MinimalRoundTrip]:
         name="ZERODHA",
         factory=ZerodhaDataClientFactory(),
         config=ZerodhaDataClientConfig(),
+        # ⭐ EVERY exchange this adapter can produce instruments for. The client's `venue()` returns
+        # a single venue (NSE), which is a lie about a nine-exchange adapter; this is the builder's
+        # supported way to say so. Registering the same venue twice for the SAME client is a no-op,
+        # so overlapping with `venue()` is harmless.
+        #
+        # This list is MEASURED from a live instrument dump on 2026-08-14, not copied from the
+        # crate's docs -- the docs list BCD (which had ZERO rows that day) and omit GLOBAL (which
+        # had 12). Counts: NFO 35605, NCO 28067, MCX 16298, BSE 12774, NSE 10037, CDS 7801,
+        # BFO 4256, GLOBAL 12, NSEIX 1. BCD is kept because the crate's enum accepts it and a
+        # zero-row day is not proof it never appears.
+        routing=RoutingConfig(
+            default=False,
+            venues=["NSE", "NFO", "BSE", "BFO", "MCX", "CDS", "BCD", "NCO", "NSEIX", "GLOBAL"],
+        ),
     )
 
     builder = builder.add_simulated_exec_client(
