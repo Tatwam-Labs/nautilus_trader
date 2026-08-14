@@ -7184,7 +7184,7 @@ dependencies = [
  "strum 0.28.0",
  "thiserror 2.0.20",
  "tokio",
- "tokio-tungstenite",
+ "tokio-tungstenite 0.30.0",
  "zeroize",
 ]
 
