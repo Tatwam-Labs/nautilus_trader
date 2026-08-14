@@ -72,6 +72,21 @@ pub enum KiteRequest {
     Mode(ZerodhaTickMode, Vec<u32>),
 }
 
+/// The venue's cap on instrument tokens per WebSocket connection.
+///
+/// Kite Connect allows **3 concurrent connections per `access_token`**, each carrying up to
+/// **3,000 tokens** — 9,000 in total. A Kite app is assigned to a single retail user, so the
+/// `api_key` and the `access_token` share one restriction pool; the same token may legitimately be
+/// used across all three sockets. This crate holds one connection, so 3,000 is the ceiling here.
+///
+/// # Why this is enforced locally rather than left to the venue
+///
+/// Zerodha's failure mode is **silence**, not rejection. A subscription past the cap does not come
+/// back as an error to be handled; the excess simply never streams, and the socket stays healthy
+/// while an instrument the strategy believes it is watching produces nothing. Refusing locally
+/// converts an invisible partial failure into a loud one at the call site.
+pub const MAX_TOKENS_PER_CONNECTION: usize = 3_000;
+
 /// Tracks which tokens are subscribed and in which mode, so the set can be replayed.
 ///
 /// # Why this exists rather than the shared client's `SubscriptionState`
@@ -96,10 +111,39 @@ impl SubscriptionState {
     }
 
     /// Records `tokens` as subscribed in `mode`, overwriting any previous mode for them.
-    pub fn subscribe(&mut self, mode: ZerodhaTickMode, tokens: &[u32]) {
+    ///
+    /// # Only NEW tokens count against the cap
+    ///
+    /// Re-subscribing a token that is already tracked is a **mode change**, not growth. Checking
+    /// `len() + tokens.len()` would refuse a legitimate mode change on a connection sitting at the
+    /// cap — a refusal that looks like the cap working and is simply wrong.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request would take the connection past
+    /// [`MAX_TOKENS_PER_CONNECTION`]. **Nothing is recorded when it does** — the state is left
+    /// untouched rather than partially applied, because a half-applied subscription puts this
+    /// state and the venue's out of step, and the replay after the next reconnect would then
+    /// restore the wrong set.
+    pub fn subscribe(&mut self, mode: ZerodhaTickMode, tokens: &[u32]) -> anyhow::Result<()> {
+        let additions = tokens
+            .iter()
+            .filter(|token| !self.tokens.contains_key(token))
+            .count();
+
+        let total = self.tokens.len() + additions;
+        anyhow::ensure!(
+            total <= MAX_TOKENS_PER_CONNECTION,
+            "subscription would take this connection to {total} tokens, past Zerodha's cap of \
+             {MAX_TOKENS_PER_CONNECTION} per connection; the venue does not reject the excess, it \
+             simply never streams it. Nothing has been subscribed. Kite allows 3 connections per \
+             api_key, so a second connection is the remedy rather than a larger subscription.",
+        );
+
         for &token in tokens {
             self.tokens.insert(token, mode);
         }
+        Ok(())
     }
 
     /// Forgets `tokens`. Unknown tokens are ignored rather than treated as an error, matching the
@@ -209,8 +253,8 @@ mod tests {
     #[rstest]
     fn test_replay_plan_sends_subscribe_and_mode_for_each_group() {
         let mut state = SubscriptionState::new();
-        state.subscribe(ZerodhaTickMode::Full, &[408_065]);
-        state.subscribe(ZerodhaTickMode::Ltp, &[884_737, 128_083_204]);
+        state.subscribe(ZerodhaTickMode::Full, &[408_065]).expect("within the connection cap");
+        state.subscribe(ZerodhaTickMode::Ltp, &[884_737, 128_083_204]).expect("within the connection cap");
 
         // A bare subscribe would restore BOTH groups at `quote`; the mode message is what makes
         // the replay faithful. That is the whole point of the pair.
@@ -233,8 +277,8 @@ mod tests {
     #[rstest]
     fn test_resubscribing_a_token_in_a_new_mode_replaces_the_old_one() {
         let mut state = SubscriptionState::new();
-        state.subscribe(ZerodhaTickMode::Ltp, &[408_065]);
-        state.subscribe(ZerodhaTickMode::Full, &[408_065]);
+        state.subscribe(ZerodhaTickMode::Ltp, &[408_065]).expect("within the connection cap");
+        state.subscribe(ZerodhaTickMode::Full, &[408_065]).expect("within the connection cap");
 
         assert_eq!(state.len(), 1, "the token must not be tracked twice");
         assert_eq!(state.mode_of(408_065), Some(ZerodhaTickMode::Full));
@@ -251,7 +295,7 @@ mod tests {
     #[rstest]
     fn test_unsubscribe_removes_the_token_from_the_replay() {
         let mut state = SubscriptionState::new();
-        state.subscribe(ZerodhaTickMode::Full, &[408_065, 884_737]);
+        state.subscribe(ZerodhaTickMode::Full, &[408_065, 884_737]).expect("within the connection cap");
         state.unsubscribe(&[408_065]);
 
         assert_eq!(state.mode_of(408_065), None);
@@ -265,9 +309,73 @@ mod tests {
     }
 
     #[rstest]
+    fn test_exactly_the_cap_is_allowed() {
+        let mut state = SubscriptionState::new();
+        let tokens: Vec<u32> = (1..=MAX_TOKENS_PER_CONNECTION as u32).collect();
+
+        state
+            .subscribe(ZerodhaTickMode::Full, &tokens)
+            .expect("the cap is inclusive; 3,000 is allowed, 3,001 is not");
+        assert_eq!(state.len(), MAX_TOKENS_PER_CONNECTION);
+    }
+
+    #[rstest]
+    fn test_one_past_the_cap_is_refused_and_records_nothing() {
+        let mut state = SubscriptionState::new();
+        let tokens: Vec<u32> = (1..=MAX_TOKENS_PER_CONNECTION as u32 + 1).collect();
+
+        let err = match state.subscribe(ZerodhaTickMode::Full, &tokens) {
+            Ok(()) => panic!("a subscription past the venue cap must be refused"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(err.contains("never streams it"), "the error should say the excess is SILENT, not rejected; was: {err}");
+        assert!(
+            state.is_empty(),
+            "the refusal must be atomic: a partially-applied subscription leaves this state and \
+             the venue out of step, and the next reconnect replays the wrong set",
+        );
+    }
+
+    // THE DISCRIMINATING TEST FOR THE CAP. A naive `len() + tokens.len()` check refuses this, and
+    // the refusal looks exactly like the cap doing its job. Changing the mode of an
+    // already-subscribed token is not growth.
+    #[rstest]
+    fn test_a_mode_change_at_the_cap_is_not_growth() {
+        let mut state = SubscriptionState::new();
+        let tokens: Vec<u32> = (1..=MAX_TOKENS_PER_CONNECTION as u32).collect();
+        state
+            .subscribe(ZerodhaTickMode::Quote, &tokens)
+            .expect("filling to the cap");
+
+        state
+            .subscribe(ZerodhaTickMode::Full, &tokens)
+            .expect("re-subscribing tracked tokens is a MODE CHANGE and adds nothing");
+
+        assert_eq!(state.len(), MAX_TOKENS_PER_CONNECTION);
+        assert_eq!(state.mode_of(1), Some(ZerodhaTickMode::Full));
+    }
+
+    #[rstest]
+    fn test_unsubscribing_frees_room_under_the_cap() {
+        let mut state = SubscriptionState::new();
+        let tokens: Vec<u32> = (1..=MAX_TOKENS_PER_CONNECTION as u32).collect();
+        state
+            .subscribe(ZerodhaTickMode::Full, &tokens)
+            .expect("filling to the cap");
+
+        state.unsubscribe(&[1]);
+
+        state
+            .subscribe(ZerodhaTickMode::Full, &[999_999])
+            .expect("a slot was freed");
+        assert_eq!(state.len(), MAX_TOKENS_PER_CONNECTION);
+    }
+
+    #[rstest]
     fn test_unsubscribing_an_unknown_token_is_not_an_error() {
         let mut state = SubscriptionState::new();
-        state.subscribe(ZerodhaTickMode::Ltp, &[408_065]);
+        state.subscribe(ZerodhaTickMode::Ltp, &[408_065]).expect("within the connection cap");
         state.unsubscribe(&[999_999]);
 
         assert_eq!(state.len(), 1);
