@@ -151,7 +151,12 @@ fn test_factory_rejects_a_config_of_the_wrong_type() {
         clock,
     );
 
-    let err = result.expect_err("a foreign config type must be rejected, not defaulted");
+    // `expect_err` would require `Box<dyn DataClient>: Debug` so it could print the Ok variant, and
+    // the trait does not carry that bound. This is the `coinbase/src/factories.rs:270-273` form.
+    let err = match result {
+        Ok(_) => panic!("a foreign config type must be rejected, not defaulted"),
+        Err(e) => e,
+    };
     assert!(
         err.to_string().contains("ZerodhaDataClientConfig"),
         "the error should name the expected config type so the caller can fix it; was: {err}",

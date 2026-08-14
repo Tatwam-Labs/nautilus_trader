@@ -15,6 +15,9 @@
 
 //! Python bindings from `pyo3`.
 
+pub mod config;
+pub mod factories;
+
 use nautilus_common::factories::{ClientConfig, DataClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_system::get_global_pyo3_registry;

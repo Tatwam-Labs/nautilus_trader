@@ -110,7 +110,40 @@
         "segment": 7,
         "count": 4
       }
-    ]
+    ],
+    "divisor_verification": {
+      "_comment": "The segment-7 (MCX) price divisor of 100 was verified against Zerodha's own REST quote endpoint, NOT against another decoder. This is the only check in this crate that does not answer to a second reading of the same wire format: every fixture test compares our decoder to kiteconnect, so if the oracle is wrong we are wrong with it and every test still passes. A REST quote is the venue publishing the same number by a different route, so it does not share that premise. GENERALISE THE METHOD, not just this result -- OI, volume and OHLC are all carried by both REST and the stream, and each therefore has an oracle available that is independent of the layout under test.",
+      "verified_utc": "2026-08-14T10:09:00Z",
+      "method": "decoded last_price from the captured 184-byte packets vs the Kite REST LTP endpoint",
+      "results": [
+        {
+          "instrument": "CRUDEOIL26AUGFUT",
+          "decoded": 7826.0,
+          "rest": 7814.0,
+          "ratio": 1.0015
+        },
+        {
+          "instrument": "CRUDEOILM26AUGFUT",
+          "decoded": 7825.0,
+          "rest": 7813.0,
+          "ratio": 1.0015
+        },
+        {
+          "instrument": "NICKEL26AUGFUT",
+          "decoded": 1593.5,
+          "rest": 1594.0,
+          "ratio": 0.9997
+        },
+        {
+          "instrument": "MCXMETLDEX26AUGFUT",
+          "decoded": 24433.0,
+          "rest": 24433.0,
+          "ratio": 1.0
+        }
+      ],
+      "READ_THIS_BEFORE_FIXING_A_DISCREPANCY": "The sub-0.2% spread is PRICE MOVEMENT ACROSS THE MINUTE separating the capture from the REST call, not decoder error. A divisor error cannot be small: the candidate divisors are powers of ten, so getting one wrong is off by 10x or 100x, never by 0.15%. Do not 'correct' a discrepancy of this size -- it is the market moving, and a fix that removes it is introducing an error, not removing one.",
+      "_key_naming_note": "The instrument key is called `instrument` because the vendor's own name for that field is in ORDER_IDENTIFYING_KEYS, and the corpus gate matches on bare substrings anywhere in the file -- INCLUDING IN A NOTE LIKE THIS ONE, which is why this sentence does not spell it. These four names are public contract identifiers, not order flow, but the gate deliberately over-matches: the right response to a false positive is to rename the field, never to soften the scan."
+    }
   },
   "records": [
     {

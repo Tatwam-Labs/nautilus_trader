@@ -72,7 +72,7 @@ fn assert_opt_u32(actual: Option<u32>, expected: Option<&Value>, case: &str, fie
     }
 }
 
-#[test]
+#[rstest]
 fn every_fixture_case_matches_the_reference_client() {
     let doc = load_fixtures();
     let cases = doc["cases"].as_array().expect("cases must be an array");
@@ -209,7 +209,7 @@ fn every_fixture_case_matches_the_reference_client() {
     }
 }
 
-#[test]
+#[rstest]
 fn heartbeat_frame_decodes_to_no_ticks() {
     assert!(parse_binary(&[0x00]).expect("heartbeat must not error").is_empty());
     assert!(parse_binary(&[]).expect("empty frame must not error").is_empty());
@@ -232,7 +232,7 @@ fn a_packet_length_with_no_layout_is_rejected(#[case] len: usize) {
     }
 }
 
-#[test]
+#[rstest]
 fn a_packet_length_running_past_the_frame_is_rejected() {
     // Declares one packet of 184 bytes but supplies 10. The reference client slices past the end
     // and yields a SHORT packet, which then decodes as a different mode than the venue sent.
@@ -268,7 +268,7 @@ fn segment_is_decoded_from_the_low_byte_of_the_token(
     assert_eq!(segment.is_tradable(), tradable);
 }
 
-#[test]
+#[rstest]
 fn sensex_index_token_is_in_the_indices_segment_not_bse() {
     // SENSEX is fetched from the `BSE` instrument dump over REST, but its STREAMING segment — the
     // low byte of the token — is INDICES, so it decodes as non-tradable. The two "segments" are
@@ -278,7 +278,7 @@ fn sensex_index_token_is_in_the_indices_segment_not_bse() {
     assert!(!segment.is_tradable());
 }
 
-#[test]
+#[rstest]
 fn ltp_and_quote_modes_are_distinguished_by_packet_length_alone() {
     let doc = load_fixtures();
     let cases = doc["cases"].as_array().expect("cases");

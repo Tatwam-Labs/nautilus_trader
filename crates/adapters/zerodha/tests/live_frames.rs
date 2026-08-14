@@ -83,6 +83,7 @@ use nautilus_zerodha::{
     common::enums::ZerodhaSegment,
     websocket::parse::parse_packet,
 };
+use rstest::rstest;
 use serde_json::Value;
 
 /// Tolerance for price comparison. Both sides divide an integer by a power of ten in `f64`, so
@@ -144,7 +145,7 @@ fn expect_opt_u32(actual: Option<u32>, expected: Option<&Value>, field: &str, he
     }
 }
 
-#[test]
+#[rstest]
 fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
     let doc = fixtures();
     let records = doc["records"].as_array().expect("records must be an array");
@@ -291,7 +292,7 @@ fn otm_fixtures() -> Value {
     serde_json::from_str(raw).expect("OTM fixtures are not valid JSON")
 }
 
-#[test]
+#[rstest]
 fn decoder_agrees_with_the_vendor_client_on_the_deep_otm_packets() {
     // Same comparison as the main corpus, over the supplementary capture. Kept separate because
     // this corpus is full-mode only: it deliberately does NOT span all five layouts, and merging
@@ -318,7 +319,7 @@ fn decoder_agrees_with_the_vendor_client_on_the_deep_otm_packets() {
     assert_eq!(checked, 4, "expected 4 deep-OTM packets, checked {checked}");
 }
 
-#[test]
+#[rstest]
 fn a_frame_is_never_stamped_before_the_trade_it_reports() {
     // THE ONE ASSERTION HERE THAT DOES NOT REST ON THE ORACLE.
     //
@@ -373,7 +374,7 @@ fn a_frame_is_never_stamped_before_the_trade_it_reports() {
     );
 }
 
-#[test]
+#[rstest]
 fn captured_corpus_carries_no_decoded_values() {
     // The corpus must hold BYTES ONLY. If a decode ever gets stored beside the frames, every
     // fixture derived from it inherits that one reading and the circularity this whole exercise
@@ -393,7 +394,7 @@ fn captured_corpus_carries_no_decoded_values() {
     }
 }
 
-#[test]
+#[rstest]
 fn sensex_index_token_decodes_as_a_real_captured_index_packet() {
     // 265 is fetched from the BSE instrument dump but STREAMS under the INDICES segment. The two
     // meanings of "segment" disagree here, and this is the one instrument where that is visible.

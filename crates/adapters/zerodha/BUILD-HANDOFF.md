@@ -398,6 +398,77 @@ Both were authored without a compiler and are reasoned, not verified:
 3. `cargo clippy -p nautilus-zerodha --features python --all-targets` → the ordering fix introduced
    a new `enum` and a `const fn`; clippy has never seen either.
 
+### 8b-2. The B1–B4 batch — what changed since `6c4b00cc9d`
+
+**None of this has been compiled.** It is one batch on purpose, so you run one verification round
+rather than a dribble of unverified commits.
+
+**Run `--features python` this time.** Your own finding: `required-features = ["python"]` means a
+plain `cargo test` reports a clean 39 and says *nothing* about `tests/python.rs`. That is the
+sibling-standard arrangement, so it is correct — but it is also why the compile error below
+survived a full day of green runs.
+
+```bash
+cargo test -p nautilus-zerodha --features python --all-targets
+cargo clippy -p nautilus-zerodha --features python --all-targets
+```
+
+| # | Change | What should happen |
+|---|---|---|
+| — | `tests/python.rs` `expect_err` → the `coinbase/src/factories.rs:270-273` match form | the file compiles; you verified this form locally |
+| **B4** | `src/python/factories.rs` — `#[new]` + `#[pyo3(name = "name")]` | `test_zerodha_python_factory_extracts_from_registry` **passes** |
+| **B4** | `src/python/config.rs` — `#[new]` + `__repr__` | the config is constructible from Python |
+| **B2** | ten bare `#[test]` → `#[rstest]`, `use rstest::rstest;` added to `live_frames.rs` | **counts must not change**: decoder 17, live_frames 5 |
+| **B3** | dropped `nautilus-live` + `nautilus-network`; `serde_json` → dev-dependencies | builds; **`Cargo.lock` must be unchanged** — both crates are used by other adapters |
+
+**B4 is not cosmetic, and the review under-sold it.** `PyO3ClientRegistry::extract_factory` does
+`factory.getattr("name")?.call0(py)?` (`crates/system/src/python/registry.rs:176-179`). So `name`
+must be a **callable method** — a `#[getter]` returning a `str` would fail on the `call0`. Without
+that block the registry cannot resolve an extractor at all, which means **the entire Python
+registration path was unreachable**, not merely awkward to construct.
+
+**Two things I could not check without a compiler**, so look here first if something fails:
+
+1. `src/python/config.rs` adds a **second** `#[pymethods]` block on a type that already has one
+   from `impl_pyo3_config_getters!`. That is legal only because the workspace enables pyo3's
+   `multiple-pymethods` (`Cargo.toml:211`), and `coinbase` is arranged identically — but I read
+   that, I did not compile it.
+2. `py_new` takes **exactly 7 arguments**. Clippy's `too_many_arguments` threshold is 7 and fires
+   above it, so I did **not** add `#[expect(clippy::too_many_arguments)]` — an unfulfilled
+   `#[expect]` is itself a warning. If I have the boundary off by one, that is where it shows.
+
+**B3 correction — the review was wrong in one place and it would have broken your build.** It said
+to move `serde_json` to dev-dependencies. `src/config.rs` does reference it, so I checked *where*
+before moving it: lines 212/214, inside the `#[cfg(test)] mod tests` that starts at line 151. It is
+genuinely test-only and the move is safe. Had I applied the item without checking, the crate would
+not have compiled, and I could not have found that out here.
+
+### 8b-3. The corpus gate — a real hole, found by its own negative control
+
+`--verify` **returned exit 0 on a corpus with an `order_id` planted three levels deep.** Measured,
+not supposed. Two independent defects, both now fixed:
+
+1. **The scan ran only at write time.** A corpus edited by hand afterwards was never re-checked —
+   and I had just edited one by hand to add the divisor note, so I walked through the hole while
+   writing the thing that documents it.
+2. **`verify` scanned only `text_records[*]["raw"]`** — narrower than the corpus. An order key in
+   any other field, or anywhere in the header, was invisible.
+
+The write gate and `--verify` now share one function (`_order_key_offenders`) and it scans **the
+whole file as written**. Negative controls: planted-key → exit 1, empty records → exit 1, missing
+header → exit 1; all four real corpora → exit 0.
+
+**And the strengthened gate immediately caught two things in my own edit** — first a `tradingsymbol`
+key in the note, then the word `tradingsymbol` in the prose explaining why I had renamed it. Both
+are false positives in the sense that neither is order flow. Both were fixed by renaming, which is
+the rule the gate's own comment states: *a false positive is visible and fixable in seconds, a false
+negative is public forever.*
+
+**Separately: `--verify` was unrunnable by you.** `kiteconnect` was imported at module scope, so a
+pure-file check exited 1 before parsing its arguments on any machine without the vendor SDK — the
+build host, a reviewer, CI. It is now imported lazily inside `capture()`. Verified on the mini in an
+interpreter where `import kiteconnect` fails.
+
 ### 8c. Standing asks
 
 - Every compile error verbatim. Say **which configuration** produced it — a default-feature check

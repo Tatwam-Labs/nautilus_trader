@@ -113,11 +113,32 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    from kiteconnect import KiteTicker
-    from kiteconnect.__version__ import __version__ as KITECONNECT_VERSION
-except ImportError:
-    sys.exit("kiteconnect is required: pip install kiteconnect")
+# Resolved on demand by `_require_kiteconnect`, NOT at import time.
+#
+# `--verify` is a pure-file check -- it reads a capture off disk and needs no network, no
+# credentials and no vendor SDK. Importing kiteconnect at module scope made it exit 1 before
+# parsing its arguments, which meant THE GATE WAS UNRUNNABLE BY ANYONE WITHOUT THE VENDOR SDK:
+# not the build host, not a reviewer, not CI. A control that only its author can run is not
+# much of a control, and this one guards whether a corpus is publishable.
+KiteTicker = None
+KITECONNECT_VERSION = None
+
+
+def _require_kiteconnect() -> None:
+    """Import the vendor SDK, exiting with a clear message if it is absent.
+
+    Called from `capture` only -- the capture path genuinely needs it as a transport.
+    """
+    global KiteTicker, KITECONNECT_VERSION  # noqa: PLW0603
+    if KiteTicker is not None:
+        return
+    try:
+        from kiteconnect import KiteTicker as _KiteTicker
+        from kiteconnect.__version__ import __version__ as _kiteconnect_version
+    except ImportError:
+        sys.exit("kiteconnect is required to CAPTURE (--verify does not need it): pip install kiteconnect")
+    KiteTicker = _KiteTicker
+    KITECONNECT_VERSION = _kiteconnect_version
 
 # A capture is for shape coverage, not volume. Keeping a handful of each distinct shape
 # gives every layout and segment combination without writing a gigabyte of near-duplicates.
@@ -184,6 +205,39 @@ def _has_order_keys(node) -> bool:
     if isinstance(node, list):
         return any(_has_order_keys(v) for v in node)
     return False
+
+
+def _order_key_offenders(rendered: str, text_records) -> list[str]:
+    """Scan a corpus for order-identifying keys in TWO independent representations.
+
+    Extracted so the write gate and `--verify` cannot drift apart. They did: the scan ran only
+    when the recorder wrote the file, so a corpus edited by hand afterwards -- to add a note to
+    the header, say -- was never re-checked, and `--verify` returned 0 on a file with an
+    `order_id` planted three levels deep. MEASURED, not supposed; that is how this was found.
+
+    Representation 1 is the serialised TEXT, matched on BARE substrings. Not the quoted key:
+    `json.dumps` escapes the inner quotes of a stored raw string, so `"order_id"` inside a
+    captured payload renders as `\\"order_id\\"` and a quoted pattern never matches it. That exact
+    mistake was in the first version of this gate and it wrote the file its negative control was
+    built to stop.
+
+    Representation 2 re-parses each stored payload and walks the STRUCTURE. The duplication is
+    deliberate: the bug this gate shipped with was a scan reading the wrong representation, so
+    neither representation is now the only thing checked.
+
+    A bare scan over-matches -- a legitimate error string containing `user_id` blocks the write.
+    That is the correct direction for a gate whose miss is unrecoverable: a false positive is
+    visible and fixable in seconds, a false negative is public forever. Fix a false positive by
+    renaming the offending field, never by softening the scan.
+    """
+    offenders = sorted(k for k in ORDER_IDENTIFYING_KEYS if k in rendered)
+    for record in text_records:
+        try:
+            if _has_order_keys(json.loads(record.get("raw", ""))):
+                offenders.append(f"structural:{record.get('type')!r}")
+        except (ValueError, TypeError):
+            pass  # Non-JSON is flagged for human review elsewhere; it cannot be walked.
+    return offenders
 
 
 def _keep_text_frame(payload, text_records: list[dict], stats: dict) -> None:
@@ -285,6 +339,8 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
     like a complete run. One token can hold only one mode per connection, so covering both
     index rows needs TWO index tokens.
     """
+    _require_kiteconnect()
+
     api_key = os.environ.get("ZERODHA_API_KEY", "").strip()
     access_token = os.environ.get("ZERODHA_ACCESS_TOKEN", "").strip()
     if not api_key or not access_token:
@@ -458,26 +514,8 @@ def _write(path: Path, records, text_records, groups, stats, seen, heartbeat_tim
     # otherwise reach disk rather than where someone has to remember to look.
     rendered = json.dumps({"header": header, "records": records, "text_records": text_records},
                           indent=2)
-    # BARE substring, not the quoted key. json.dumps ESCAPES the inner quotes of a stored raw
-    # string, so `"order_id"` inside a captured payload renders as `\"order_id\"` and a quoted
-    # pattern never matches it. That exact mistake was in the first version of this gate and it
-    # wrote the file its negative control was built to stop.
-    #
-    # A bare scan over-matches -- a legitimate error string containing "user_id" would block the
-    # write. That is the correct direction for a last-resort gate whose miss is unrecoverable:
-    # a false positive is visible and fixable in seconds, a false negative is public forever.
-    offenders = sorted(k for k in ORDER_IDENTIFYING_KEYS if k in rendered)
-
-    # SECOND, INDEPENDENT REPRESENTATION. The scan above reads the serialised TEXT; this one
-    # re-parses each stored payload and walks the STRUCTURE. Deliberate duplication: the bug this
-    # gate shipped with was a scan that read the wrong representation, so neither representation
-    # is now the only thing checked.
-    for record in text_records:
-        try:
-            if _has_order_keys(json.loads(record.get("raw", ""))):
-                offenders.append(f"structural:{record.get('type')!r}")
-        except (ValueError, TypeError):
-            pass  # Non-JSON is flagged for human review elsewhere; it cannot be walked.
+    # Shared with `--verify`, so the two cannot drift. See `_order_key_offenders`.
+    offenders = _order_key_offenders(rendered, text_records)
 
     if offenders:
         raise SystemExit(
@@ -565,15 +603,23 @@ def verify(path: Path) -> int:
             break
 
     # Text frames: the redaction gates must be checkable after the fact, not trusted.
+    #
+    # This scans THE WHOLE FILE AS WRITTEN, via the same function the write gate uses. It used to
+    # scan only `text_records[*]["raw"]`, which is narrower than the corpus in two ways that both
+    # matter: an order key in any OTHER field of a text record was invisible, and so was one
+    # anywhere in the header or the binary records. MEASURED -- an `order_id` planted three levels
+    # deep under a new `payload` key passed with exit 0.
+    #
+    # Scanning the file rather than the parsed object is deliberate: `--verify` exists to be run
+    # on a corpus SOMEONE ELSE PRODUCED, or on one edited by hand after capture, where the write
+    # gate never ran at all.
     text = doc.get("text_records", [])
-    leaked = [
-        i for i, r in enumerate(text)
-        if any(k in r.get("raw", "") for k in ORDER_IDENTIFYING_KEYS)
-    ]
-    if leaked:
+    offenders = _order_key_offenders(path.read_text(), text)
+    if offenders:
         failures.append(
-            f"ORDER-IDENTIFYING KEYS IN STORED TEXT at record(s) {leaked}. Both redaction gates "
-            "were defeated, or this corpus predates them. Do NOT publish or derive from it."
+            f"ORDER-IDENTIFYING KEYS PRESENT: {offenders}. Both redaction gates were defeated, "
+            "this corpus predates them, or it was edited after capture. Do NOT publish or derive "
+            "from it. Fix by renaming the offending field -- never by softening the scan."
         )
 
     flagged = [i for i, r in enumerate(text) if r.get("review_before_publication")]
