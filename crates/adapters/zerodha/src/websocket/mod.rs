@@ -15,12 +15,14 @@
 
 //! WebSocket streaming for the Zerodha Kite Connect API.
 
+pub mod client;
 pub mod error;
 pub mod messages;
 pub mod parse;
 pub mod subscription;
 
 pub use crate::websocket::{
+    client::{ZERODHA_WS_URL, ZerodhaWebSocketClient},
     error::ZerodhaWsError,
     messages::{KiteDepth, KiteDepthEntry, KiteOhlc, KiteTick},
     parse::{parse_binary, parse_packet, split_packets},
