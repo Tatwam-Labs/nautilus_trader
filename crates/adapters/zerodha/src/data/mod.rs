@@ -37,6 +37,8 @@
 //! indistinguishable from a quiet market; the correction is that refusing in `connect` is not what
 //! prevents it.
 
+pub mod parse;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
