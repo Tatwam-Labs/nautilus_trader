@@ -39,6 +39,28 @@
 //! Replay is why [`SubscriptionState`] exists: a socket that reconnects and streams nothing looks
 //! exactly like a quiet market, which is the failure this crate has refused to fake since
 //! `connect()` was first written to return an error.
+//!
+//! # ⚠️ TWO WAYS THE SESSION DIES THAT RECONNECTING CANNOT FIX
+//!
+//! `reconnect_max_attempts` is `None` below — unlimited — which is right for a network blip and
+//! **wrong for an invalid token**, because the credential is fixed at construction and every retry
+//! re-presents the same dead one. Both of these produce a client that retries forever and never
+//! recovers:
+//!
+//! 1. **Daily expiry.** Kite flushes the `access_token` every morning, roughly 06:00–07:30 IST,
+//!    for regulatory reasons. A process running across that window holds a token that is simply
+//!    gone.
+//! 2. **Session overwrite.** Running the login flow again *immediately invalidates the previous
+//!    token*, and any socket still open on it is disconnected. So a second consumer authenticating
+//!    with the same app kills the first — **without exhausting the 3-connection limit and without
+//!    anything on the first connection reporting why.**
+//!
+//! Point 2 is worth dwelling on: it produces exactly the symptom that was historically attributed
+//! to a one-socket-per-token rule — a healthy-looking client that stops receiving. **Sharing one
+//! token across sockets is supported; re-issuing it is what breaks them.**
+//!
+//! Neither case is handled here. A correct response needs a fresh token, which means credential
+//! refresh rather than reconnection, and that is not built.
 
 use nautilus_common::live::get_runtime;
 use nautilus_network::{
@@ -186,7 +208,12 @@ impl ZerodhaWebSocketClient {
                 tokio::select! {
                     cmd = cmd_rx.recv() => match cmd {
                         Some(Command::Subscribe(mode, tokens)) => {
-                            state.subscribe(mode, &tokens);
+                            // Refuse locally rather than let the venue silently not stream the
+                            // excess. Nothing is sent when the cap would be passed.
+                            if let Err(e) = state.subscribe(mode, &tokens) {
+                                log::error!("Rejecting Zerodha subscription: {e}");
+                                continue;
+                            }
                             // Subscribe THEN set mode -- a bare subscribe lands the venue at
                             // `quote` regardless of what was asked for. See `subscription`.
                             send_all(&client, &[
