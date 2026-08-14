@@ -25,6 +25,8 @@ WHAT THIS DOES AND DOES NOT DO
 ------------------------------
 DOES:      open a read-only market-data WebSocket, subscribe to the tokens you name, and
            write RAW FRAMES to a JSON file, with the subscription that produced them.
+           Binary frames (ticks) and text frames (acks, errors) are both recorded, in
+           separate arrays.
 DOES NOT:  place, modify or cancel any order. It never imports `KiteConnect`, only
            `KiteTicker`, so there is no order API in the process at all.
 
@@ -60,6 +62,10 @@ SAFETY
   regardless of how long it runs.** Fixtures need coverage, not volume; recording a whole
   `full`-mode session across a wide strike band would be gigabytes and would add nothing.
   This matters because the machine that may run it is disk-constrained.
+* **Order data is never stored.** Text frames with `type == "order"` carry the account's own
+  order details; they are counted and discarded. We record that one arrived and nothing about
+  what it said. This matters if a corpus is ever published -- "no orders were placed that day"
+  is an assumption, not a guarantee, and the exclusion does not depend on it.
 * **Secrets are never printed.** The access token is read from the environment and never
   logged, echoed, or written to the output file.
 * **Connection limits.** Zerodha caps WebSocket connections PER API KEY. Use a dev key --
@@ -149,6 +155,53 @@ def _packet_shapes(payload: bytes) -> list[tuple[int, int]]:
     return shapes
 
 
+# Text-frame `type` values that must NEVER be stored. `type == "order"` carries the account's own
+# order details -- see kiteconnect.ticker.KiteTicker._parse_text_message, which routes it to
+# on_order_update. This corpus is for the DATA path, may be published, and has no use for it.
+TEXT_TYPES_NEVER_STORED = {"order"}
+
+
+def _keep_text_frame(payload, text_records: list[dict], stats: dict) -> None:
+    """Record a text control frame, minus anything account-identifying.
+
+    Text frames are what the binary corpus is missing: subscription acknowledgements and errors.
+    Without them, any handling written for them is written against the reference client's source
+    rather than against observed bytes -- the same self-confirming position captured frames exist
+    to escape, one layer up.
+
+    A frame whose `type` is in TEXT_TYPES_NEVER_STORED is COUNTED and DISCARDED: we record that it
+    happened and nothing about what it said.
+    """
+    stats["text_frames"] = stats.get("text_frames", 0) + 1
+    raw = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload)
+
+    try:
+        parsed = json.loads(raw)
+        kind = parsed.get("type") if isinstance(parsed, dict) else None
+    except ValueError:
+        # Not JSON. Worth keeping -- it means the venue sends something undocumented, and that is
+        # exactly the kind of thing a corpus built from documentation would never contain.
+        parsed, kind = None, "<not-json>"
+
+    if kind in TEXT_TYPES_NEVER_STORED:
+        stats["text_frames_discarded"] = stats.get("text_frames_discarded", 0) + 1
+        return
+
+    # Cap per kind, for the same reason binary frames are shape-sampled.
+    seen_kinds = [r["type"] for r in text_records]
+    if seen_kinds.count(kind) >= MAX_PER_SHAPE:
+        return
+
+    text_records.append(
+        {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "type": kind,
+            "raw": raw,
+            "parses_as_json": parsed is not None,
+        }
+    )
+
+
 def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
     """Capture frames for a set of (mode -> tokens) subscription groups.
 
@@ -195,14 +248,16 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
     seen: Counter[tuple[int, int]] = Counter()
     last_kept: dict[tuple[int, int], float] = {}
     records: list[dict] = []
-    stats = {"frames": 0, "heartbeats": 0, "kept": 0}
+    text_records: list[dict] = []
+    stats = {"frames": 0, "heartbeats": 0, "kept": 0, "text_frames": 0, "text_frames_discarded": 0}
     started = time.monotonic()
 
     def on_message(ws, payload, is_binary):
         """Fires BEFORE _parse_binary. `payload` is the untouched frame."""
         stats["frames"] += 1
         if not is_binary:
-            return  # Text control frames carry no ticks
+            _keep_text_frame(payload, text_records, stats)
+            return
         if len(payload) < 2:
             stats["heartbeats"] += 1
             return
@@ -250,7 +305,7 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
         try:
             kws.close()
         finally:
-            _write(out_path, records, groups, stats, seen)
+            _write(out_path, records, text_records, groups, stats, seen)
             _report(stats, seen, out_path)
             sys.stdout.flush()
             # os._exit, NOT sys.exit. MEASURED on the first live run: KiteTicker.connect()
@@ -293,7 +348,7 @@ def _jsonable(value):
     return value
 
 
-def _write(path: Path, records, groups, stats, seen) -> None:
+def _write(path: Path, records, text_records, groups, stats, seen) -> None:
     header = {
         "_comment": (
             "RAW frames captured from a live Zerodha WebSocket, recorded BEFORE any decode. "
@@ -321,7 +376,12 @@ def _write(path: Path, records, groups, stats, seen) -> None:
     }
     # Written whole then renamed, so a reader never sees a half-written capture.
     tmp = path.with_suffix(path.suffix + ".partial")
-    tmp.write_text(json.dumps({"header": header, "records": records}, indent=2) + "\n")
+    tmp.write_text(
+        json.dumps(
+            {"header": header, "records": records, "text_records": text_records}, indent=2
+        )
+        + "\n"
+    )
     tmp.replace(path)
 
 
