@@ -14,6 +14,29 @@
 // -------------------------------------------------------------------------------------------------
 
 //! Factory functions for creating Zerodha clients and components.
+//!
+//! # The config and the cache arrive HERE, not on the client trait
+//!
+//! This is worth stating because it is easy to look for them in the wrong place.
+//! [`nautilus_common::clients::DataClient`] carries only identity, lifecycle, subscriptions and
+//! requests — it never sees a config. Construction inputs arrive on
+//! [`DataClientFactory::create`] instead, and there are **four** of them:
+//!
+//! ```text
+//! fn create(
+//!     &self,
+//!     name: &str,
+//!     config: &dyn ClientConfig,        // type-erased; downcast to the concrete config
+//!     cache: CacheView,                 // READ-ONLY view, for querying platform state
+//!     clock: Rc<RefCell<dyn Clock>>,    // easy to miss when copying a signature
+//! ) -> anyhow::Result<Box<dyn DataClient>>;
+//! ```
+//!
+//! The config is type-erased, so the factory downcasts it and returns a clear error on mismatch
+//! rather than panicking — `config_type()` is what lets the caller pair them up correctly.
+//!
+//! The cache is a *view*: adapters may query platform state during construction but cannot mutate
+//! it. See `crates/common/src/factories/client.rs` for the declaration.
 
 use std::{any::Any, cell::RefCell, rc::Rc};
 
