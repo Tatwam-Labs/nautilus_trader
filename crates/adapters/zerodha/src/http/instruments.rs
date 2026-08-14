@@ -180,9 +180,13 @@ impl KiteInstrument {
     ///
     /// # Errors
     ///
-    /// Returns an error if `instrument_type` is not one of `EQ`, `FUT`, `CE` or `PE`, or if the
-    /// row's own fields cannot make a valid instrument (an empty identity, a non-positive tick
-    /// size or lot size, a derivative with no expiry, or an option with no strike).
+    /// Returns an error if `segment` is not `INDICES` and `instrument_type` is not one of `EQ`,
+    /// `FUT`, `CE` or `PE`, or if the row's own fields cannot make a valid instrument (an empty
+    /// identity, a non-positive tick size or lot size on a *tradable* row, a derivative with no
+    /// expiry, or an option with no strike).
+    ///
+    /// An `INDICES` row never reaches the `instrument_type` match, so the zero tick size and zero
+    /// lot size those rows carry are not errors — see [`Self::to_index_instrument`].
     pub fn to_instrument_any(&self, ts_init: UnixNanos) -> anyhow::Result<InstrumentAny> {
         // `segment` is read FIRST and it wins. 136 rows of the live NSE dump carry
         // `instrument_type = EQ` with `segment = INDICES`; falling through to the match below
@@ -531,6 +535,10 @@ mod tests {
     const NIFTY_50_INDEX: &str = "256265,1001,NIFTY 50,NIFTY 50,0,,0,0,0,EQ,INDICES,NSE";
     /// A second index row, to show the first is not a special case.
     const NIFTY_BANK_INDEX: &str = "260105,1002,NIFTY BANK,NIFTY BANK,0,,0,0,0,EQ,INDICES,NSE";
+    /// An index row that would build a **perfectly valid** [`Equity`]: positive tick, positive
+    /// lot. Nothing about it trips a zero guard, so only `segment` can save it.
+    const INDEX_WITH_NONZERO_TICK: &str =
+        "256270,1003,NIFTY NEXT 50,NIFTY NEXT 50,0,,0,0.05,1,EQ,INDICES,NSE";
 
     /// 2026-08-28 15:30 IST as UNIX nanoseconds.
     ///
@@ -608,7 +616,40 @@ mod tests {
         );
     }
 
-    // The negative control for the check above: the segment test must not swallow real equities.
+    // THE SHARPEST DISCRIMINATOR FOR THE SEGMENT DISPATCH, and the one the test above cannot be.
+    //
+    // Both index rows above carry `tick_size = 0` and `lot_size = 0`, so a mapping that ignored
+    // `segment` and fell through to `to_equity` would still not produce a bogus equity -- it would
+    // error, because `price_increment` and `lot_quantity` reject zeros for reasons that have
+    // nothing to do with indices. Passing that test therefore does not prove the segment is read;
+    // it only proves something rejected the row.
+    //
+    // This row is a valid equity in every respect except its segment: tick 0.05, lot 1. No zero
+    // guard can fire. It maps correctly ONLY because `segment` is read first -- and it is exactly
+    // the row that would have gone silently wrong had the venue published a real tick on an index.
+    #[rstest]
+    fn test_an_index_that_would_build_a_valid_equity_is_still_an_index() {
+        let instrument = convert(INDEX_WITH_NONZERO_TICK);
+
+        assert!(
+            !matches!(instrument, InstrumentAny::Equity(_)),
+            "this row has a positive tick and a positive lot, so no zero guard can catch it; the \
+             segment check is the only thing standing between it and a bogus equity",
+        );
+
+        let InstrumentAny::IndexInstrument(index) = instrument else {
+            panic!("an INDICES row must map to an index whatever its tick size");
+        };
+
+        assert_eq!(
+            index.price_increment,
+            Price::from("0.05"),
+            "a positive venue tick is preferred over the substituted index increment",
+        );
+        assert_eq!(index.price_precision, 2);
+    }
+
+    // The negative control for the checks above: the segment test must not swallow real equities.
     #[rstest]
     fn test_a_cash_segment_row_is_still_an_equity() {
         assert!(
@@ -914,9 +955,12 @@ mod tests {
         );
     }
 
+    // `INDICES` is deliberately NOT a case here. It is a `segment` value and the venue never sends
+    // it as an `instrument_type`; listing it would imply indices arrive down this path, which is
+    // exactly the misreading that makes a reader stop looking for the segment check.
     #[rstest]
-    #[case("INDICES")]
     #[case("COM")]
+    #[case("SP")]
     #[case("ce")]
     fn test_an_unmapped_instrument_type_is_an_error_naming_it(#[case] instrument_type: &str) {
         let csv_row =
