@@ -16,6 +16,7 @@
 //! The Zerodha Kite REST API.
 
 pub mod client;
+pub mod instruments;
 pub mod parse;
 
 pub use crate::http::{
