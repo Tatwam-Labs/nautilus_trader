@@ -18,10 +18,24 @@
 //! # Status
 //!
 //! The binary tick decoder ([`crate::websocket::parse`]) is complete and covered by fixture tests.
-//! **The WebSocket transport is not yet wired**, so [`DataClient::connect`] returns an error rather
-//! than reporting success and streaming nothing. A client that connects successfully and then never
-//! delivers a tick is indistinguishable from a quiet market, which is the exact failure mode this
-//! adapter exists to remove.
+//! **The WebSocket transport is not yet wired.**
+//!
+//! # Where the guard actually is — an earlier version of this comment was wrong
+//!
+//! [`DataClient::connect`] returns an error, and **that does not stop anything**.
+//! `DataEngine::connect` collects client errors with `filter_map(Result::err)` into `log::error!`
+//! and carries on — its own doc says *"Connection failures are logged but do not prevent the node
+//! from running."* So the observable difference between `bail!` and `Ok(())` here is **one ERROR
+//! log line**; the node starts either way.
+//!
+//! The real guard is at **construction**. [`ZerodhaDataClient::new`] returns `Result`, and
+//! `DataClientFactory::create` is called with `?` in `LiveNodeBuilder` — so a client that cannot be
+//! built aborts the build. That is why the credential check lives in `new` and not in `connect`.
+//!
+//! The `connect` error is kept because it is **true and loud**, not because it is protective. This
+//! crate spent a day insisting that a client which reports health while streaming nothing is
+//! indistinguishable from a quiet market; the correction is that refusing in `connect` is not what
+//! prevents it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
