@@ -228,7 +228,7 @@ fn a_packet_length_with_no_layout_is_rejected(#[case] len: usize) {
 
     match parse_binary(&frame) {
         Err(ZerodhaWsError::UnknownPacketLength(got)) => assert_eq!(got, len),
-        other => panic!("expected UnknownPacketLength({len}), got {other:?}"),
+        other => panic!("expected UnknownPacketLength({len}), was {other:?}"),
     }
 }
 

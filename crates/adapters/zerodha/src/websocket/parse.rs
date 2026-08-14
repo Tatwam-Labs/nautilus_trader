@@ -147,13 +147,75 @@ pub fn parse_binary(frame: &[u8]) -> Result<Vec<KiteTick>, ZerodhaWsError> {
     split_packets(frame)?.into_iter().map(parse_packet).collect()
 }
 
+/// The wire layout of a packet.
+///
+/// The layout is selected by the packet **length**, which is the only selector the protocol
+/// provides. Naming the five layouts makes that structural rather than a comment: a length is
+/// resolved to a `PacketLayout` exactly once, before any field is read, and every consumer then
+/// matches on the layout exhaustively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PacketLayout {
+    /// 8 bytes — token and last price only.
+    Ltp,
+    /// 28 bytes — index quote: OHLC, no traded quantities.
+    IndexQuote,
+    /// 32 bytes — index quote plus an exchange timestamp.
+    IndexFull,
+    /// 44 bytes — tradable quote: traded quantities and OHLC.
+    Quote,
+    /// 184 bytes — tradable quote plus timestamps, open interest and five-deep depth.
+    Full,
+}
+
+impl PacketLayout {
+    /// Resolves a packet length to its layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ZerodhaWsError::UnknownPacketLength`] if the length matches no documented layout.
+    const fn from_len(len: usize) -> Result<Self, ZerodhaWsError> {
+        match len {
+            8 => Ok(Self::Ltp),
+            28 => Ok(Self::IndexQuote),
+            32 => Ok(Self::IndexFull),
+            44 => Ok(Self::Quote),
+            184 => Ok(Self::Full),
+            len => Err(ZerodhaWsError::UnknownPacketLength(len)),
+        }
+    }
+
+    /// Returns the streaming mode this layout implies.
+    const fn mode(self) -> ZerodhaTickMode {
+        match self {
+            Self::Ltp => ZerodhaTickMode::Ltp,
+            Self::IndexQuote | Self::Quote => ZerodhaTickMode::Quote,
+            Self::IndexFull | Self::Full => ZerodhaTickMode::Full,
+        }
+    }
+}
+
 /// Decodes a single packet, selecting the layout from its length.
 ///
 /// # Errors
 ///
-/// Returns [`ZerodhaWsError::UnknownPacketLength`] for a length with no documented layout, or
-/// [`ZerodhaWsError::Truncated`] if a field runs past the end.
+/// Returns [`ZerodhaWsError::UnknownPacketLength`] for a length with no documented layout.
+///
+/// [`ZerodhaWsError::Truncated`] is **not** reachable from this function: the length is resolved to
+/// a [`PacketLayout`] first, and every layout's field offsets are within its own length, so no read
+/// below can run past the end. The reads stay fallible so that a future layout added with wrong
+/// offsets fails loudly rather than reading adjacent bytes. Frame-level truncation — a declared
+/// packet length running past the end of the frame — is caught earlier, by [`split_packets`].
 pub fn parse_packet(packet: &[u8]) -> Result<KiteTick, ZerodhaWsError> {
+    // The length is validated FIRST, before any field is read.
+    //
+    // Reading a field first would report `Truncated` for a packet whose actual problem is that its
+    // length matches no documented layout — every packet under 8 bytes would be misreported. Both
+    // outcomes reject, so nothing mis-decodes, but a caller distinguishing "the venue sent a length
+    // I do not know" from "the frame was cut short" would get the wrong answer, and those two imply
+    // different operational responses. Resolving the layout up front makes the ordering structural
+    // instead of relying on the reader to keep the eager reads below the check.
+    let layout = PacketLayout::from_len(packet.len())?;
+
     let instrument_token = be_u32(packet, 0)?;
     let segment = ZerodhaSegment::from_instrument_token(instrument_token);
     let divisor = segment.price_divisor();
@@ -162,39 +224,29 @@ pub fn parse_packet(packet: &[u8]) -> Result<KiteTick, ZerodhaWsError> {
         instrument_token,
         segment,
         tradable: segment.is_tradable(),
+        mode: layout.mode(),
         last_price: be_price(packet, 4, divisor)?,
         ..Default::default()
     };
 
-    match packet.len() {
-        8 => {
-            tick.mode = ZerodhaTickMode::Ltp;
-        }
+    match layout {
+        // Nothing beyond the last price.
+        PacketLayout::Ltp => {}
         // Index packets carry OHLC but no traded quantities.
-        28 | 32 => {
-            tick.mode = if packet.len() == 28 {
-                ZerodhaTickMode::Quote
-            } else {
-                ZerodhaTickMode::Full
-            };
+        PacketLayout::IndexQuote | PacketLayout::IndexFull => {
             tick.ohlc = Some(KiteOhlc {
                 high: be_price(packet, 8, divisor)?,
                 low: be_price(packet, 12, divisor)?,
                 open: be_price(packet, 16, divisor)?,
                 close: be_price(packet, 20, divisor)?,
             });
-            if packet.len() == 32 {
+            if layout == PacketLayout::IndexFull {
                 tick.exchange_timestamp = Some(be_u32(packet, 28)?);
             }
         }
         // Tradable instrument packets. Note the OHLC field ORDER differs from the index layout
         // above: open/high/low/close here, high/low/open/close there.
-        44 | 184 => {
-            tick.mode = if packet.len() == 44 {
-                ZerodhaTickMode::Quote
-            } else {
-                ZerodhaTickMode::Full
-            };
+        PacketLayout::Quote | PacketLayout::Full => {
             tick.last_traded_quantity = Some(be_u32(packet, 8)?);
             tick.average_traded_price = Some(be_price(packet, 12, divisor)?);
             tick.volume_traded = Some(be_u32(packet, 16)?);
@@ -207,7 +259,7 @@ pub fn parse_packet(packet: &[u8]) -> Result<KiteTick, ZerodhaWsError> {
                 close: be_price(packet, 40, divisor)?,
             });
 
-            if packet.len() == 184 {
+            if layout == PacketLayout::Full {
                 tick.last_trade_time = Some(be_u32(packet, 44)?);
                 tick.oi = Some(be_u32(packet, 48)?);
                 tick.oi_day_high = Some(be_u32(packet, 52)?);
@@ -216,7 +268,6 @@ pub fn parse_packet(packet: &[u8]) -> Result<KiteTick, ZerodhaWsError> {
                 tick.depth = Some(parse_depth(packet, divisor)?);
             }
         }
-        len => return Err(ZerodhaWsError::UnknownPacketLength(len)),
     }
 
     // The venue does not send `change`; it is derived. A zero previous close (a freshly listed
