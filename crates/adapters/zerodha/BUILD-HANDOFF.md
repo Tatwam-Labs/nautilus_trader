@@ -17,6 +17,26 @@ live/paper stack), so this file is still the route for every build.
 conventions-hook fixes were authored on the mini and are reasoned, not verified. The next run should
 expect **17/17**; if it does not get that, the fix is wrong, not the test.
 
+> ## 🛑 A GREEN BUILD IS NOT EVIDENCE THIS DECODER MATCHES ZERODHA
+>
+> Read this before quoting any test result from this branch, including a 17/17.
+>
+> The fixtures are **constructed from the published wire layout**, not captured from a live
+> socket. The expected values come from the `kiteconnect` Python client. So a passing suite
+> establishes exactly one thing:
+>
+> > **Two independent implementations agree with each other.**
+>
+> It does **not** establish that either matches what Zerodha actually sends. **Both could share a
+> misreading of the spec, and this suite would stay green.** That is not a hypothetical: the whole
+> reason the reference client is used as the oracle is that no one here has read the venue's bytes.
+>
+> **17/17 will not change this. Neither will 100/100.** The only thing that moves this line is
+> frames captured from a live Kite session — see §7.
+>
+> AT has no raw-frame corpus and structurally cannot produce one from existing code: `kiteconnect`
+> decodes inside the library, so the pre-decode bytes are never persisted anywhere in AT.
+
 > **Do not put this branch on the AT repo.** This is `nautilus_trader` source. AT cannot compile it
 > (v2 adapters are in-tree only — ADR-097), and it would be unmergeable upstream from there.
 
@@ -238,6 +258,20 @@ pre-decode bytes are never persisted anywhere in AT.
 
 **Capturing real frames is the next milestone**, and it needs a live Kite session. Zerodha caps
 WebSocket connections per API key, so a dev key cannot disturb prod.
+
+### Phrases to use, and phrases that will mislead
+
+| ✅ say | ❌ do not say |
+|---|---|
+| "the decoder agrees with the `kiteconnect` reference on 9 constructed frames" | "the decoder is verified" |
+| "17/17 fixture tests pass" | "the decoder is correct" |
+| "no disagreement found between two implementations" | "the tick decoding works" |
+| "fidelity to the venue is UNMEASURED" | *(silence — silence reads as closure)* |
+
+**The settling measurement, named so it is not left to memory:** capture raw binary frames from a
+live Kite WebSocket session, commit them to `test_data/`, and re-derive the expected values from
+those bytes instead of from a constructed layout. Until that exists, the honest status of venue
+fidelity is **UNKNOWN**, not "passing".
 
 ## 8. Next run — what is asked, and the one thing only you can do
 
