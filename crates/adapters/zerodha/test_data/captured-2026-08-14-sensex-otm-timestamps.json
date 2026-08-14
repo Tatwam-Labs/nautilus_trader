@@ -28,7 +28,9 @@
         "segment": 5,
         "count": 4
       }
-    ]
+    ],
+    "sampling_limitation": "kept=1 of 952 frames. This recorder shape-samples on (packet_len, segment) with a cap, and a SINGLE WebSocket message carried all four packets, taking that shape straight to its cap. So this corpus captures ONE INSTANT, and the question it was captured to answer -- whether exchange_timestamp and last_trade_time ever separate -- rested entirely on that first message happening to contain separated values. It did, and deep-OTM staleness made that likely, but LIKELY IS NOT DESIGNED: had it been coincident the run would have reported zero after five minutes of a market that opens only on weekdays. The sampler optimises LAYOUT coverage and this question needed TEMPORAL coverage. Fixed afterwards in capture_live_frames.py (MIN_SHAPE_INTERVAL_SECS spaces repeat samples of a shape in time); this corpus predates it.",
+    "coverage_limitation": "Full mode only, four deep-OTM SENSEX strikes. Layouts 8/28/32/44 are ABSENT. This corpus is SUPPLEMENTARY to captured-2026-08-14-sensex-live.json, not a replacement, and nothing here should be read as whole-protocol coverage."
   },
   "records": [
     {
