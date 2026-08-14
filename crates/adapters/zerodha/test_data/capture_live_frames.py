@@ -155,51 +155,101 @@ def _packet_shapes(payload: bytes) -> list[tuple[int, int]]:
     return shapes
 
 
-# Text-frame `type` values that must NEVER be stored. `type == "order"` carries the account's own
-# order details -- see kiteconnect.ticker.KiteTicker._parse_text_message, which routes it to
-# on_order_update. This corpus is for the DATA path, may be published, and has no use for it.
-TEXT_TYPES_NEVER_STORED = {"order"}
+# Keys that mark a payload as carrying the ACCOUNT's own order flow. Matched on KEYS, at ANY
+# depth, regardless of the frame's declared `type`.
+ORDER_IDENTIFYING_KEYS = {
+    "order_id", "exchange_order_id", "parent_order_id", "tradingsymbol",
+    "user_id", "account_id", "placed_by", "average_price", "filled_quantity",
+}
+
+
+def _has_order_keys(node) -> bool:
+    """Recursively test whether any order-identifying KEY appears anywhere in a decoded payload.
+
+    Keys, not values, deliberately: an error string that happens to mention a tradingsymbol is
+    venue behaviour worth keeping, while `{"data": {"order_id": ...}}` with no `type` field at all
+    is order flow wearing an unfamiliar shape.
+    """
+    if isinstance(node, dict):
+        if ORDER_IDENTIFYING_KEYS & node.keys():
+            return True
+        return any(_has_order_keys(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_order_keys(v) for v in node)
+    return False
 
 
 def _keep_text_frame(payload, text_records: list[dict], stats: dict) -> None:
-    """Record a text control frame, minus anything account-identifying.
+    """Record a text control frame, subject to TWO INDEPENDENT GATES.
 
-    Text frames are what the binary corpus is missing: subscription acknowledgements and errors.
-    Without them, any handling written for them is written against the reference client's source
-    rather than against observed bytes -- the same self-confirming position captured frames exist
-    to escape, one layer up.
+    Text frames are what the binary corpus is missing: acknowledgements and errors. Without them,
+    handling written for them is written against the reference client's source rather than against
+    observed bytes -- the self-confirming position captured frames exist to escape.
 
-    A frame whose `type` is in TEXT_TYPES_NEVER_STORED is COUNTED and DISCARDED: we record that it
-    happened and nothing about what it said.
+    # Why two gates rather than a list of types
+
+    A DENY-LIST on `type` fails OPEN: a frame whose type is absent, misspelled, renamed by the
+    venue or nested differently walks straight in -- and we have never observed a single Zerodha
+    text frame, so the space of shapes is exactly what we do not know.
+
+    An ALLOW-LIST on `type` fails CLOSED but throws away the unparseable and unrecognised frames,
+    which are the most valuable thing here: a corpus built from documentation cannot contain them
+    by construction.
+
+    So `type` is not the gate at all. What is kept and what is redacted are separate questions:
+
+      KEEP    everything -- unknown types, untyped frames, non-JSON
+      REDACT  any payload carrying order-identifying KEYS at any depth, whatever its type
+
+    A frame has to defeat both to leak.
+
+    # Non-JSON cannot be scanned
+
+    The key scan needs a decoded structure. Non-JSON text is kept and marked
+    `review_before_publication`, which `--verify` treats as a hard gate rather than a note. It
+    converts an unknown into a FLAGGED unknown, which is the most that can honestly be done.
     """
     stats["text_frames"] = stats.get("text_frames", 0) + 1
     raw = payload.decode("utf-8", errors="replace") if isinstance(payload, bytes) else str(payload)
 
+    def _discard(reason: str) -> None:
+        stats.setdefault("text_discarded_by_reason", {})
+        stats["text_discarded_by_reason"][reason] = (
+            stats["text_discarded_by_reason"].get(reason, 0) + 1
+        )
+        stats["text_frames_discarded"] = stats.get("text_frames_discarded", 0) + 1
+
     try:
         parsed = json.loads(raw)
-        kind = parsed.get("type") if isinstance(parsed, dict) else None
     except ValueError:
-        # Not JSON. Worth keeping -- it means the venue sends something undocumented, and that is
-        # exactly the kind of thing a corpus built from documentation would never contain.
-        parsed, kind = None, "<not-json>"
-
-    if kind in TEXT_TYPES_NEVER_STORED:
-        stats["text_frames_discarded"] = stats.get("text_frames_discarded", 0) + 1
-        return
-
-    # Cap per kind, for the same reason binary frames are shape-sampled.
-    seen_kinds = [r["type"] for r in text_records]
-    if seen_kinds.count(kind) >= MAX_PER_SHAPE:
-        return
-
-    text_records.append(
-        {
+        # GATE 2 cannot run. Keep it -- undocumented venue behaviour is the point -- but flag it.
+        if sum(1 for r in text_records if not r.get("parses_as_json")) >= MAX_PER_SHAPE:
+            return
+        text_records.append({
             "captured_at": datetime.now(timezone.utc).isoformat(),
-            "type": kind,
+            "type": None,
             "raw": raw,
-            "parses_as_json": parsed is not None,
-        }
-    )
+            "parses_as_json": False,
+            "review_before_publication": True,
+        })
+        return
+
+    if _has_order_keys(parsed):
+        kind = parsed.get("type") if isinstance(parsed, dict) else None
+        _discard(f"order-identifying keys (type={kind!r})")
+        return
+
+    kind = parsed.get("type") if isinstance(parsed, dict) else None
+    if [r.get("type") for r in text_records].count(kind) >= MAX_PER_SHAPE:
+        return
+
+    text_records.append({
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "type": kind,
+        "raw": raw,
+        "parses_as_json": True,
+        "review_before_publication": False,
+    })
 
 
 def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
@@ -456,7 +506,23 @@ def verify(path: Path) -> int:
             failures.append(f"record {i}: frame_len disagrees with the payload length")
             break
 
+    # Text frames: the redaction gates must be checkable after the fact, not trusted.
+    text = doc.get("text_records", [])
+    leaked = [
+        i for i, r in enumerate(text)
+        if any(k in r.get("raw", "") for k in ORDER_IDENTIFYING_KEYS)
+    ]
+    if leaked:
+        failures.append(
+            f"ORDER-IDENTIFYING KEYS IN STORED TEXT at record(s) {leaked}. Both redaction gates "
+            "were defeated, or this corpus predates them. Do NOT publish or derive from it."
+        )
+
+    flagged = [i for i, r in enumerate(text) if r.get("review_before_publication")]
+
     print(f"{path}: {len(records)} records, packet lengths {sorted(lengths) or '(none)'}")
+    if text:
+        print(f"  text frames stored: {len(text)}  flagged for review: {len(flagged)}")
     if failures:
         print("\nFAILED:")
         for f in failures:
@@ -465,6 +531,12 @@ def verify(path: Path) -> int:
 
     missing = known - lengths
     print("PASSED — the corpus is usable.")
+    if flagged:
+        print(
+            f"\n⚠️  {len(flagged)} text record(s) are marked review_before_publication — non-JSON "
+            "frames the key scan could not read.\n"
+            "    These must be read by a human before this corpus is published or sent anywhere."
+        )
     if missing:
         print(
             f"\nBut layouts {sorted(missing)} were NOT captured. Those stay UNVERIFIED "
