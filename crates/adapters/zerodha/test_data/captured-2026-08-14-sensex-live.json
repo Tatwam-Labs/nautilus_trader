@@ -1,0 +1,190 @@
+{
+  "header": {
+    "_comment": "RAW frames captured from a live Zerodha WebSocket, recorded BEFORE any decode. Unlike fixtures.json these are ground truth from the venue, not constructed from the published layout. 'reference_decoded' is the kiteconnect client's reading of these bytes -- one implementation's interpretation, kept alongside the bytes rather than replacing them.",
+    "reference_implementation": "kiteconnect 5.2.1",
+    "subscriptions": {
+      "ltp": [
+        218814981
+      ],
+      "quote": [
+        265,
+        219012101
+      ],
+      "full": [
+        256265,
+        218968069
+      ]
+    },
+    "captured_tokens": [
+      265,
+      256265,
+      218814981,
+      218968069,
+      219012101
+    ],
+    "mode": "ltp+quote+full",
+    "stats": {
+      "frames": 389,
+      "heartbeats": 30,
+      "kept": 7
+    },
+    "shape_coverage": [
+      {
+        "packet_len": 8,
+        "segment": 5,
+        "count": 3
+      },
+      {
+        "packet_len": 28,
+        "segment": 9,
+        "count": 3
+      },
+      {
+        "packet_len": 32,
+        "segment": 9,
+        "count": 7
+      },
+      {
+        "packet_len": 44,
+        "segment": 5,
+        "count": 3
+      },
+      {
+        "packet_len": 184,
+        "segment": 5,
+        "count": 4
+      }
+    ]
+  },
+  "records": [
+    {
+      "captured_at": "2026-08-14T07:42:50.052256+00:00",
+      "frame_hex": "000500080d0ada050000aa78001c000001090076c3ee0076e6e6007689750076df07007723fcffff9ff2002c0d0ddc05000077fb00000014000087bf00e03ff8000177000002e6440000858900009bb9000074b800006e6e00200003e9090025255600252d94002512f000252c5e002539a1ffffebb56a7ec6f900b80d0d30050000c003000000140000bdb50084ba0c000148340001c3f40000afc80000e8710000a6c70000fb8b6a7ec6f900097d10000b40a0000303f46a7ec6f9000000280000c00d00020000000000c80000c00300040000000000b40000bffe00030000000000640000bfea00040000000000780000bfe500030000000000780000c080000500000000003c0000c08f00030000000000500000c09400030000000000640000c09900040000000000500000c09e00040000",
+      "frame_len": 308,
+      "shapes": [
+        {
+          "packet_len": 8,
+          "segment": 5
+        },
+        {
+          "packet_len": 28,
+          "segment": 9
+        },
+        {
+          "packet_len": 44,
+          "segment": 5
+        },
+        {
+          "packet_len": 32,
+          "segment": 9
+        },
+        {
+          "packet_len": 184,
+          "segment": 5
+        }
+      ]
+    },
+    {
+      "captured_at": "2026-08-14T07:42:50.307457+00:00",
+      "frame_hex": "000200080d0ada050000a9d800200003e9090025257e00252d94002512f000252c5e002539a1ffffebdd6a7ec6fa",
+      "frame_len": 46,
+      "shapes": [
+        {
+          "packet_len": 8,
+          "segment": 5
+        },
+        {
+          "packet_len": 32,
+          "segment": 9
+        }
+      ]
+    },
+    {
+      "captured_at": "2026-08-14T07:42:50.552064+00:00",
+      "frame_hex": "000200080d0ada050000a9d800200003e9090025258800252d94002512f000252c5e002539a1ffffebe76a7ec6fa",
+      "frame_len": 46,
+      "shapes": [
+        {
+          "packet_len": 8,
+          "segment": 5
+        },
+        {
+          "packet_len": 32,
+          "segment": 9
+        }
+      ]
+    },
+    {
+      "captured_at": "2026-08-14T07:42:50.802578+00:00",
+      "frame_hex": "000200200003e9090025258d00252d94002512f000252c5e002539a1ffffebec6a7ec6fa00b80d0d30050000c003000000140000bdb50084ba0c000148fc0001c32c0000afc80000e8710000a6c70000fb8b6a7ec6f900097d10000b40a0000303f46a7ec6fa000000500000c00d00040000000000b40000c00800030000000000500000c00300040000000000a00000bffe00020000000000140000bff900010000000000280000c06c00020000000000640000c099000400000000003c0000c0a300030000000000640000c0a800040000000000280000c0ad00020000",
+      "frame_len": 222,
+      "shapes": [
+        {
+          "packet_len": 32,
+          "segment": 9
+        },
+        {
+          "packet_len": 184,
+          "segment": 5
+        }
+      ]
+    },
+    {
+      "captured_at": "2026-08-14T07:42:51.050448+00:00",
+      "frame_hex": "0003001c000001090076c3e30076e6e6007689750076df07007723fcffff9fe7002c0d0ddc05000078b400000014000087bf00e040e800017bb00002e4b40000858900009bb9000074b800006e6e00200003e9090025258d00252d94002512f000252c5e002539a1ffffebec6a7ec6fa",
+      "frame_len": 112,
+      "shapes": [
+        {
+          "packet_len": 28,
+          "segment": 9
+        },
+        {
+          "packet_len": 44,
+          "segment": 5
+        },
+        {
+          "packet_len": 32,
+          "segment": 9
+        }
+      ]
+    },
+    {
+      "captured_at": "2026-08-14T07:42:51.802235+00:00",
+      "frame_hex": "000200200003e9090025253800252d94002512f000252c5e002539a1ffffeb976a7ec6fb00b80d0d30050000bfe0000000140000bdb50084bac000013c900001c1ec0000afc80000e8710000a6c70000fb8b6a7ec6fa00097d10000b40a0000303f46a7ec6fb000000280000beeb00020000000000640000bee6000300000000003c0000bee100020000000000280000bedc00010000000000780000bed700020000000000280000bf6800020000000000780000bf72000500000000003c0000bf7c000300000000008c0000bf8100050000000000a00000bf8600030000",
+      "frame_len": 222,
+      "shapes": [
+        {
+          "packet_len": 32,
+          "segment": 9
+        },
+        {
+          "packet_len": 184,
+          "segment": 5
+        }
+      ]
+    },
+    {
+      "captured_at": "2026-08-14T07:42:52.084993+00:00",
+      "frame_hex": "0004001c000001090076c4bd0076e6e6007689750076df07007723fcffffa0c1002c0d0ddc05000078f500000014000087bf00e0413800017df40002e34c0000858900009bb9000074b800006e6e00200003e909002524de00252d94002512f000252c5e002539a1ffffeb3d6a7ec6fb00b80d0d30050000bfe0000000140000bdb50084bac000013d440001c23c0000afc80000e8710000a6c70000fb8b6a7ec6fa00097d10000b40a0000303f46a7ec6fb000000280000bee100020000000000280000bedc00010000000000780000bed700020000000000f00000bed200050000000000b40000becd00030000000000280000bf5900020000000000280000bf5e00020000000000640000bf63000400000000003c0000bf6800030000000000640000bf6d00040000",
+      "frame_len": 298,
+      "shapes": [
+        {
+          "packet_len": 28,
+          "segment": 9
+        },
+        {
+          "packet_len": 44,
+          "segment": 5
+        },
+        {
+          "packet_len": 32,
+          "segment": 9
+        },
+        {
+          "packet_len": 184,
+          "segment": 5
+        }
+      ]
+    }
+  ]
+}
