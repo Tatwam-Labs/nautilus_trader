@@ -17,40 +17,62 @@
 //!
 //! # Status
 //!
-//! The binary tick decoder ([`crate::websocket::parse`]) is complete and covered by fixture tests.
-//! **The WebSocket transport is not yet wired.**
+//! [`DataClient::connect`] now opens a real socket and [`DataClient::subscribe_quotes`] issues a
+//! real subscription. **Neither has been run against Zerodha.** The decoder underneath is checked
+//! against captured bytes and the mapping is unit-tested, but the path from socket to engine has
+//! never carried a live tick.
 //!
-//! # Where the guard actually is — an earlier version of this comment was wrong
+//! # Where the guard is — this replaced an earlier `bail!`, and the reasoning is worth keeping
 //!
-//! [`DataClient::connect`] returns an error, and **that does not stop anything**.
-//! `DataEngine::connect` collects client errors with `filter_map(Result::err)` into `log::error!`
-//! and carries on — its own doc says *"Connection failures are logged but do not prevent the node
-//! from running."* So the observable difference between `bail!` and `Ok(())` here is **one ERROR
-//! log line**; the node starts either way.
+//! `connect` used to return an error deliberately, so the client could not report health while
+//! streaming nothing. That was the right instinct pointed at the wrong place: **a `connect` error
+//! does not stop anything.** `DataEngine::connect` collects client errors with
+//! `filter_map(Result::err)` into `log::error!` and carries on — its own doc says *"Connection
+//! failures are logged but do not prevent the node from running."*
 //!
-//! The real guard is at **construction**. [`ZerodhaDataClient::new`] returns `Result`, and
-//! `DataClientFactory::create` is called with `?` in `LiveNodeBuilder` — so a client that cannot be
-//! built aborts the build. That is why the credential check lives in `new` and not in `connect`.
+//! The real guard is at **construction**: [`ZerodhaDataClient::new`] returns `Result` and
+//! `DataClientFactory::create` is called with `?` in `LiveNodeBuilder`, so a client that cannot be
+//! built aborts the build. That is why the credential check lives in `new`.
 //!
-//! The `connect` error is kept because it is **true and loud**, not because it is protective. This
-//! crate spent a day insisting that a client which reports health while streaming nothing is
-//! indistinguishable from a quiet market; the correction is that refusing in `connect` is not what
-//! prevents it.
+//! **What still has no guard is the failure the `bail!` was aiming at** — a connected socket
+//! delivering nothing. `idle_timeout_ms` on the transport catches a dead *socket*; heartbeats keep
+//! arriving while ticks stop, so it does not catch a dead *feed*. The shape-asserting watchdog
+//! that would is not built.
+//!
+//! # Quotes are subscribed in FULL mode, and that is not a preference
+//!
+//! Kite's 44-byte packet is named `quote` and carries **no book**. Only the 184-byte full packet
+//! has depth, so a quote-mode subscription produces a stream from which no [`QuoteTick`] can ever
+//! be constructed. See [`crate::data::parse`].
+//!
+//! [`QuoteTick`]: nautilus_model::data::QuoteTick
 
 pub mod parse;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use async_trait::async_trait;
-use nautilus_common::clients::DataClient;
+use nautilus_common::{
+    clients::DataClient,
+    live::{get_runtime, runner::get_data_event_sender},
+    messages::{DataEvent, data::SubscribeQuotes},
+};
+use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::identifiers::{ClientId, Venue};
 
 use crate::{
     common::{
         consts::NSE_VENUE,
         credential::{ZerodhaCredential, credential_env_vars},
+        enums::ZerodhaTickMode,
+        instruments::InstrumentRegistry,
     },
     config::ZerodhaDataClientConfig,
+    data::parse::quote_tick_from,
+    websocket::client::ZerodhaWebSocketClient,
 };
 
 /// A Nautilus data client for the Zerodha Kite Connect streaming API.
@@ -67,8 +89,14 @@ pub struct ZerodhaDataClient {
     client_id: ClientId,
     config: ZerodhaDataClientConfig,
     /// Resolved at construction from the config or the environment.
-    #[expect(dead_code, reason = "consumed once the WebSocket transport is wired")]
     credential: ZerodhaCredential,
+    /// Built by [`Self::connect`]; `None` until then.
+    websocket: Option<ZerodhaWebSocketClient>,
+    /// Shared with the feed task, which resolves a token on every tick.
+    ///
+    /// `RwLock` rather than a plain map because the two users are on different threads: this
+    /// client registers and reads on the engine side, and the feed task reads on the runtime.
+    instruments: Arc<RwLock<InstrumentRegistry>>,
     is_connected: AtomicBool,
 }
 
@@ -93,8 +121,19 @@ impl ZerodhaDataClient {
             credential,
             client_id,
             config,
+            websocket: None,
+            instruments: Arc::new(RwLock::new(InstrumentRegistry::new())),
             is_connected: AtomicBool::new(false),
         })
+    }
+
+    /// Returns the shared instrument registry.
+    ///
+    /// Until the REST instrument provider exists this is how tokens get into the client at all —
+    /// the caller registers what it intends to subscribe to. See [`InstrumentRegistry`].
+    #[must_use]
+    pub fn instruments(&self) -> Arc<RwLock<InstrumentRegistry>> {
+        Arc::clone(&self.instruments)
     }
 
     /// Returns the primary venue for this client.
@@ -152,16 +191,112 @@ impl DataClient for ZerodhaDataClient {
     }
 
     async fn connect(&mut self) -> anyhow::Result<()> {
-        // Deliberately an error, not a no-op: the default trait body returns `Ok(())`, which would
-        // report a healthy client that never streams. See the module docs.
-        anyhow::bail!(
-            "Zerodha WebSocket transport is not implemented yet — the tick decoder is complete but \
-             nothing is connected to it"
-        )
+        if self.is_connected() {
+            log::warn!("Zerodha data client {} is already connected", self.client_id);
+            return Ok(());
+        }
+
+        let mut websocket =
+            ZerodhaWebSocketClient::new(self.credential.clone(), self.config.base_url_ws.clone());
+        websocket.connect().await?;
+
+        let mut ticks = websocket
+            .take_tick_stream()
+            .ok_or_else(|| anyhow::anyhow!("tick stream was already taken"))?;
+
+        let instruments = Arc::clone(&self.instruments);
+        let sender = get_data_event_sender();
+
+        // The tick path. Everything here runs per tick at market rates, which is why the token
+        // lookup is a hash rather than a scan and why the read lock is released before mapping.
+        get_runtime().spawn(async move {
+            let clock = get_atomic_clock_realtime();
+
+            while let Some(tick) = ticks.recv().await {
+                let details = match instruments.read() {
+                    Ok(guard) => guard.by_token(tick.instrument_token).copied(),
+                    Err(e) => {
+                        log::error!("Instrument registry lock poisoned: {e}");
+                        return;
+                    }
+                };
+
+                let Some(details) = details else {
+                    // Not an error: the venue streams every token we ever subscribed, and a token
+                    // can outlive its registration. Logged at debug so an unregistered instrument
+                    // does not drown the log at tick rates.
+                    log::debug!("No instrument registered for token {}", tick.instrument_token);
+                    continue;
+                };
+
+                let ts_init = clock.get_time_ns();
+
+                match quote_tick_from(
+                    &tick,
+                    details.instrument_id,
+                    details.price_precision,
+                    details.size_precision,
+                    ts_init,
+                ) {
+                    Ok(quote) => {
+                        if sender.send(DataEvent::Data(quote.into())).is_err() {
+                            log::debug!("Data event receiver dropped; stopping Zerodha feed");
+                            return;
+                        }
+                    }
+                    // Expected for ltp and quote-mode packets, which carry no book at all. This is
+                    // the reason `subscribe_quotes` subscribes in FULL mode.
+                    Err(e) => log::debug!("Skipping tick that cannot become a quote: {e}"),
+                }
+            }
+
+            log::debug!("Zerodha tick stream ended");
+        });
+
+        self.websocket = Some(websocket);
+        self.is_connected.store(true, Ordering::Release);
+        log::info!("Zerodha data client {} connected", self.client_id);
+        Ok(())
+    }
+
+    fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
+        let token = self
+            .instruments
+            .read()
+            .map_err(|e| anyhow::anyhow!("instrument registry lock poisoned: {e}"))?
+            .token_of(&cmd.instrument_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Zerodha instrument token registered for {}; the streaming API subscribes \
+                     by token and tokens come only from the REST instrument dump",
+                    cmd.instrument_id,
+                )
+            })?;
+
+        let websocket = self
+            .websocket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Zerodha data client is not connected"))?;
+
+        // FULL, not Quote. Kite's 44-byte `quote` packet carries no book -- only the 184-byte full
+        // packet does -- so subscribing in quote mode yields a stream from which no `QuoteTick`
+        // can ever be built. See `data::parse`.
+        websocket.subscribe(ZerodhaTickMode::Full, vec![token])?;
+
+        log::info!(
+            "Subscribed quotes for {} (token {token}) in full mode",
+            cmd.instrument_id,
+        );
+        Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
+        if let Some(websocket) = self.websocket.as_mut() {
+            websocket.close()?;
+        }
+        self.websocket = None;
         self.is_connected.store(false, Ordering::Release);
+        log::info!("Zerodha data client {} disconnected", self.client_id);
         Ok(())
     }
 }
