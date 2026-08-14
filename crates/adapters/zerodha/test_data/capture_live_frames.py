@@ -50,6 +50,13 @@ So: **bytes are ground truth and live here. Interpretation happens downstream**,
 
 SAFETY
 ------
+⚠️ **THE GATES BELOW PROTECT THE NEXT `git push`, NOT A FUTURE RELEASE.**
+`Tatwam-Labs/nautilus_trader` is a fork of a public repository and is itself **PUBLIC** —
+verified not from the repo setting but from the fact that an **unauthenticated** fetch of a
+committed corpus returns **HTTP 200**. So anything committed and pushed to this branch is
+published at that moment. There is no pre-release window in which to clean it up, and reading
+the redaction as tidiness before a PR is the mistake this paragraph exists to prevent.
+
 * **Read-only.** Market data only. No order path is imported.
 * **Time-bounded.** `--duration` is required and capped; it cannot run unattended forever.
 * **Sampled on SHAPE and spaced in TIME, so the disk cost is bounded and small.** The time
@@ -203,6 +210,11 @@ def _keep_text_frame(payload, text_records: list[dict], stats: dict) -> None:
 
     A frame has to defeat both to leak.
 
+    # Every push is a publication
+
+    This repository is public. The gates are not pre-release hygiene; they run before data reaches
+    a commit, because a commit here is the publication event.
+
     # Non-JSON cannot be scanned
 
     The key scan needs a decoded structure. Non-JSON text is kept and marked
@@ -297,6 +309,7 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
     kws = KiteTicker(api_key, access_token)
     seen: Counter[tuple[int, int]] = Counter()
     last_kept: dict[tuple[int, int], float] = {}
+    heartbeat_times: list[float] = []
     records: list[dict] = []
     text_records: list[dict] = []
     stats = {"frames": 0, "heartbeats": 0, "kept": 0, "text_frames": 0, "text_frames_discarded": 0}
@@ -309,7 +322,11 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
             _keep_text_frame(payload, text_records, stats)
             return
         if len(payload) < 2:
+            # Heartbeats carry no content, but their TIMING is the thing a transport uses to
+            # decide a connection is dead -- and two earlier captures counted 130 of them and
+            # discarded every one, leaving no sample of the interval. Record arrival times only.
             stats["heartbeats"] += 1
+            heartbeat_times.append(time.monotonic())
             return
 
         shapes = _packet_shapes(payload)
@@ -355,7 +372,7 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
         try:
             kws.close()
         finally:
-            _write(out_path, records, text_records, groups, stats, seen)
+            _write(out_path, records, text_records, groups, stats, seen, heartbeat_times)
             _report(stats, seen, out_path)
             sys.stdout.flush()
             # os._exit, NOT sys.exit. MEASURED on the first live run: KiteTicker.connect()
@@ -398,7 +415,7 @@ def _jsonable(value):
     return value
 
 
-def _write(path: Path, records, text_records, groups, stats, seen) -> None:
+def _write(path: Path, records, text_records, groups, stats, seen, heartbeat_times=()) -> None:
     header = {
         "_comment": (
             "RAW frames captured from a live Zerodha WebSocket, recorded BEFORE any decode. "
@@ -420,18 +437,59 @@ def _write(path: Path, records, text_records, groups, stats, seen) -> None:
         "captured_tokens": sorted(t for toks in groups.values() for t in toks),
         "mode": "+".join(groups),
         "stats": dict(stats),
+        # Intervals only, never absolute times -- the interval is the transport-relevant fact
+        # and it carries nothing about when we were connected.
+        "heartbeat_intervals_secs": (
+            [round(b - a, 3) for a, b in zip(heartbeat_times, heartbeat_times[1:])]
+            if len(heartbeat_times) > 1 else []
+        ),
         "shape_coverage": [
             {"packet_len": p, "segment": s, "count": c} for (p, s), c in sorted(seen.items())
         ],
     }
+    # LAST GATE, AT THE POINT OF WRITING. The per-frame scan should already have caught this;
+    # this catches the case where it did not.
+    #
+    # It is here because a miss is UNRECOVERABLE. This repository is public, so the commit that
+    # adds a corpus publishes it, and editing the file afterwards leaves the data in git history.
+    # There is no "clean it up before the PR" step to fall back on.
+    #
+    # Refusing to write is the only remedy that works, so the check runs where the data would
+    # otherwise reach disk rather than where someone has to remember to look.
+    rendered = json.dumps({"header": header, "records": records, "text_records": text_records},
+                          indent=2)
+    # BARE substring, not the quoted key. json.dumps ESCAPES the inner quotes of a stored raw
+    # string, so `"order_id"` inside a captured payload renders as `\"order_id\"` and a quoted
+    # pattern never matches it. That exact mistake was in the first version of this gate and it
+    # wrote the file its negative control was built to stop.
+    #
+    # A bare scan over-matches -- a legitimate error string containing "user_id" would block the
+    # write. That is the correct direction for a last-resort gate whose miss is unrecoverable:
+    # a false positive is visible and fixable in seconds, a false negative is public forever.
+    offenders = sorted(k for k in ORDER_IDENTIFYING_KEYS if k in rendered)
+
+    # SECOND, INDEPENDENT REPRESENTATION. The scan above reads the serialised TEXT; this one
+    # re-parses each stored payload and walks the STRUCTURE. Deliberate duplication: the bug this
+    # gate shipped with was a scan that read the wrong representation, so neither representation
+    # is now the only thing checked.
+    for record in text_records:
+        try:
+            if _has_order_keys(json.loads(record.get("raw", ""))):
+                offenders.append(f"structural:{record.get('type')!r}")
+        except (ValueError, TypeError):
+            pass  # Non-JSON is flagged for human review elsewhere; it cannot be walked.
+
+    if offenders:
+        raise SystemExit(
+            "REFUSING TO WRITE: order-identifying keys reached the corpus: "
+            f"{offenders}\n"
+            "The per-frame redaction did not hold. Nothing has been written. Do not work around "
+            "this by editing the output -- fix the gate in _keep_text_frame and recapture."
+        )
+
     # Written whole then renamed, so a reader never sees a half-written capture.
     tmp = path.with_suffix(path.suffix + ".partial")
-    tmp.write_text(
-        json.dumps(
-            {"header": header, "records": records, "text_records": text_records}, indent=2
-        )
-        + "\n"
-    )
+    tmp.write_text(rendered + "\n")
     tmp.replace(path)
 
 
