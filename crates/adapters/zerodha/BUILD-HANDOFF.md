@@ -9,22 +9,26 @@
 
 ## Why this file exists
 
-**Status: first compile DONE on the MacBook Pro, 2026-08-14, at `84d2bcb079` — 0 errors, 0 warnings,
-16/17 tests passing.** Details in §4. Rust builds remain prohibited on the Mac mini (16 GB, runs the
-live/paper stack), so this file is still the route for every build.
+Rust builds are prohibited on the Mac mini (16 GB, runs the live/paper stack), so **everything in
+this crate is authored without a compiler and verified on the MacBook Pro.** This file is the route
+for every build.
 
-**Second build, `e8e65a4b61`, 2026-08-14 — everything authored without a compiler now VERIFIED:**
+**Build log — what has actually been verified, and at which commit:**
 
-| Check | Result |
-|---|---|
-| `cargo test -p nautilus-zerodha` — decoder | **17/17** (the ordering fix is correct) |
-| `credential` module — first ever compile | **13/13** |
-| `cargo clippy --features python --all-targets` | **exit 0, 0 warnings** |
-| `check_nautilus_conventions.sh` | **exit 0** |
-| `pytest test_public_exports.py` | **121 passed** |
-| Registration surface #11 | **closed** — stub generated and committed |
+| # | commit | result |
+|---|---|---|
+| 1 | `84d2bcb079` | First compile. **0 errors, 0 warnings** on ~2,000 unseen lines. 16/17 — one real decoder bug (§4a). |
+| 2 | `e8e65a4b61` | **17/17** decoder (ordering fix correct) · **13/13** credential, first ever compile · clippy clean · hook clean · 121 pytest · surface #11 closed |
+| 3 | `554fe5191d` | **35/35** — adds `live_frames.rs` against **real captured bytes**. Build 2m02s. `Cargo.lock` untouched. ❌ clippy: `needless_pass_by_value` |
+| 4 | `89c1bc6701` | clippy re-run: first lint gone. ❌ second lint **uncovered, not caused** — `unnecessary_to_owned` |
+| 5 | `92cdcaa146` | **PENDING** — `as_ref()` fix applied here, verified sufficient on the build host before sending |
 
-**Anything committed after `e8e65a4b61` is again unverified** unless this table says otherwise.
+**Anything committed after the last VERIFIED row is unverified** unless this table says otherwise.
+
+> **A caution about the test count.** Build 3 was predicted as 34 tests and ran 35 — an expectation
+> quoted from memory, against a file that had one more `#[test]` than remembered. It landed in the
+> harmless direction; **34 against an expected 34, with one test silently not compiled in, reads as
+> success to everyone.** Count `#[test]` from the files, never from anything this document tells you.
 
 > ## ⚠️ TWO FIXTURE SETS NOW, AND THEY ARE NOT EQUAL EVIDENCE
 >
