@@ -18,9 +18,11 @@
 pub mod error;
 pub mod messages;
 pub mod parse;
+pub mod subscription;
 
 pub use crate::websocket::{
     error::ZerodhaWsError,
     messages::{KiteDepth, KiteDepthEntry, KiteOhlc, KiteTick},
     parse::{parse_binary, parse_packet, split_packets},
+    subscription::{KiteRequest, SubscriptionState},
 };
