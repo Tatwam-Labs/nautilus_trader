@@ -274,12 +274,18 @@ def _write(path: Path, records, groups, stats, seen) -> None:
     header = {
         "_comment": (
             "RAW frames captured from a live Zerodha WebSocket, recorded BEFORE any decode. "
-            "Unlike fixtures.json these are ground truth from the venue, not constructed "
-            "from the published layout. 'reference_decoded' is the kiteconnect client's "
-            "reading of these bytes -- one implementation's interpretation, kept alongside "
-            "the bytes rather than replacing them."
+            "Unlike fixtures.json these are ground truth from the venue, not constructed from "
+            "the published layout. "
+            "NO DECODED VALUES ARE STORED HERE, DELIBERATELY: a corpus that carries one "
+            "implementation's reading hands that reading to every fixture derived from it, "
+            "which re-closes the circle live capture exists to break. Expected values must be "
+            "derived downstream by an oracle named with its version. "
+            "STRUCTURE: a record is one WebSocket MESSAGE, not one packet. A message carries "
+            "several packets and 'shapes' lists them, so the record count is NOT the packet "
+            "count -- a deriver written against records will get the framing wrong."
         ),
-        "reference_implementation": f"kiteconnect {KITECONNECT_VERSION}",
+        # The library used for TRANSPORT only. It decoded nothing that reached this file.
+        "captured_with": f"kiteconnect {KITECONNECT_VERSION} (transport only, not an oracle)",
         # WHICH TOKEN WAS IN WHICH MODE. Without this the bytes cannot be interpreted
         # later: the mode is half of what determines the layout under test.
         "subscriptions": {m: toks for m, toks in groups.items()},

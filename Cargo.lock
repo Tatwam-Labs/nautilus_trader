@@ -6909,6 +6909,7 @@ dependencies = [
  "nautilus-tardis",
  "nautilus-testkit",
  "nautilus-trading",
+ "nautilus-zerodha",
  "pyo3",
  "pyo3-stub-gen",
 ]
@@ -7160,6 +7161,30 @@ dependencies = [
  "nautilus-model",
  "nautilus-trading",
  "tokio",
+]
+
+[[package]]
+name = "nautilus-zerodha"
+version = "0.62.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rstest",
+ "serde",
+ "serde_json",
+ "strum 0.28.0",
+ "thiserror 2.0.20",
+ "zeroize",
 ]
 
 [[package]]
