@@ -23,7 +23,16 @@ use crate::common::{
 };
 
 /// Configuration for the Zerodha data client.
-#[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
+///
+/// [`Debug`] is implemented BY HAND to redact both credential fields. Deriving it would print a
+/// live session token into any log line or error that formats a config — and one already does:
+/// [`crate::factories::ZerodhaDataClientFactory::create`] formats `{config:?}` into its
+/// wrong-config error. Deriving `Debug` here also leaked through
+/// [`crate::data::ZerodhaDataClient`], which derives `Debug` over a `config` field.
+///
+/// `Serialize` is still derived, because round-tripping the config must preserve the values. The
+/// distinction is deliberate: serialisation is asked for, formatting happens by accident.
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
 #[cfg_attr(
     feature = "python",
@@ -66,6 +75,23 @@ nautilus_core::impl_pyo3_config_getters!(ZerodhaDataClientConfig {
     ws_timeout_secs: u64,
     update_instruments_interval_mins: u64,
 });
+
+impl std::fmt::Debug for ZerodhaDataClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ZerodhaDataClientConfig))
+            .field("api_key", &self.api_key.as_ref().map(|_| "***redacted***"))
+            .field("access_token", &self.access_token.as_ref().map(|_| "***redacted***"))
+            .field("base_url_http", &self.base_url_http)
+            .field("base_url_ws", &self.base_url_ws)
+            .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("ws_timeout_secs", &self.ws_timeout_secs)
+            .field(
+                "update_instruments_interval_mins",
+                &self.update_instruments_interval_mins,
+            )
+            .finish()
+    }
+}
 
 impl Default for ZerodhaDataClientConfig {
     fn default() -> Self {
@@ -117,5 +143,72 @@ impl ZerodhaDataClientConfig {
         self.base_url_ws
             .clone()
             .unwrap_or_else(|| ZERODHA_WS_URL.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    const TOKEN: &str = "ldyr-live-session-token-value";
+    const KEY: &str = "c5gabz-api-key-value";
+
+    fn populated() -> ZerodhaDataClientConfig {
+        ZerodhaDataClientConfig {
+            api_key: Some(KEY.to_string()),
+            access_token: Some(TOKEN.to_string()),
+            ..ZerodhaDataClientConfig::default()
+        }
+    }
+
+    #[rstest]
+    fn test_debug_does_not_print_credentials() {
+        // REGRESSION. This config derived `Debug` until 2026-08-14, and the crate formats a config
+        // into an error string in `factories.rs` -- so a wrong-config error printed a live session
+        // token. Found by review, not by any test, which is why this one exists.
+        let rendered = format!("{:?}", populated());
+        assert!(!rendered.contains(TOKEN), "access token leaked into Debug: {rendered}");
+        assert!(!rendered.contains(KEY), "api key leaked into Debug: {rendered}");
+        assert!(rendered.contains("redacted"), "redaction marker missing: {rendered}");
+    }
+
+    #[rstest]
+    fn test_debug_of_the_client_does_not_print_credentials() {
+        // The leak reached `Debug` on the CLIENT through its `config` field, which is the path the
+        // client's own doc comment wrongly asserted was safe. Asserted at that level too, because
+        // fixing the config alone would not have been visible here.
+        let client = crate::data::ZerodhaDataClient::new(
+            nautilus_model::identifiers::ClientId::from("ZERODHA-DEBUG-TEST"),
+            populated(),
+        )
+        .expect("a fully populated config should construct");
+
+        let rendered = format!("{client:?}");
+        assert!(!rendered.contains(TOKEN), "access token leaked via the client: {rendered}");
+        assert!(!rendered.contains(KEY), "api key leaked via the client: {rendered}");
+    }
+
+    #[rstest]
+    fn test_debug_still_shows_the_non_secret_fields() {
+        // Redaction that hides everything is unusable and invites someone to remove it. The
+        // operational fields must survive.
+        let rendered = format!("{:?}", populated());
+        for field in ["http_timeout_secs", "ws_timeout_secs", "update_instruments_interval_mins"] {
+            assert!(rendered.contains(field), "{field} missing from Debug: {rendered}");
+        }
+    }
+
+    #[rstest]
+    fn test_serialize_still_round_trips_the_credentials() {
+        // Serialization must NOT be redacted -- the distinction is deliberate: serialising is asked
+        // for, formatting happens by accident. If someone "fixes" serde the same way as Debug, a
+        // persisted config would silently lose its credentials.
+        let json = serde_json::to_string(&populated()).expect("config should serialize");
+        let back: ZerodhaDataClientConfig =
+            serde_json::from_str(&json).expect("config should deserialize");
+        assert_eq!(back.access_token.as_deref(), Some(TOKEN));
+        assert_eq!(back.api_key.as_deref(), Some(KEY));
     }
 }
