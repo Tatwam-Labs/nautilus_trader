@@ -121,9 +121,25 @@ cargo test -p nautilus-zerodha
 # The conventions hook: registration allowlist vs crates/pyo3/src/lib.rs
 bash .pre-commit-hooks/check_nautilus_conventions.sh
 
-# The Python surface, after the build has produced the extension module
-uv run --no-sync pytest python/tests/unit/adapters/test_public_exports.py
+# The Python surface, after the build has produced the extension module.
+# Run from python/, not the repo root — see the note below.
+cd python && VIRTUAL_ENV= uv run --no-sync pytest -rfE tests/unit/adapters/test_public_exports.py
 ```
+
+> ⚠️ **This command was wrong in an earlier revision** and the correction is worth reading, because
+> the wrong form may still appear to work.
+>
+> It previously read `uv run --no-sync pytest python/tests/...` **from the repo root**. There is no
+> `pyproject.toml` at the repo root — the only one is `python/pyproject.toml` — and `uv` resolves a
+> project by searching the working directory and its **ancestors**, never its descendants. Every
+> `pytest` invocation in the `Makefile` is `cd python && VIRTUAL_ENV= uv run --no-sync pytest …`,
+> and the `VIRTUAL_ENV=` prefix is there deliberately, to stop an already-activated venv from
+> hijacking the run.
+>
+> **UNKNOWN, and it is yours to settle:** the first build reported this test as `121 passed` while
+> quoting the repo-root form. Either it was actually run from `python/`, or `uv` did something I
+> cannot predict from here. Please say which — if the root form genuinely works, this note is the
+> thing that is wrong, and I would rather know that than leave a correction that is itself untrue.
 
 ## 4. Where the first errors were predicted — and what actually happened
 

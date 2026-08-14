@@ -24,6 +24,22 @@ use zeroize::ZeroizeOnDrop;
 const KEY_PREFIX_LEN: usize = 4;
 
 /// Returns the `(api_key, access_token)` environment variable names.
+///
+/// # Call this; do not hand-write the names
+///
+/// **An error message that names a remedy is an assertion about the code, and it should be tested
+/// like one.** This function is the single source of those two names, so the message raised when
+/// resolution fails and the variables actually consulted cannot drift apart.
+///
+/// That is not a style preference — it is a repair. An earlier revision hand-wrote the names into
+/// both the config doc comments and the "credentials required" error, while **no code in the crate
+/// read an environment variable at all**. The result was a *self-reinforcing* error: a user set
+/// `ZERODHA_API_KEY`, retried, failed identically, and was told again to set `ZERODHA_API_KEY`.
+/// Following correct-looking advice never converged, and every attempt looked like the previous one
+/// had simply been done wrong.
+///
+/// A remedy hint that can be wrong independently of the code is worse than no hint, because it
+/// removes the user's route to discovering the real fault. Derive it, do not restate it.
 #[must_use]
 pub const fn credential_env_vars() -> (&'static str, &'static str) {
     ("ZERODHA_API_KEY", "ZERODHA_ACCESS_TOKEN")
