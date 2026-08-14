@@ -347,11 +347,22 @@ fn a_frame_is_never_stamped_before_the_trade_it_reports() {
         }
     }
 
+    // DO NOT REMOVE THIS AS REDUNDANT. It is what stops the test above passing VACUOUSLY.
+    //
+    // The loop `continue`s on coincident packets, which is correct -- they carry no ordering
+    // information. But that means a decoder reading BOTH fields from the SAME offset would make
+    // every packet coincident, skip every iteration, and reach the end having executed the
+    // ordering assertion ZERO times. Green, and it checked nothing.
+    //
+    // Requiring the separated count keeps the test honest against that, and against the milder
+    // case of the wrong corpus being wired up.
     assert!(
         separated >= 3,
-        "only {separated} packets separate the two timestamps; this corpus was captured \
-         specifically to provide them, so fewer than 3 means the wrong corpus is wired up and \
-         the ordering is no longer actually being tested",
+        "only {separated} of the captured packets separate the two timestamps, so the ordering \
+         assertion above ran {separated} times and this test proved almost nothing.\n\
+         Two causes, both real:\n\
+           1. the decoder reads BOTH fields from the same offset, making every packet coincident\n\
+           2. the wrong corpus is wired up (this one was captured specifically to separate them)",
     );
 }
 
