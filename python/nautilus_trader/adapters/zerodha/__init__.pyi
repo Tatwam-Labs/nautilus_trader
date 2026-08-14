@@ -22,9 +22,21 @@ class ZerodhaDataClientConfig:
     def ws_timeout_secs(self) -> int: ...
     @property
     def update_instruments_interval_mins(self) -> int: ...
+    def __init__(
+        self,
+        api_key: str | None = None,
+        access_token: str | None = None,
+        base_url_http: str | None = None,
+        base_url_ws: str | None = None,
+        http_timeout_secs: int | None = None,
+        ws_timeout_secs: int | None = None,
+        update_instruments_interval_mins: int | None = None,
+    ) -> None: ...
 
 @typing.final
-class ZerodhaDataClientFactory: ...
+class ZerodhaDataClientFactory:
+    def __init__(self) -> None: ...
+    def name(self) -> str: ...
 
 @typing.final
 class ZerodhaSegment(enum.Enum):
