@@ -48,9 +48,7 @@ use nautilus_common::{
 };
 use nautilus_model::identifiers::ClientId;
 
-use crate::{
-    common::consts::ZERODHA, config::ZerodhaDataClientConfig, data::ZerodhaDataClient,
-};
+use crate::{common::consts::ZERODHA, config::ZerodhaDataClientConfig, data::ZerodhaDataClient};
 
 impl ClientConfig for ZerodhaDataClientConfig {
     fn as_any(&self) -> &dyn Any {

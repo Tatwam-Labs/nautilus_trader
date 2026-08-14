@@ -82,7 +82,10 @@ impl Debug for ZerodhaDataClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(ZerodhaDataClientConfig))
             .field("api_key", &self.api_key.as_ref().map(|_| "***redacted***"))
-            .field("access_token", &self.access_token.as_ref().map(|_| "***redacted***"))
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "***redacted***"),
+            )
             .field("base_url_http", &self.base_url_http)
             .field("base_url_ws", &self.base_url_ws)
             .field("http_timeout_secs", &self.http_timeout_secs)
@@ -173,9 +176,18 @@ mod tests {
         // into an error string in `factories.rs` -- so a wrong-config error printed a live session
         // token. Found by review, not by any test, which is why this one exists.
         let rendered = format!("{:?}", populated());
-        assert!(!rendered.contains(TOKEN), "access token leaked into Debug: {rendered}");
-        assert!(!rendered.contains(KEY), "api key leaked into Debug: {rendered}");
-        assert!(rendered.contains("redacted"), "redaction marker missing: {rendered}");
+        assert!(
+            !rendered.contains(TOKEN),
+            "access token leaked into Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(KEY),
+            "api key leaked into Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "redaction marker missing: {rendered}"
+        );
     }
 
     #[rstest]
@@ -183,15 +195,18 @@ mod tests {
         // The leak reached `Debug` on the CLIENT through its `config` field, which is the path the
         // client's own doc comment wrongly asserted was safe. Asserted at that level too, because
         // fixing the config alone would not have been visible here.
-        let client = ZerodhaDataClient::new(
-            ClientId::from("ZERODHA-DEBUG-TEST"),
-            populated(),
-        )
-        .expect("a fully populated config should construct");
+        let client = ZerodhaDataClient::new(ClientId::from("ZERODHA-DEBUG-TEST"), populated())
+            .expect("a fully populated config should construct");
 
         let rendered = format!("{client:?}");
-        assert!(!rendered.contains(TOKEN), "access token leaked via the client: {rendered}");
-        assert!(!rendered.contains(KEY), "api key leaked via the client: {rendered}");
+        assert!(
+            !rendered.contains(TOKEN),
+            "access token leaked via the client: {rendered}"
+        );
+        assert!(
+            !rendered.contains(KEY),
+            "api key leaked via the client: {rendered}"
+        );
     }
 
     #[rstest]
@@ -199,8 +214,16 @@ mod tests {
         // Redaction that hides everything is unusable and invites someone to remove it. The
         // operational fields must survive.
         let rendered = format!("{:?}", populated());
-        for field in ["http_timeout_secs", "ws_timeout_secs", "update_instruments_interval_mins"] {
-            assert!(rendered.contains(field), "{field} missing from Debug: {rendered}");
+
+        for field in [
+            "http_timeout_secs",
+            "ws_timeout_secs",
+            "update_instruments_interval_mins",
+        ] {
+            assert!(
+                rendered.contains(field),
+                "{field} missing from Debug: {rendered}"
+            );
         }
     }
 
