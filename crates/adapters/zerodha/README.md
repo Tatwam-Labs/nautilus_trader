@@ -19,12 +19,17 @@ rather than reporting a connected client that never streams.
 
 | area | state |
 |---|---|
-| Binary tick decoder (LTP / quote / full, all segments, depth) | implemented — **17 constructed-fixture tests + 5 against real captured bytes** |
+| Binary **wire** decode — bytes → `KiteTick` (all 5 layouts, all segments, depth) | implemented — **17 constructed-fixture tests + 5 against real captured bytes** |
 | Config, factory, credential resolution | implemented, **13 unit tests** |
 | PyO3 registration | implemented, builds into the extension module |
-| WebSocket transport | not started |
+| **Domain mapping** — `KiteTick` → `QuoteTick` / `TradeTick` | **not started** |
+| WebSocket transport (connect, subscribe, dispatch, resubscribe) | not started |
 | REST instrument provider | not started |
 | Historical requests, execution client | not started |
+
+> **"The decoder is done" means the WIRE decode.** `parse_packet` produces a `KiteTick` — a venue
+> struct. Nothing here yet produces a Nautilus `QuoteTick`. The two are easy to conflate, and the
+> second is where an adapter usually gets its *semantics* wrong rather than its bytes.
 
 **35 tests total**, last verified on a build host at `92cdcaa146`. The two decoder suites are not
 equal evidence — see *Fixtures* below.
