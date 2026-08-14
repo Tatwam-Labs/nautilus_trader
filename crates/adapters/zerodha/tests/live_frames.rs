@@ -99,7 +99,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 }
 
 /// Formats a disagreement so it can be adjudicated without re-running anything.
-fn disagreement(field: &str, hex: &str, ours: String, theirs: String) -> String {
+fn disagreement(field: &str, hex: &str, ours: &str, theirs: &str) -> String {
     format!(
         "\n  FIELD    {field}\n  DECODER  {ours}\n  ORACLE   {theirs}\n  PACKET   {hex}\n\
          \n  This is a RESULT, not necessarily a decoder bug. Report the packet, both readings and\
@@ -129,13 +129,13 @@ fn expect_opt_u32(actual: Option<u32>, expected: Option<&Value>, field: &str, he
                 actual,
                 Some(u32::try_from(want).expect("exceeds u32")),
                 "{}",
-                disagreement(field, hex, format!("{actual:?}"), format!("{want}")),
+                disagreement(field, hex, &format!("{actual:?}"), &format!("{want}")),
             );
         }
         None => assert_eq!(
             actual, None,
             "{}",
-            disagreement(field, hex, format!("{actual:?}"), "absent".to_string()),
+            disagreement(field, hex, &format!("{actual:?}"), "absent"),
         ),
     }
 }
@@ -156,7 +156,7 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
             let want = &pair["expected"];
 
             let tick = parse_packet(&packet)
-                .unwrap_or_else(|e| panic!("{}", disagreement("decode", hex, e.to_string(), "decoded ok".into())));
+                .unwrap_or_else(|e| panic!("{}", disagreement("decode", hex, &e.to_string(), "decoded ok")));
 
             lengths.push(packet.len());
             checked += 1;
@@ -164,23 +164,23 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
             assert_eq!(
                 u64::from(tick.instrument_token),
                 want["instrument_token"].as_u64().expect("instrument_token"),
-                "{}", disagreement("instrument_token", hex, tick.instrument_token.to_string(), want["instrument_token"].to_string()),
+                "{}", disagreement("instrument_token", hex, &tick.instrument_token.to_string(), &want["instrument_token"].to_string()),
             );
             assert_eq!(
                 tick.tradable,
                 want["tradable"].as_bool().expect("tradable"),
-                "{}", disagreement("tradable", hex, tick.tradable.to_string(), want["tradable"].to_string()),
+                "{}", disagreement("tradable", hex, &tick.tradable.to_string(), &want["tradable"].to_string()),
             );
             assert_eq!(
                 tick.mode.to_string(),
                 want["mode"].as_str().expect("mode"),
-                "{}", disagreement("mode", hex, tick.mode.to_string(), want["mode"].to_string()),
+                "{}", disagreement("mode", hex, &tick.mode.to_string(), &want["mode"].to_string()),
             );
 
             let lp = want["last_price"].as_f64().expect("last_price");
             assert!(
                 close_enough(tick.last_price, lp),
-                "{}", disagreement("last_price", hex, tick.last_price.to_string(), lp.to_string()),
+                "{}", disagreement("last_price", hex, &tick.last_price.to_string(), &lp.to_string()),
             );
 
             // OHLC. The FIELD ORDER differs between index and tradable layouts, and a
@@ -197,18 +197,18 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
                         let theirs = w[key].as_f64().unwrap_or_else(|| panic!("ohlc.{key}"));
                         assert!(
                             close_enough(ours, theirs),
-                            "{}", disagreement(&format!("ohlc.{key}"), hex, ours.to_string(), theirs.to_string()),
+                            "{}", disagreement(&format!("ohlc.{key}"), hex, &ours.to_string(), &theirs.to_string()),
                         );
                     }
                     let ch = want["change"].as_f64().expect("change");
                     assert!(
                         close_enough(tick.change, ch),
-                        "{}", disagreement("change", hex, tick.change.to_string(), ch.to_string()),
+                        "{}", disagreement("change", hex, &tick.change.to_string(), &ch.to_string()),
                     );
                 }
                 (None, None) => {}
                 (a, w) => panic!(
-                    "{}", disagreement("ohlc presence", hex, a.is_some().to_string(), w.is_some().to_string()),
+                    "{}", disagreement("ohlc presence", hex, &a.is_some().to_string(), &w.is_some().to_string()),
                 ),
             }
 
@@ -226,7 +226,7 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
                 let ours = tick.average_traded_price.expect("decoder produced no average_traded_price");
                 assert!(
                     close_enough(ours, avg),
-                    "{}", disagreement("average_traded_price", hex, ours.to_string(), avg.to_string()),
+                    "{}", disagreement("average_traded_price", hex, &ours.to_string(), &avg.to_string()),
                 );
             }
 
@@ -238,28 +238,28 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
                         let theirs = w[side].as_array().unwrap_or_else(|| panic!("depth.{side}"));
                         assert_eq!(
                             ours.len(), theirs.len(),
-                            "{}", disagreement(&format!("depth.{side}.len"), hex, ours.len().to_string(), theirs.len().to_string()),
+                            "{}", disagreement(&format!("depth.{side}.len"), hex, &ours.len().to_string(), &theirs.len().to_string()),
                         );
                         for (i, (a, b)) in ours.iter().zip(theirs).enumerate() {
                             assert_eq!(
                                 u64::from(a.quantity), b["quantity"].as_u64().expect("quantity"),
-                                "{}", disagreement(&format!("depth.{side}[{i}].quantity"), hex, a.quantity.to_string(), b["quantity"].to_string()),
+                                "{}", disagreement(&format!("depth.{side}[{i}].quantity"), hex, &a.quantity.to_string(), &b["quantity"].to_string()),
                             );
                             assert_eq!(
                                 u64::from(a.orders), b["orders"].as_u64().expect("orders"),
-                                "{}", disagreement(&format!("depth.{side}[{i}].orders"), hex, a.orders.to_string(), b["orders"].to_string()),
+                                "{}", disagreement(&format!("depth.{side}[{i}].orders"), hex, &a.orders.to_string(), &b["orders"].to_string()),
                             );
                             let bp = b["price"].as_f64().expect("price");
                             assert!(
                                 close_enough(a.price, bp),
-                                "{}", disagreement(&format!("depth.{side}[{i}].price"), hex, a.price.to_string(), bp.to_string()),
+                                "{}", disagreement(&format!("depth.{side}[{i}].price"), hex, &a.price.to_string(), &bp.to_string()),
                             );
                         }
                     }
                 }
                 (None, None) => {}
                 (a, w) => panic!(
-                    "{}", disagreement("depth presence", hex, a.is_some().to_string(), w.is_some().to_string()),
+                    "{}", disagreement("depth presence", hex, &a.is_some().to_string(), &w.is_some().to_string()),
                 ),
             }
         }
@@ -301,7 +301,7 @@ fn decoder_agrees_with_the_vendor_client_on_the_deep_otm_packets() {
             assert_eq!(
                 u64::from(tick.instrument_token),
                 want["instrument_token"].as_u64().expect("instrument_token"),
-                "{}", disagreement("instrument_token", hex, tick.instrument_token.to_string(), want["instrument_token"].to_string()),
+                "{}", disagreement("instrument_token", hex, &tick.instrument_token.to_string(), &want["instrument_token"].to_string()),
             );
             expect_opt_u32(tick.exchange_timestamp, want.get("exchange_timestamp"), "exchange_timestamp", hex);
             expect_opt_u32(tick.last_trade_time, want.get("last_trade_time"), "last_trade_time", hex);
