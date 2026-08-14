@@ -50,6 +50,10 @@ SAFETY
 ------
 * **Read-only.** Market data only. No order path is imported.
 * **Time-bounded.** `--duration` is required and capped; it cannot run unattended forever.
+* **Sampled on SHAPE and spaced in TIME, so the disk cost is bounded and small.** The time
+  spacing matters as much as the cap: shape sampling alone answers "which layouts exist" and
+  cannot answer anything about how a field CHANGES, because a single message can fill a
+  shape's quota with four copies of one instant.
 * **Shape-sampled, so the disk cost is bounded and small.** It keeps at most
   `MAX_PER_SHAPE` (3) examples of each distinct `(packet_length, segment)` pair. Five
   layouts across nine segments is 45 shapes, so **135 frames maximum, well under 100 KB --
@@ -105,6 +109,15 @@ except ImportError:
 # A capture is for shape coverage, not volume. Keeping a handful of each distinct shape
 # gives every layout and segment combination without writing a gigabyte of near-duplicates.
 MAX_PER_SHAPE = 3
+# Minimum seconds between two KEPT samples of the same shape.
+#
+# Shape sampling alone answers "which layouts exist" and CANNOT answer anything about how a
+# field changes over time. Measured 2026-08-14: one WebSocket message carried four packets of
+# the same shape and took it straight to MAX_PER_SHAPE, so a 300-second run kept ONE message
+# out of 952 frames. The question that run existed to answer -- whether two timestamp fields
+# ever separate -- then rested entirely on that first message happening to contain the answer.
+# Spacing repeat samples in time makes the corpus span the session rather than an instant.
+MIN_SHAPE_INTERVAL_SECS = 20.0
 # Hard ceiling on --duration. A capture script that can run indefinitely will eventually be
 # left running by accident against a connection-capped API key.
 MAX_DURATION_SECS = 900
@@ -180,6 +193,7 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
 
     kws = KiteTicker(api_key, access_token)
     seen: Counter[tuple[int, int]] = Counter()
+    last_kept: dict[tuple[int, int], float] = {}
     records: list[dict] = []
     stats = {"frames": 0, "heartbeats": 0, "kept": 0}
     started = time.monotonic()
@@ -194,11 +208,20 @@ def capture(groups: dict[str, list[int]], duration: int, out_path: Path) -> int:
             return
 
         shapes = _packet_shapes(payload)
-        # Keep the frame if it contains any shape we are still short of.
-        if not any(seen[s] < MAX_PER_SHAPE for s in shapes):
+        now = time.monotonic()
+        # Keep the frame if it carries any shape that is BOTH under its cap AND not sampled too
+        # recently. The time gate is what makes repeat samples informative rather than four
+        # copies of the same instant -- see MIN_SHAPE_INTERVAL_SECS.
+        wanted = [
+            s for s in shapes
+            if seen[s] < MAX_PER_SHAPE
+            and (s not in last_kept or now - last_kept[s] >= MIN_SHAPE_INTERVAL_SECS)
+        ]
+        if not wanted:
             return
-        for s in shapes:
+        for s in wanted:
             seen[s] += 1
+            last_kept[s] = now
 
         # BYTES ONLY. No decoded form is stored here, deliberately -- see the module docstring
         # section "Why no decoded values are recorded".
