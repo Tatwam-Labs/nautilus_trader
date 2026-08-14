@@ -190,18 +190,67 @@ async def main() -> None:
         await node.stop()
         node.dispose()
 
-    print("\n=== RESULT ===")
+    report(node, strategy)
+
+
+def report(node: LiveNode, strategy: MinimalRoundTrip | None) -> None:
+    """Prints the paper-trading result: what was traded, what filled, and what it made or lost.
+
+    Counters alone are not a report. A run that submits two orders and fills neither has the same
+    order count as a run that filled both, and only the money tells them apart.
+    """
+    venue = Venue("MCX")
+
+    print("\n" + "=" * 62)
+    print("  PAPER TRADING REPORT — Zerodha MCX via Nautilus sandbox execution")
+    print("=" * 62)
 
     if strategy is None:
-        print("  could not reach the strategy instance to report; check the node API")
+        print("  could not reach the strategy instance; check the node API")
         return
 
-    print(f"  quotes received  : {strategy.quotes}")
-    print(f"  orders submitted : {strategy.orders_submitted}")
-    print(f"  fills received   : {strategy.fills}")
+    print("\n  FEED")
+    print(f"    quotes received     : {strategy.quotes}")
+    print(f"    orders submitted    : {strategy.orders_submitted}")
+    print(f"    fills received      : {strategy.fills}")
+
+    # --- orders and fills, from the cache rather than the strategy's own counters ---
+    # Deliberately a SECOND source. The strategy counts what it thinks it did; the cache records
+    # what the engine actually processed. If those disagree, the disagreement is the finding.
+    try:
+        orders = node.cache.orders()
+        print("\n  ORDERS (from the engine cache, not the strategy's counters)")
+
+        for order in orders:
+            print(
+                f"    {order.side} {order.quantity} {order.instrument_id} "
+                f"status={order.status} filled={order.filled_qty} avg_px={order.avg_px}"
+            )
+
+        if not orders:
+            print("    (none)")
+    except Exception as e:  # noqa: BLE001 - a reporting failure must not mask the run's result
+        print(f"    could not read orders from the cache: {e}")
+
+    # --- the money ---
+    try:
+        account = node.portfolio.account(venue)
+        print("\n  ACCOUNT")
+        print(f"    balances            : {account.balances_total() if account else 'n/a'}")
+
+        print("\n  P&L")
+        print(f"    realised            : {node.portfolio.realized_pnls(venue=venue)}")
+        print(f"    unrealised          : {node.portfolio.unrealized_pnls(venue=venue)}")
+        print(f"    total               : {node.portfolio.total_pnls(venue=venue)}")
+        print(f"    equity              : {node.portfolio.equity(venue=venue)}")
+        print(f"    net position {INSTRUMENT_ID}: {node.portfolio.net_position(INSTRUMENT_ID)}")
+    except Exception as e:  # noqa: BLE001
+        print(f"    could not read the portfolio: {e}")
 
     # The verdict separates outcomes a count cannot. "Submitted but never filled" is the likeliest
     # failure and must not read as success.
+    print("\n  VERDICT")
+
     if strategy.quotes == 0:
         verdict = "NO QUOTES — the data client never delivered. Market closed, or the adapter is not wired."
     elif strategy.orders_submitted == 0:
