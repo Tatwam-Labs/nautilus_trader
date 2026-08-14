@@ -46,8 +46,11 @@
 
 use std::{env, time::Duration};
 
+use nautilus_core::UnixNanos;
+use nautilus_model::identifiers::InstrumentId;
 use nautilus_zerodha::{
     common::{credential::ZerodhaCredential, enums::ZerodhaTickMode},
+    data::parse::TradeTracker,
     http::client::ZerodhaHttpClient,
     websocket::client::ZerodhaWebSocketClient,
 };
@@ -108,6 +111,16 @@ async fn main() -> anyhow::Result<()> {
     ws.subscribe(ZerodhaTickMode::Full, vec![target.instrument_token])?;
     println!("subscribed {} in FULL mode; listening {seconds}s", target.tradingsymbol);
 
+    // The trade path is the half the first run did NOT exercise. Depth arrives on every tick, so
+    // the quote mapper was proven immediately; a trade only appears when cumulative volume MOVES,
+    // which needs something to actually trade during the window.
+    let mut tracker = TradeTracker::new();
+    let instrument_id = InstrumentId::from(
+        format!("{}.{}", target.tradingsymbol, target.exchange).as_str(),
+    );
+    let mut trades = 0usize;
+    let mut volume_seen: Option<u32> = None;
+
     let mut count = 0usize;
     let mut with_depth = 0usize;
     let deadline = tokio::time::sleep(Duration::from_secs(seconds));
@@ -122,6 +135,31 @@ async fn main() -> anyhow::Result<()> {
 
                     if tick.depth.is_some() {
                         with_depth += 1;
+                    }
+
+                    volume_seen = tick.volume_traded;
+
+                    // Exercises the volume-delta logic against the venue. A per-tick emitter would
+                    // report a trade here every second; this must only fire when volume moves.
+                    match tracker.observe(
+                        &tick,
+                        instrument_id,
+                        target.price_precision,
+                        0,
+                        UnixNanos::from(0),
+                    ) {
+                        Ok(Some(trade)) => {
+                            trades += 1;
+
+                            if trades <= 3 {
+                                println!(
+                                    "  TRADE {trades}: price={} size={} aggressor={:?} id={}",
+                                    trade.price, trade.size, trade.aggressor_side, trade.trade_id,
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => println!("  trade mapping error: {e}"),
                     }
 
                     // First few only: enough to see the shape, not a firehose.
@@ -149,6 +187,20 @@ async fn main() -> anyhow::Result<()> {
     println!("\n=== RESULT ===");
     println!("  ticks received      : {count}");
     println!("  ticks carrying depth: {with_depth}");
+    println!("  trades detected     : {trades}");
+    println!("  final session volume: {volume_seen:?}");
+    println!(
+        "  trade verdict       : {}",
+        if count == 0 {
+            "n/a -- no ticks"
+        } else if trades == 0 {
+            "NO TRADES IN WINDOW -- this is NOT a failure. It means cumulative volume never moved, \
+             which is the correct output for an instrument nobody traded. It does mean the \
+             volume-delta path is still unproven; run longer or pick a more liquid contract."
+        } else {
+            "VOLUME DELTA DETECTED -- trades emitted only when volume moved, not per tick"
+        },
+    );
     println!(
         "  verdict             : {}",
         if count == 0 {
