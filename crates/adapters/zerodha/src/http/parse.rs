@@ -59,10 +59,19 @@ pub struct KiteInstrument {
     pub instrument_token: u32,
     /// The venue's trading symbol, e.g. `NIFTY24AUG24000CE`.
     pub tradingsymbol: String,
+    /// The venue's `name` column, e.g. `NIFTY` for `NIFTY24AUG24000CE`.
+    ///
+    /// For a derivative this is the underlying's ticker, which is the only place in the dump the
+    /// underlying appears — the trading symbol concatenates it with an expiry and a strike, and
+    /// splitting that back apart needs a format the venue does not publish. For an equity it is
+    /// the company name, and nothing treats it as an identifier.
+    pub name: String,
     /// The exchange the instrument trades on, e.g. `NSE`, `NFO`, `MCX`.
     pub exchange: String,
     /// `EQ`, `FUT`, `CE`, `PE`, …
     pub instrument_type: String,
+    /// The option strike, `0` for every instrument that is not an option.
+    pub strike: f64,
     /// The minimum price increment, as the venue wrote it.
     pub tick_size: f64,
     /// Decimal places implied by `tick_size`, counted from its text form.
@@ -141,19 +150,23 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
     // Resolved by NAME rather than by position. The vendor client uses `DictReader`, so column
     // order is not part of the contract and a positional parser would silently misread if the
     // venue reordered them -- reading a strike as a tick size, not failing.
-    let (i_token, i_symbol, i_exchange, i_type, i_tick, i_lot, i_expiry) = (
+    let (i_token, i_symbol, i_name, i_exchange, i_type, i_strike, i_tick, i_lot, i_expiry) = (
         index_of("instrument_token")?,
         index_of("tradingsymbol")?,
+        index_of("name")?,
         index_of("exchange")?,
         index_of("instrument_type")?,
+        index_of("strike")?,
         index_of("tick_size")?,
         index_of("lot_size")?,
         index_of("expiry")?,
     );
-    let widest = [i_token, i_symbol, i_exchange, i_type, i_tick, i_lot, i_expiry]
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let widest = [
+        i_token, i_symbol, i_name, i_exchange, i_type, i_strike, i_tick, i_lot, i_expiry,
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0);
 
     let mut instruments = Vec::new();
     let mut skipped = 0usize;
@@ -174,8 +187,20 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
             Some(KiteInstrument {
                 instrument_token: fields[i_token].trim().parse().ok()?,
                 tradingsymbol: fields[i_symbol].trim().to_string(),
+                name: fields[i_name].trim().to_string(),
                 exchange: fields[i_exchange].trim().to_string(),
                 instrument_type: fields[i_type].trim().to_string(),
+                strike: {
+                    // The venue writes `0` for everything that is not an option, but an empty
+                    // cell says the same thing -- and equities are the majority of the dump, so
+                    // treating a blank as unparseable would skip most of it.
+                    let strike_text = fields[i_strike].trim();
+                    if strike_text.is_empty() {
+                        0.0
+                    } else {
+                        strike_text.parse().ok()?
+                    }
+                },
                 tick_size: tick_text.parse().ok()?,
                 price_precision: decimals_in(tick_text),
                 lot_size: fields[i_lot].trim().parse().ok()?,
