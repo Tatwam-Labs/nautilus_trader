@@ -29,7 +29,7 @@
 //! | subscription messages ([`websocket::subscription`]) | complete; checked against the vendor client's source |
 //! | tick → [`QuoteTick`] mapping ([`data::parse`]) | complete; unit-tested |
 //! | WebSocket transport ([`websocket::client`]) | written, **never run against Zerodha** |
-//! | REST client and instrument provider | **not started** — and instrument tokens come only from there |
+//! | REST instrument dump ([`http`]) | written, **never requested**; the CSV parsing is unit-tested |
 //! | execution client | **not started** |
 //!
 //! **No part of the live path has carried a real tick.** A passing test suite says nothing about
@@ -68,6 +68,7 @@ pub mod common;
 pub mod config;
 pub mod data;
 pub mod factories;
+pub mod http;
 pub mod websocket;
 
 #[cfg(feature = "python")]

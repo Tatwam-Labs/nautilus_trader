@@ -17,10 +17,22 @@
 //!
 //! # Status
 //!
-//! [`DataClient::connect`] now opens a real socket and [`DataClient::subscribe_quotes`] issues a
-//! real subscription. **Neither has been run against Zerodha.** The decoder underneath is checked
-//! against captured bytes and the mapping is unit-tested, but the path from socket to engine has
-//! never carried a live tick.
+//! [`DataClient::connect`] loads the instrument dump, opens a real socket, and
+//! [`DataClient::subscribe_quotes`] issues a real subscription. **None of it has been run against
+//! Zerodha.** The decoder is checked against captured bytes and the CSV and tick mappings are
+//! unit-tested, but no request has been made and no live tick has reached the engine.
+//!
+//! # Instruments load BEFORE the socket, and the order is deliberate
+//!
+//! `subscribe_quotes` resolves an [`InstrumentId`] to a Zerodha token against the registry, and
+//! tokens exist **only** in the REST dump — not in the feed, not in the historical catalog. A
+//! connected client with an empty registry can therefore subscribe to nothing, so failing on the
+//! fetch is more useful than a healthy socket that will reject every subscription.
+//!
+//! The load is skipped when the registry is already populated, so a caller that registered
+//! instruments itself is not forced through a several-megabyte download.
+//!
+//! [`InstrumentId`]: nautilus_model::identifiers::InstrumentId
 //!
 //! # Where the guard is — this replaced an earlier `bail!`, and the reasoning is worth keeping
 //!
@@ -72,6 +84,7 @@ use crate::{
     },
     config::ZerodhaDataClientConfig,
     data::parse::quote_tick_from,
+    http::client::ZerodhaHttpClient,
     websocket::client::ZerodhaWebSocketClient,
 };
 
@@ -129,11 +142,45 @@ impl ZerodhaDataClient {
 
     /// Returns the shared instrument registry.
     ///
-    /// Until the REST instrument provider exists this is how tokens get into the client at all —
-    /// the caller registers what it intends to subscribe to. See [`InstrumentRegistry`].
+    /// Populated by [`Self::load_instruments`], which [`DataClient::connect`] calls. A caller may
+    /// also register entries directly, which is what the tests do.
     #[must_use]
     pub fn instruments(&self) -> Arc<RwLock<InstrumentRegistry>> {
         Arc::clone(&self.instruments)
+    }
+
+    /// Fetches the instrument dump and populates the registry.
+    ///
+    /// `exchange` limits the request to one exchange; `None` fetches every exchange, which is a
+    /// several-megabyte response of roughly 100k rows. **Prefer naming an exchange.** The
+    /// unfiltered call is the default only because a client that cannot resolve an instrument is
+    /// useless, and there is no way to ask the venue for one.
+    ///
+    /// Returns the number of instruments registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the venue answers with a non-success status, or the
+    /// dump cannot be parsed.
+    pub async fn load_instruments(&self, exchange: Option<&str>) -> anyhow::Result<usize> {
+        let http = ZerodhaHttpClient::new(self.credential.clone(), self.config.base_url_http.clone())?;
+        let instruments = http.instruments(exchange).await?;
+
+        let mut registry = self
+            .instruments
+            .write()
+            .map_err(|e| anyhow::anyhow!("instrument registry lock poisoned: {e}"))?;
+
+        for instrument in &instruments {
+            registry.register(instrument.to_details());
+        }
+
+        log::info!(
+            "Registered {} Zerodha instruments ({})",
+            registry.len(),
+            exchange.unwrap_or("all exchanges"),
+        );
+        Ok(instruments.len())
     }
 
     /// Returns the primary venue for this client.
@@ -194,6 +241,13 @@ impl DataClient for ZerodhaDataClient {
         if self.is_connected() {
             log::warn!("Zerodha data client {} is already connected", self.client_id);
             return Ok(());
+        }
+
+        // Instruments BEFORE the socket. A connected client that cannot resolve a token can
+        // subscribe to nothing, so failing here is more useful than a healthy socket with an
+        // empty registry -- and the registry is what `subscribe_quotes` resolves against.
+        if self.instruments.read().is_ok_and(|r| r.is_empty()) {
+            self.load_instruments(None).await?;
         }
 
         let mut websocket =
