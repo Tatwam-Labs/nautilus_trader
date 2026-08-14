@@ -77,3 +77,11 @@ pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
+tokio = { workspace = true }
+
+# Declared so the python-registration test only builds when the feature is on, matching the 17 of
+# 19 in-tree adapters that do the same.
+[[test]]
+name = "python"
+path = "tests/python.rs"
+required-features = ["python"]
