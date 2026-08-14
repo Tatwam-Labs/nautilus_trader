@@ -103,11 +103,11 @@ def full_packet(
     """184-byte full packet: the 44-byte quote body, timestamps, OI, then 10 depth levels."""
     body = quote_packet(tok, last, ltq, atp, vol, tbq, tsq, open_, high, low, close)
     body += struct.pack(">IIIII", ltt, oi, oi_hi, oi_lo, ts)
-    assert len(body) == 64, f"header should be 64 bytes, got {len(body)}"
+    assert len(body) == 64, f"header should be 64 bytes, was {len(body)}"
     # 10 levels x 12 bytes: u32 quantity, u32 price, u16 orders, 2 bytes padding.
     for qty, price, orders in depth:
         body += struct.pack(">IIHH", qty, price, orders, 0)
-    assert len(body) == 184, f"full packet should be 184 bytes, got {len(body)}"
+    assert len(body) == 184, f"full packet should be 184 bytes, was {len(body)}"
     return body
 
 

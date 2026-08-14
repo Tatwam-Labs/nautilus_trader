@@ -15,7 +15,7 @@
 
 //! Credentials for the Zerodha Kite Connect API.
 
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display};
 
 use zeroize::ZeroizeOnDrop;
 
@@ -70,7 +70,7 @@ impl ZerodhaCredential {
 }
 
 impl Debug for ZerodhaCredential {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(ZerodhaCredential))
             .field("api_key", &self.api_key_masked())
             .field("access_token", &"***redacted***")
@@ -79,7 +79,7 @@ impl Debug for ZerodhaCredential {
 }
 
 impl Display for ZerodhaCredential {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
             "{}({})",
