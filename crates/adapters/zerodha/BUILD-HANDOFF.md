@@ -26,25 +26,38 @@ live/paper stack), so this file is still the route for every build.
 
 **Anything committed after `e8e65a4b61` is again unverified** unless this table says otherwise.
 
-> ## 🛑 A GREEN BUILD IS NOT EVIDENCE THIS DECODER MATCHES ZERODHA
+> ## ⚠️ TWO FIXTURE SETS NOW, AND THEY ARE NOT EQUAL EVIDENCE
 >
-> Read this before quoting any test result from this branch, including a 17/17.
+> Read this before quoting any test result from this branch.
 >
-> The fixtures are **constructed from the published wire layout**, not captured from a live
-> socket. The expected values come from the `kiteconnect` Python client. So a passing suite
-> establishes exactly one thing:
+> **`fixtures.json` — 9 CONSTRUCTED frames. Weak, and weak in a specific way.**
 >
-> > **Two independent implementations agree with each other.**
+> The frames were built from our own reading of the published wire layout. That is worse than
+> "unverified":
 >
-> It does **not** establish that either matches what Zerodha actually sends. **Both could share a
-> misreading of the spec, and this suite would stay green.** That is not a hypothetical: the whole
-> reason the reference client is used as the oracle is that no one here has read the venue's bytes.
+> > **When you build the frame from your own reading of the spec, the frame agrees with the
+> > misreading by construction.**
 >
-> **17/17 will not change this. Neither will 100/100.** The only thing that moves this line is
-> frames captured from a live Kite session — see §7.
+> A transposed field order gets encoded into *both* the fixture and the decoder, and every
+> assertion passes. The set is **self-confirming about layout** — it can catch an arithmetic slip,
+> and it structurally cannot catch a misread of the format. That is why the index OHLC order
+> (`high, low, open, close`, transposed from the tradable rows) was never in danger of being caught
+> here.
 >
-> AT has no raw-frame corpus and structurally cannot produce one from existing code: `kiteconnect`
-> decodes inside the library, so the pre-decode bytes are never persisted anywhere in AT.
+> **`captured-2026-08-14-sensex-live.json` + `derived-fixtures-2026-08-14.json` — 20 REAL packets.**
+>
+> Bytes Zerodha actually sent, captured before anything decoded them, with expected values derived
+> by the vendor's own client run by someone who did not write this decoder. All five layouts,
+> including the 184-byte full-depth one. **This is the set that carries weight.**
+>
+> **What even the real set does NOT establish:** that the oracle is right. If `kiteconnect` misreads
+> a field, the derived fixtures encode the same misreading and this decoder would be "wrong" for
+> agreeing with reality. That residue is irreducible without vendor documentation or a third
+> independent implementation.
+>
+> So the honest sentence is **"the decoder agrees with the vendor's own client on 20 real packets
+> spanning all five layouts"** — never "venue fidelity verified". See §7 for what would move it
+> further, and `tests/live_frames.rs` for two limits that are asserted rather than merely noted.
 
 > **Do not put this branch on the AT repo.** This is `nautilus_trader` source. AT cannot compile it
 > (v2 adapters are in-tree only — ADR-097), and it would be unmergeable upstream from there.
@@ -104,9 +117,10 @@ CARGO_PROFILE_RELEASE_LTO=thin make build-debug
 > **So: use an in-spec `uv` and this does not happen.** Still worth a `git status` after the build,
 > but it is now a symptom with a known cause rather than an unexplained hazard.
 
-> **`Cargo.lock` has no `nautilus-zerodha` entry yet**, because no cargo command has run since the
-> crate was added. Your first build will add it. **Commit that change** — it is a real part of the
-> branch, unlike the `uv.lock` churn above.
+> **`Cargo.lock` now carries the `nautilus-zerodha` entry** — regenerated on the build host and
+> committed, since it cannot be produced on a machine that cannot run cargo. It goes stale only when
+> a `Cargo.toml` changes; commits that touch only Rust bodies, Python or fixtures leave it valid.
+> **If your build modifies it, commit that** — unlike the `uv.lock` churn above, it is real.
 
 `make build-debug` uses the `nextest` profile and does not invoke release LTO, so the env var is
 belt-and-braces for any release build you run later. **Do not run a fat-LTO release build**; that is
@@ -333,10 +347,11 @@ WebSocket connections per API key, so a dev key cannot disturb prod.
 
 | ✅ say | ❌ do not say |
 |---|---|
-| "the decoder agrees with the `kiteconnect` reference on 9 constructed frames" | "the decoder is verified" |
-| "17/17 fixture tests pass" | "the decoder is correct" |
-| "no disagreement found between two implementations" | "the tick decoding works" |
-| "fidelity to the venue is UNMEASURED" | *(silence — silence reads as closure)* |
+| "agrees with the vendor's client on 20 real packets, all five layouts" | "the decoder is verified" |
+| "17/17 constructed + 20/20 captured pass" | "the decoder is correct" |
+| "no disagreement found with `kiteconnect` on captured bytes" | "venue fidelity confirmed" |
+| "the oracle itself is unverified" | *(silence — silence reads as closure)* |
+| "184-byte timestamp *mapping* is uncovered" | *(omitting it because the row is green)* |
 
 **The settling measurement, named so it is not left to memory:** capture raw binary frames from a
 live Kite WebSocket session, commit them to `test_data/`, and re-derive the expected values from
