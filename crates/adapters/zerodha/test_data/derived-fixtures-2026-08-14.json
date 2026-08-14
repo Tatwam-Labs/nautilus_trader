@@ -1,0 +1,725 @@
+{
+  "header": {
+    "_comment": "EXPECTED VALUES DERIVED FROM CAPTURED LIVE BYTES. The bytes in captured-2026-08-14-sensex-live.json are ground truth from the venue; the values here are ONE ORACLE'S READING of those bytes. This file does NOT prove the oracle is correct - it establishes what Zerodha's own official Python client reads from packets Zerodha actually sent. That is a strictly stronger claim than fixtures.json, whose frames were CONSTRUCTED from the published layout and could share a misreading with any decoder tested against them.",
+    "oracle": "kiteconnect 5.2.1 (_split_packets + _parse_binary)",
+    "derived_by": "AT Architecture Discussions pane - NOT the author of the Rust decoder",
+    "derived_from": "crates/adapters/zerodha/test_data/captured-2026-08-14-sensex-live.json",
+    "source_records_sha256": "a162970d6c0c6806d451b6c65d20f7fcc4378f2dc292179ebda913b547f263b7",
+    "note": "A record is a WS MESSAGE; packets[] are the individual packets inside it.",
+    "packet_total": 20,
+    "pairing_verification": "packets[i] <-> expected[i] is VERIFIED, not assumed: for all 20 pairs the instrument token read from packet bytes[0:4] as big-endian u32 equals the oracle's instrument_token. 20/20 matched.",
+    "layout_coverage": {
+      "8": "ltp/tradable",
+      "28": "quote/index",
+      "32": "full/index",
+      "44": "quote/tradable",
+      "184": "full/tradable (depth 5x5)"
+    },
+    "what_this_does_not_establish": "Fidelity of the ORACLE. kiteconnect could misread a field and this file would encode the same misreading. What it removes is the weaker circle: the FRAMES are no longer ours.",
+    "timestamp_encoding": "exchange_timestamp and last_trade_time are INTEGER EPOCH SECONDS, exactly as they sit in the packet as big-endian u32. They were previously rendered strings, which was a defect: kiteconnect's datetime.fromtimestamp() takes no tzinfo and returns a NAIVE datetime in the HOST's local zone, so the same oracle on the same bytes emits a different string on an IST host than on a UTC one - and the file did not record which. Caught by RustClientBuilder.",
+    "timestamp_verification": "All 15 of 15 timestamp values were LOCATED IN THE PACKET BYTES as big-endian u32 before conversion, so the values are read from the venue's bytes and no timezone assumption is encoded anywhere. CAVEAT: where exchange_timestamp and last_trade_time hold the SAME value (a trade in the same second), the byte-offset scan cannot distinguish which offset belongs to which field - it confirms the VALUES, not the field-to-offset mapping."
+  },
+  "records": [
+    {
+      "record_index": 0,
+      "captured_at": "2026-08-14T07:42:50.052256+00:00",
+      "frame_len": 308,
+      "packet_count": 5,
+      "pairs": [
+        {
+          "packet_index": 0,
+          "packet_len": 8,
+          "packet_hex": "0d0ada050000aa78",
+          "token_from_bytes": 218814981,
+          "expected": {
+            "tradable": true,
+            "mode": "ltp",
+            "instrument_token": 218814981,
+            "last_price": 436.4
+          }
+        },
+        {
+          "packet_index": 1,
+          "packet_len": 28,
+          "packet_hex": "000001090076c3ee0076e6e6007689750076df07007723fcffff9ff2",
+          "token_from_bytes": 265,
+          "expected": {
+            "tradable": false,
+            "mode": "quote",
+            "instrument_token": 265,
+            "last_price": 77834.06,
+            "ohlc": {
+              "high": 77923.58,
+              "low": 77684.37,
+              "open": 77903.43,
+              "close": 78079.96
+            },
+            "change": -0.31493356297827085
+          }
+        },
+        {
+          "packet_index": 2,
+          "packet_len": 44,
+          "packet_hex": "0d0ddc05000077fb00000014000087bf00e03ff8000177000002e6440000858900009bb9000074b800006e6e",
+          "token_from_bytes": 219012101,
+          "expected": {
+            "tradable": true,
+            "mode": "quote",
+            "instrument_token": 219012101,
+            "last_price": 307.15,
+            "last_traded_quantity": 20,
+            "average_traded_price": 347.51,
+            "volume_traded": 14696440,
+            "total_buy_quantity": 96000,
+            "total_sell_quantity": 190020,
+            "ohlc": {
+              "open": 341.85,
+              "high": 398.65,
+              "low": 298.8,
+              "close": 282.7
+            },
+            "change": 8.648744251857089
+          }
+        },
+        {
+          "packet_index": 3,
+          "packet_len": 32,
+          "packet_hex": "0003e9090025255600252d94002512f000252c5e002539a1ffffebb56a7ec6f9",
+          "token_from_bytes": 256265,
+          "expected": {
+            "tradable": false,
+            "mode": "full",
+            "instrument_token": 256265,
+            "last_price": 24343.9,
+            "ohlc": {
+              "high": 24365.0,
+              "low": 24296.8,
+              "open": 24361.9,
+              "close": 24395.85
+            },
+            "change": -0.21294605434939587,
+            "exchange_timestamp": 1786693369
+          }
+        },
+        {
+          "packet_index": 4,
+          "packet_len": 184,
+          "packet_hex": "0d0d30050000c003000000140000bdb50084ba0c000148340001c3f40000afc80000e8710000a6c70000fb8b6a7ec6f900097d10000b40a0000303f46a7ec6f9000000280000c00d00020000000000c80000c00300040000000000b40000bffe00030000000000640000bfea00040000000000780000bfe500030000000000780000c080000500000000003c0000c08f00030000000000500000c09400030000000000640000c09900040000000000500000c09e00040000",
+          "token_from_bytes": 218968069,
+          "expected": {
+            "tradable": true,
+            "mode": "full",
+            "instrument_token": 218968069,
+            "last_price": 491.55,
+            "last_traded_quantity": 20,
+            "average_traded_price": 485.65,
+            "volume_traded": 8698380,
+            "total_buy_quantity": 84020,
+            "total_sell_quantity": 115700,
+            "ohlc": {
+              "open": 450.0,
+              "high": 595.05,
+              "low": 426.95,
+              "close": 643.95
+            },
+            "change": -23.666433729326815,
+            "last_trade_time": 1786693369,
+            "oi": 621840,
+            "oi_day_high": 737440,
+            "oi_day_low": 197620,
+            "exchange_timestamp": 1786693369,
+            "depth": {
+              "buy": [
+                {
+                  "quantity": 40,
+                  "price": 491.65,
+                  "orders": 2
+                },
+                {
+                  "quantity": 200,
+                  "price": 491.55,
+                  "orders": 4
+                },
+                {
+                  "quantity": 180,
+                  "price": 491.5,
+                  "orders": 3
+                },
+                {
+                  "quantity": 100,
+                  "price": 491.3,
+                  "orders": 4
+                },
+                {
+                  "quantity": 120,
+                  "price": 491.25,
+                  "orders": 3
+                }
+              ],
+              "sell": [
+                {
+                  "quantity": 120,
+                  "price": 492.8,
+                  "orders": 5
+                },
+                {
+                  "quantity": 60,
+                  "price": 492.95,
+                  "orders": 3
+                },
+                {
+                  "quantity": 80,
+                  "price": 493.0,
+                  "orders": 3
+                },
+                {
+                  "quantity": 100,
+                  "price": 493.05,
+                  "orders": 4
+                },
+                {
+                  "quantity": 80,
+                  "price": 493.1,
+                  "orders": 4
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "record_index": 1,
+      "captured_at": "2026-08-14T07:42:50.307457+00:00",
+      "frame_len": 46,
+      "packet_count": 2,
+      "pairs": [
+        {
+          "packet_index": 0,
+          "packet_len": 8,
+          "packet_hex": "0d0ada050000a9d8",
+          "token_from_bytes": 218814981,
+          "expected": {
+            "tradable": true,
+            "mode": "ltp",
+            "instrument_token": 218814981,
+            "last_price": 434.8
+          }
+        },
+        {
+          "packet_index": 1,
+          "packet_len": 32,
+          "packet_hex": "0003e9090025257e00252d94002512f000252c5e002539a1ffffebdd6a7ec6fa",
+          "token_from_bytes": 256265,
+          "expected": {
+            "tradable": false,
+            "mode": "full",
+            "instrument_token": 256265,
+            "last_price": 24344.3,
+            "ohlc": {
+              "high": 24365.0,
+              "low": 24296.8,
+              "open": 24361.9,
+              "close": 24395.85
+            },
+            "change": -0.21130643121678186,
+            "exchange_timestamp": 1786693370
+          }
+        }
+      ]
+    },
+    {
+      "record_index": 2,
+      "captured_at": "2026-08-14T07:42:50.552064+00:00",
+      "frame_len": 46,
+      "packet_count": 2,
+      "pairs": [
+        {
+          "packet_index": 0,
+          "packet_len": 8,
+          "packet_hex": "0d0ada050000a9d8",
+          "token_from_bytes": 218814981,
+          "expected": {
+            "tradable": true,
+            "mode": "ltp",
+            "instrument_token": 218814981,
+            "last_price": 434.8
+          }
+        },
+        {
+          "packet_index": 1,
+          "packet_len": 32,
+          "packet_hex": "0003e9090025258800252d94002512f000252c5e002539a1ffffebe76a7ec6fa",
+          "token_from_bytes": 256265,
+          "expected": {
+            "tradable": false,
+            "mode": "full",
+            "instrument_token": 256265,
+            "last_price": 24344.4,
+            "ohlc": {
+              "high": 24365.0,
+              "low": 24296.8,
+              "open": 24361.9,
+              "close": 24395.85
+            },
+            "change": -0.21089652543361717,
+            "exchange_timestamp": 1786693370
+          }
+        }
+      ]
+    },
+    {
+      "record_index": 3,
+      "captured_at": "2026-08-14T07:42:50.802578+00:00",
+      "frame_len": 222,
+      "packet_count": 2,
+      "pairs": [
+        {
+          "packet_index": 0,
+          "packet_len": 32,
+          "packet_hex": "0003e9090025258d00252d94002512f000252c5e002539a1ffffebec6a7ec6fa",
+          "token_from_bytes": 256265,
+          "expected": {
+            "tradable": false,
+            "mode": "full",
+            "instrument_token": 256265,
+            "last_price": 24344.45,
+            "ohlc": {
+              "high": 24365.0,
+              "low": 24296.8,
+              "open": 24361.9,
+              "close": 24395.85
+            },
+            "change": -0.21069157254204227,
+            "exchange_timestamp": 1786693370
+          }
+        },
+        {
+          "packet_index": 1,
+          "packet_len": 184,
+          "packet_hex": "0d0d30050000c003000000140000bdb50084ba0c000148fc0001c32c0000afc80000e8710000a6c70000fb8b6a7ec6f900097d10000b40a0000303f46a7ec6fa000000500000c00d00040000000000b40000c00800030000000000500000c00300040000000000a00000bffe00020000000000140000bff900010000000000280000c06c00020000000000640000c099000400000000003c0000c0a300030000000000640000c0a800040000000000280000c0ad00020000",
+          "token_from_bytes": 218968069,
+          "expected": {
+            "tradable": true,
+            "mode": "full",
+            "instrument_token": 218968069,
+            "last_price": 491.55,
+            "last_traded_quantity": 20,
+            "average_traded_price": 485.65,
+            "volume_traded": 8698380,
+            "total_buy_quantity": 84220,
+            "total_sell_quantity": 115500,
+            "ohlc": {
+              "open": 450.0,
+              "high": 595.05,
+              "low": 426.95,
+              "close": 643.95
+            },
+            "change": -23.666433729326815,
+            "last_trade_time": 1786693369,
+            "oi": 621840,
+            "oi_day_high": 737440,
+            "oi_day_low": 197620,
+            "exchange_timestamp": 1786693370,
+            "depth": {
+              "buy": [
+                {
+                  "quantity": 80,
+                  "price": 491.65,
+                  "orders": 4
+                },
+                {
+                  "quantity": 180,
+                  "price": 491.6,
+                  "orders": 3
+                },
+                {
+                  "quantity": 80,
+                  "price": 491.55,
+                  "orders": 4
+                },
+                {
+                  "quantity": 160,
+                  "price": 491.5,
+                  "orders": 2
+                },
+                {
+                  "quantity": 20,
+                  "price": 491.45,
+                  "orders": 1
+                }
+              ],
+              "sell": [
+                {
+                  "quantity": 40,
+                  "price": 492.6,
+                  "orders": 2
+                },
+                {
+                  "quantity": 100,
+                  "price": 493.05,
+                  "orders": 4
+                },
+                {
+                  "quantity": 60,
+                  "price": 493.15,
+                  "orders": 3
+                },
+                {
+                  "quantity": 100,
+                  "price": 493.2,
+                  "orders": 4
+                },
+                {
+                  "quantity": 40,
+                  "price": 493.25,
+                  "orders": 2
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "record_index": 4,
+      "captured_at": "2026-08-14T07:42:51.050448+00:00",
+      "frame_len": 112,
+      "packet_count": 3,
+      "pairs": [
+        {
+          "packet_index": 0,
+          "packet_len": 28,
+          "packet_hex": "000001090076c3e30076e6e6007689750076df07007723fcffff9fe7",
+          "token_from_bytes": 265,
+          "expected": {
+            "tradable": false,
+            "mode": "quote",
+            "instrument_token": 265,
+            "last_price": 77833.95,
+            "ohlc": {
+              "high": 77923.58,
+              "low": 77684.37,
+              "open": 77903.43,
+              "close": 78079.96
+            },
+            "change": -0.31507444419798536
+          }
+        },
+        {
+          "packet_index": 1,
+          "packet_len": 44,
+          "packet_hex": "0d0ddc05000078b400000014000087bf00e040e800017bb00002e4b40000858900009bb9000074b800006e6e",
+          "token_from_bytes": 219012101,
+          "expected": {
+            "tradable": true,
+            "mode": "quote",
+            "instrument_token": 219012101,
+            "last_price": 309.0,
+            "last_traded_quantity": 20,
+            "average_traded_price": 347.51,
+            "volume_traded": 14696680,
+            "total_buy_quantity": 97200,
+            "total_sell_quantity": 189620,
+            "ohlc": {
+              "open": 341.85,
+              "high": 398.65,
+              "low": 298.8,
+              "close": 282.7
+            },
+            "change": 9.303148213654055
+          }
+        },
+        {
+          "packet_index": 2,
+          "packet_len": 32,
+          "packet_hex": "0003e9090025258d00252d94002512f000252c5e002539a1ffffebec6a7ec6fa",
+          "token_from_bytes": 256265,
+          "expected": {
+            "tradable": false,
+            "mode": "full",
+            "instrument_token": 256265,
+            "last_price": 24344.45,
+            "ohlc": {
+              "high": 24365.0,
+              "low": 24296.8,
+              "open": 24361.9,
+              "close": 24395.85
+            },
+            "change": -0.21069157254204227,
+            "exchange_timestamp": 1786693370
+          }
+        }
+      ]
+    },
+    {
+      "record_index": 5,
+      "captured_at": "2026-08-14T07:42:51.802235+00:00",
+      "frame_len": 222,
+      "packet_count": 2,
+      "pairs": [
+        {
+          "packet_index": 0,
+          "packet_len": 32,
+          "packet_hex": "0003e9090025253800252d94002512f000252c5e002539a1ffffeb976a7ec6fb",
+          "token_from_bytes": 256265,
+          "expected": {
+            "tradable": false,
+            "mode": "full",
+            "instrument_token": 256265,
+            "last_price": 24343.6,
+            "ohlc": {
+              "high": 24365.0,
+              "low": 24296.8,
+              "open": 24361.9,
+              "close": 24395.85
+            },
+            "change": -0.21417577169887503,
+            "exchange_timestamp": 1786693371
+          }
+        },
+        {
+          "packet_index": 1,
+          "packet_len": 184,
+          "packet_hex": "0d0d30050000bfe0000000140000bdb50084bac000013c900001c1ec0000afc80000e8710000a6c70000fb8b6a7ec6fa00097d10000b40a0000303f46a7ec6fb000000280000beeb00020000000000640000bee6000300000000003c0000bee100020000000000280000bedc00010000000000780000bed700020000000000280000bf6800020000000000780000bf72000500000000003c0000bf7c000300000000008c0000bf8100050000000000a00000bf8600030000",
+          "token_from_bytes": 218968069,
+          "expected": {
+            "tradable": true,
+            "mode": "full",
+            "instrument_token": 218968069,
+            "last_price": 491.2,
+            "last_traded_quantity": 20,
+            "average_traded_price": 485.65,
+            "volume_traded": 8698560,
+            "total_buy_quantity": 81040,
+            "total_sell_quantity": 115180,
+            "ohlc": {
+              "open": 450.0,
+              "high": 595.05,
+              "low": 426.95,
+              "close": 643.95
+            },
+            "change": -23.72078577529312,
+            "last_trade_time": 1786693370,
+            "oi": 621840,
+            "oi_day_high": 737440,
+            "oi_day_low": 197620,
+            "exchange_timestamp": 1786693371,
+            "depth": {
+              "buy": [
+                {
+                  "quantity": 40,
+                  "price": 488.75,
+                  "orders": 2
+                },
+                {
+                  "quantity": 100,
+                  "price": 488.7,
+                  "orders": 3
+                },
+                {
+                  "quantity": 60,
+                  "price": 488.65,
+                  "orders": 2
+                },
+                {
+                  "quantity": 40,
+                  "price": 488.6,
+                  "orders": 1
+                },
+                {
+                  "quantity": 120,
+                  "price": 488.55,
+                  "orders": 2
+                }
+              ],
+              "sell": [
+                {
+                  "quantity": 40,
+                  "price": 490.0,
+                  "orders": 2
+                },
+                {
+                  "quantity": 120,
+                  "price": 490.1,
+                  "orders": 5
+                },
+                {
+                  "quantity": 60,
+                  "price": 490.2,
+                  "orders": 3
+                },
+                {
+                  "quantity": 140,
+                  "price": 490.25,
+                  "orders": 5
+                },
+                {
+                  "quantity": 160,
+                  "price": 490.3,
+                  "orders": 3
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "record_index": 6,
+      "captured_at": "2026-08-14T07:42:52.084993+00:00",
+      "frame_len": 298,
+      "packet_count": 4,
+      "pairs": [
+        {
+          "packet_index": 0,
+          "packet_len": 28,
+          "packet_hex": "000001090076c4bd0076e6e6007689750076df07007723fcffffa0c1",
+          "token_from_bytes": 265,
+          "expected": {
+            "tradable": false,
+            "mode": "quote",
+            "instrument_token": 265,
+            "last_price": 77836.13,
+            "ohlc": {
+              "high": 77923.58,
+              "low": 77684.37,
+              "open": 77903.43,
+              "close": 78079.96
+            },
+            "change": -0.3122824345709216
+          }
+        },
+        {
+          "packet_index": 1,
+          "packet_len": 44,
+          "packet_hex": "0d0ddc05000078f500000014000087bf00e0413800017df40002e34c0000858900009bb9000074b800006e6e",
+          "token_from_bytes": 219012101,
+          "expected": {
+            "tradable": true,
+            "mode": "quote",
+            "instrument_token": 219012101,
+            "last_price": 309.65,
+            "last_traded_quantity": 20,
+            "average_traded_price": 347.51,
+            "volume_traded": 14696760,
+            "total_buy_quantity": 97780,
+            "total_sell_quantity": 189260,
+            "ohlc": {
+              "open": 341.85,
+              "high": 398.65,
+              "low": 298.8,
+              "close": 282.7
+            },
+            "change": 9.533073929961086
+          }
+        },
+        {
+          "packet_index": 2,
+          "packet_len": 32,
+          "packet_hex": "0003e909002524de00252d94002512f000252c5e002539a1ffffeb3d6a7ec6fb",
+          "token_from_bytes": 256265,
+          "expected": {
+            "tradable": false,
+            "mode": "full",
+            "instrument_token": 256265,
+            "last_price": 24342.7,
+            "ohlc": {
+              "high": 24365.0,
+              "low": 24296.8,
+              "open": 24361.9,
+              "close": 24395.85
+            },
+            "change": -0.21786492374726776,
+            "exchange_timestamp": 1786693371
+          }
+        },
+        {
+          "packet_index": 3,
+          "packet_len": 184,
+          "packet_hex": "0d0d30050000bfe0000000140000bdb50084bac000013d440001c23c0000afc80000e8710000a6c70000fb8b6a7ec6fa00097d10000b40a0000303f46a7ec6fb000000280000bee100020000000000280000bedc00010000000000780000bed700020000000000f00000bed200050000000000b40000becd00030000000000280000bf5900020000000000280000bf5e00020000000000640000bf63000400000000003c0000bf6800030000000000640000bf6d00040000",
+          "token_from_bytes": 218968069,
+          "expected": {
+            "tradable": true,
+            "mode": "full",
+            "instrument_token": 218968069,
+            "last_price": 491.2,
+            "last_traded_quantity": 20,
+            "average_traded_price": 485.65,
+            "volume_traded": 8698560,
+            "total_buy_quantity": 81220,
+            "total_sell_quantity": 115260,
+            "ohlc": {
+              "open": 450.0,
+              "high": 595.05,
+              "low": 426.95,
+              "close": 643.95
+            },
+            "change": -23.72078577529312,
+            "last_trade_time": 1786693370,
+            "oi": 621840,
+            "oi_day_high": 737440,
+            "oi_day_low": 197620,
+            "exchange_timestamp": 1786693371,
+            "depth": {
+              "buy": [
+                {
+                  "quantity": 40,
+                  "price": 488.65,
+                  "orders": 2
+                },
+                {
+                  "quantity": 40,
+                  "price": 488.6,
+                  "orders": 1
+                },
+                {
+                  "quantity": 120,
+                  "price": 488.55,
+                  "orders": 2
+                },
+                {
+                  "quantity": 240,
+                  "price": 488.5,
+                  "orders": 5
+                },
+                {
+                  "quantity": 180,
+                  "price": 488.45,
+                  "orders": 3
+                }
+              ],
+              "sell": [
+                {
+                  "quantity": 40,
+                  "price": 489.85,
+                  "orders": 2
+                },
+                {
+                  "quantity": 40,
+                  "price": 489.9,
+                  "orders": 2
+                },
+                {
+                  "quantity": 100,
+                  "price": 489.95,
+                  "orders": 4
+                },
+                {
+                  "quantity": 60,
+                  "price": 490.0,
+                  "orders": 3
+                },
+                {
+                  "quantity": 100,
+                  "price": 490.05,
+                  "orders": 4
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
