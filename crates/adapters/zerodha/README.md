@@ -53,9 +53,11 @@ Observed on a live session, **not** exercised by any test here:
   Index definitions come from the parent exchange's dump. *(2026-08-13)*
 - **Heartbeats arrive every ~3s.** 139 intervals measured: median **3.000s**, range 2.844–3.156.
   This is the figure a liveness timeout should be built on. *(2026-08-14, one 7-minute window)*
-- **No subscription acknowledgement was seen.** 1,810 binary frames arrived in the same window and
-  no ack text frame did. **An observation, not a conclusion** — an ack sent before the handler
-  attached would look identical. *(2026-08-14, one window)*
+- **Zerodha does not acknowledge subscriptions on this channel.** 1,810 binary frames arrived in a
+  7-minute window and no ack text frame did — and the obvious confound does not apply: the text
+  handler is attached *before* `connect()`, and `subscribe` is sent from the on-connect callback,
+  so an ack could not have been missed. **A transport that waits for a subscription ack will wait
+  forever.** *(2026-08-14, one window, 5 tokens across 3 modes)*
 - **The venue sends `instruments_meta`**, a text type the vendor's client does not handle. See
   *Fixtures* below. *(2026-08-14, observed once)*
 
