@@ -43,21 +43,31 @@
 //! So the honest sentence is **"agrees with the vendor's client on N real packets"**, never
 //! "venue fidelity verified".
 //!
-//! # What this corpus CANNOT discriminate, stated so a green run is not over-read
+//! # The 184-byte timestamp mapping is confirmed by ORDERING, not by agreement
 //!
-//! **The 184-byte timestamp field mapping.** In every captured 184-byte packet,
-//! `exchange_timestamp` and `last_trade_time` hold the **same value** — the trade happened in the
-//! same second the frame was stamped. Both candidate offsets (44 and 60) therefore match both
-//! fields, so the corpus confirms the *values* and **not** the field-to-offset mapping.
+//! Worth reading, because it is the one conclusion here that does **not** rest on the oracle.
 //!
-//! **If this decoder had those two transposed, nothing here would fail.** The decoder reads
-//! `last_trade_time` at 44 and `exchange_timestamp` at 60, which agrees with the reference client —
-//! but those offsets were transcribed *from* that client, so the agreement is not independent
-//! evidence. It is one source, read twice.
+//! The first corpus could not settle it: every 184-byte packet had `exchange_timestamp ==
+//! last_trade_time`, so both candidate offsets matched both fields and a transposition would have
+//! failed nothing. Agreement with the reference client was no help either — these offsets were
+//! transcribed *from* that client, so it was one source read twice.
 //!
-//! The discriminating capture is a packet from a **quiet trade minute**, where the last trade is
-//! older than the frame and the two values separate. Until such a frame is in the corpus, treat
-//! 184-byte timestamp *mapping* as unverified even when this file is green.
+//! A second capture against **deep out-of-the-money strikes** settled it. Quotes there tick
+//! continuously while trades are minutes apart, so the two fields separate:
+//!
+//! ```text
+//! bytes[44:48]=1786695195   bytes[60:64]=1786695200   +5s
+//! bytes[44:48]=1786695192   bytes[60:64]=1786695200   +8s
+//! bytes[44:48]=1786695191   bytes[60:64]=1786695200   +9s
+//! ```
+//!
+//! **`bytes[60:64]` is later in every separated packet.** A frame cannot be stamped *before* the
+//! trade it reports, so the later value is the frame stamp and the earlier is the trade. A
+//! transposed mapping would require the venue to timestamp frames before the trades they carry —
+//! **incoherent, not merely different.**
+//!
+//! That is a physical constraint on the venue's own data, which neither implementation could have
+//! imposed. The field *names* are still the oracle's; the *ordering* is not.
 //!
 //! # A disagreement here is a RESULT, not a failure
 //!
@@ -268,33 +278,80 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
     assert_eq!(checked, 20, "expected 20 captured packets, checked {checked}");
 }
 
+/// The deep-OTM corpus: same shape as the main fixtures, captured to separate the two timestamps.
+fn otm_fixtures() -> Value {
+    let raw = include_str!("../test_data/derived-fixtures-2026-08-14-otm-timestamps.json");
+    serde_json::from_str(raw).expect("OTM fixtures are not valid JSON")
+}
+
 #[test]
-fn the_184_byte_timestamp_mapping_is_known_to_be_uncovered() {
-    // This test asserts a LIMITATION, so that the limitation cannot quietly disappear.
+fn decoder_agrees_with_the_vendor_client_on_the_deep_otm_packets() {
+    // Same comparison as the main corpus, over the supplementary capture. Kept separate because
+    // this corpus is full-mode only: it deliberately does NOT span all five layouts, and merging
+    // it into the main test would weaken that test's layout-coverage assertion.
+    let doc = otm_fixtures();
+    let mut checked = 0usize;
+
+    for record in doc["records"].as_array().expect("records") {
+        for pair in record["pairs"].as_array().expect("pairs") {
+            let hex = pair["packet_hex"].as_str().expect("packet_hex");
+            let want = &pair["expected"];
+            let tick = parse_packet(&decode_hex(hex)).expect("OTM packet failed to decode");
+
+            assert_eq!(
+                u64::from(tick.instrument_token),
+                want["instrument_token"].as_u64().expect("instrument_token"),
+                "{}", disagreement("instrument_token", hex, tick.instrument_token.to_string(), want["instrument_token"].to_string()),
+            );
+            expect_opt_u32(tick.exchange_timestamp, want.get("exchange_timestamp"), "exchange_timestamp", hex);
+            expect_opt_u32(tick.last_trade_time, want.get("last_trade_time"), "last_trade_time", hex);
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 4, "expected 4 deep-OTM packets, checked {checked}");
+}
+
+#[test]
+fn a_frame_is_never_stamped_before_the_trade_it_reports() {
+    // THE ONE ASSERTION HERE THAT DOES NOT REST ON THE ORACLE.
     //
-    // If a future capture contains a 184-byte packet where exchange_timestamp and last_trade_time
-    // DIFFER, this fails -- and that is good news: it means the corpus has finally gained the
-    // power to discriminate a transposition of those two fields, and the module-level caveat
-    // should be deleted rather than carried forward.
-    let doc = fixtures();
-    let separated: Vec<(u64, u64)> = doc["records"]
-        .as_array()
-        .expect("records")
-        .iter()
-        .flat_map(|r| r["pairs"].as_array().expect("pairs"))
-        .filter(|p| p["packet_len"].as_u64() == Some(184))
-        .filter_map(|p| {
-            let e = &p["expected"];
-            Some((e["exchange_timestamp"].as_u64()?, e["last_trade_time"].as_u64()?))
-        })
-        .filter(|(ts, ltt)| ts != ltt)
-        .collect();
+    // The field NAMES come from the reference client, and this decoder's offsets were transcribed
+    // from it -- so "decoder agrees with oracle at 44 and 60" is one source read twice. The
+    // ORDERING is different: a venue cannot stamp a frame before the trade that frame carries.
+    // So wherever the two separate, the later value IS the frame stamp and the earlier IS the
+    // trade, and a transposed mapping would be incoherent rather than merely different.
+    //
+    // This is what closes the gap the first corpus could not.
+    let doc = otm_fixtures();
+    let mut separated = 0usize;
+
+    for record in doc["records"].as_array().expect("records") {
+        for pair in record["pairs"].as_array().expect("pairs") {
+            let hex = pair["packet_hex"].as_str().expect("packet_hex");
+            let tick = parse_packet(&decode_hex(hex)).expect("decode");
+            let (Some(ts), Some(ltt)) = (tick.exchange_timestamp, tick.last_trade_time) else {
+                panic!("a 184-byte packet decoded without both timestamps: {hex}");
+            };
+            if ts == ltt {
+                continue; // Trade landed in the same second the frame was stamped.
+            }
+            separated += 1;
+            assert!(
+                ts > ltt,
+                "IMPOSSIBLE ORDERING: exchange_timestamp {ts} precedes last_trade_time {ltt} by \
+                 {}s.\n  PACKET {hex}\n  The venue cannot stamp a frame before the trade it \
+                 reports, so this means the two fields are read from transposed offsets -- the \
+                 decoder has bytes[44:48] and bytes[60:64] the wrong way round.",
+                ltt - ts,
+            );
+        }
+    }
 
     assert!(
-        separated.is_empty(),
-        "A captured 184-byte packet now has exchange_timestamp != last_trade_time {separated:?}.\n\
-         The corpus can finally discriminate the field-to-offset mapping for those two fields.\n\
-         DELETE this test and the 'cannot discriminate' caveat in the module docs -- the gap is closed.",
+        separated >= 3,
+        "only {separated} packets separate the two timestamps; this corpus was captured \
+         specifically to provide them, so fewer than 3 means the wrong corpus is wired up and \
+         the ordering is no longer actually being tested",
     );
 }
 
