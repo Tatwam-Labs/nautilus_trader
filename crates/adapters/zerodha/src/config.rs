@@ -17,7 +17,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::common::consts::{ZERODHA_HTTP_URL, ZERODHA_WS_URL};
+use crate::common::{
+    consts::{ZERODHA_HTTP_URL, ZERODHA_WS_URL},
+    credential::ZerodhaCredential,
+};
 
 /// Configuration for the Zerodha data client.
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
@@ -77,16 +80,27 @@ impl ZerodhaDataClientConfig {
         Self::default()
     }
 
-    /// Returns whether both credentials are populated and non-empty.
+    /// Resolves the credential pair from this config, falling back to the environment.
+    ///
+    /// Returns `None` unless **both** halves resolve — a key without a token cannot authenticate,
+    /// so a partial pair is treated as absent rather than passed on to fail at the venue.
+    #[must_use]
+    pub fn credential(&self) -> Option<ZerodhaCredential> {
+        ZerodhaCredential::resolve(self.api_key.as_deref(), self.access_token.as_deref())
+    }
+
+    /// Returns whether a complete credential pair is available.
+    ///
+    /// This consults the **process environment** as well as the config, because the fields above
+    /// document an environment fallback. Checking only the struct fields would report "no
+    /// credentials" for a correctly-configured environment-only deployment.
+    ///
+    /// **Therefore this is not a pure function of `self`.** A test asserting that a default config
+    /// has no credentials will pass on a clean machine and fail on a developer's machine with
+    /// `ZERODHA_API_KEY` exported. Tests that care must clear the variables explicitly.
     #[must_use]
     pub fn has_credentials(&self) -> bool {
-        self.api_key
-            .as_deref()
-            .is_some_and(|s| !s.trim().is_empty())
-            && self
-                .access_token
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty())
+        self.credential().is_some()
     }
 
     /// Returns the REST API base URL, respecting any override.

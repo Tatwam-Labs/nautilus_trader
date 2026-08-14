@@ -17,10 +17,17 @@
 
 use std::fmt::{Debug, Display};
 
+use nautilus_core::env::resolve_env_var_pair;
 use zeroize::ZeroizeOnDrop;
 
 /// The number of leading characters of the API key shown in redacted output.
 const KEY_PREFIX_LEN: usize = 4;
+
+/// Returns the `(api_key, access_token)` environment variable names.
+#[must_use]
+pub const fn credential_env_vars() -> (&'static str, &'static str) {
+    ("ZERODHA_API_KEY", "ZERODHA_ACCESS_TOKEN")
+}
 
 /// A Zerodha Kite Connect credential.
 ///
@@ -47,6 +54,23 @@ impl ZerodhaCredential {
         }
     }
 
+    /// Resolves credentials from the provided values or [`credential_env_vars`], returning `None`
+    /// when neither yields a complete pair.
+    ///
+    /// Blank and whitespace-only values are treated as absent, so an empty config field falls
+    /// through to the environment rather than producing a credential that fails at the venue.
+    #[must_use]
+    pub fn resolve(api_key: Option<&str>, access_token: Option<&str>) -> Option<Self> {
+        let (key_var, token_var) = credential_env_vars();
+        let (key, token) = resolve_env_var_pair(
+            api_key.filter(|s| !s.trim().is_empty()).map(String::from),
+            access_token.filter(|s| !s.trim().is_empty()).map(String::from),
+            key_var,
+            token_var,
+        )?;
+        Some(Self::new(key, token))
+    }
+
     /// Returns the API key.
     #[must_use]
     pub fn api_key(&self) -> &str {
@@ -60,12 +84,14 @@ impl ZerodhaCredential {
     }
 
     /// Returns the API key truncated to its leading characters, for logs and errors.
+    ///
+    /// Truncates by **character**, not by byte. Byte-slicing would panic on a multi-byte character
+    /// straddling the cut — and this function exists to be called from log and error paths, which
+    /// is the worst place to acquire a panic.
     #[must_use]
     pub fn api_key_masked(&self) -> String {
-        format!(
-            "{}...",
-            &self.api_key[..KEY_PREFIX_LEN.min(self.api_key.len())]
-        )
+        let prefix: String = self.api_key.chars().take(KEY_PREFIX_LEN).collect();
+        format!("{prefix}...")
     }
 }
 
@@ -86,5 +112,102 @@ impl Display for ZerodhaCredential {
             stringify!(ZerodhaCredential),
             self.api_key_masked()
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_credential_env_vars_returns_canonical_pair() {
+        // Pinned because the names appear in the config doc comments and in the error message
+        // raised when resolution fails. If they drift apart, the error tells the user to set a
+        // variable that is never read — which is the defect this pair of assertions exists for.
+        assert_eq!(
+            credential_env_vars(),
+            ("ZERODHA_API_KEY", "ZERODHA_ACCESS_TOKEN")
+        );
+    }
+
+    #[rstest]
+    fn test_resolve_prefers_explicit_values() {
+        let cred = ZerodhaCredential::resolve(Some("explicit-key"), Some("explicit-token"))
+            .expect("explicit values should resolve");
+        assert_eq!(cred.api_key(), "explicit-key");
+        assert_eq!(cred.access_token(), "explicit-token");
+    }
+
+    #[rstest]
+    #[case::both_absent(None, None)]
+    #[case::key_only(Some("key"), None)]
+    #[case::token_only(None, Some("token"))]
+    #[case::key_blank(Some("   "), Some("token"))]
+    #[case::token_blank(Some("key"), Some(""))]
+    fn test_resolve_returns_none_for_an_incomplete_pair(
+        #[case] api_key: Option<&str>,
+        #[case] access_token: Option<&str>,
+    ) {
+        // A half-pair cannot authenticate, so it must read as absent rather than be passed on to
+        // fail at the venue. Blank and whitespace-only count as absent.
+        //
+        // NOTE: this asserts the no-environment case, so it only holds when the variables are
+        // unset. It is written to be robust either way by checking the *explicit* half is what
+        // decides — see the guard below.
+        if std::env::var(credential_env_vars().0).is_ok()
+            || std::env::var(credential_env_vars().1).is_ok()
+        {
+            // The developer's shell has Zerodha credentials exported; the fallback would supply
+            // the missing half and this case cannot be observed. Skipping loudly beats asserting
+            // something the environment has already decided.
+            eprintln!("SKIPPED: ZERODHA_* set in the environment, fallback would mask this case");
+            return;
+        }
+        assert!(ZerodhaCredential::resolve(api_key, access_token).is_none());
+    }
+
+    #[rstest]
+    fn test_debug_and_display_redact_the_access_token() {
+        let cred = ZerodhaCredential::new("abcdef123456".to_string(), "supersecrettoken".to_string());
+
+        let debug = format!("{cred:?}");
+        let display = format!("{cred}");
+
+        // The token must not appear in either rendering, in whole or in part.
+        assert!(!debug.contains("supersecrettoken"), "token leaked into Debug");
+        assert!(
+            !display.contains("supersecrettoken"),
+            "token leaked into Display"
+        );
+        // Nor may the full key — only its prefix.
+        assert!(!debug.contains("abcdef123456"), "full API key leaked into Debug");
+        assert!(
+            !display.contains("abcdef123456"),
+            "full API key leaked into Display"
+        );
+        assert!(debug.contains("abcd"), "masked prefix should still be present");
+    }
+
+    #[rstest]
+    #[case::shorter_than_the_prefix("ab", "ab...")]
+    #[case::exactly_the_prefix("abcd", "abcd...")]
+    #[case::empty("", "...")]
+    // The two cases below PANIC under byte-slicing `&key[..min(4, len)]`, because byte 4 lands
+    // inside a multi-byte character. Both were checked against the old implementation first —
+    // a case that does not reproduce the fault proves nothing. Note `"éé"` does NOT qualify: it
+    // is exactly 4 bytes, so the cut lands cleanly on a boundary and the old code survived it.
+    //
+    // Written from the failure mode rather than from realistic data. An API key is unlikely to be
+    // non-ASCII, but this runs on log and error paths, which is the worst place for a panic.
+    #[case::multibyte_straddling_the_cut("aaaé", "aaaé...")]
+    #[case::multibyte_longer_than_the_cut("日本語です", "日本語で...")]
+    fn test_api_key_masked_truncates_by_character_and_never_panics(
+        #[case] key: &str,
+        #[case] expected: &str,
+    ) {
+        let cred = ZerodhaCredential::new(key.to_string(), "token".to_string());
+        assert_eq!(cred.api_key_masked(), expected);
     }
 }

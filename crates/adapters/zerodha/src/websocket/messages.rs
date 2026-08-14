@@ -51,11 +51,21 @@ pub struct KiteDepthEntry {
 }
 
 /// The five-deep bid and ask ladders carried by a full-mode tick.
+///
+/// # Level ordering is UNVERIFIED
+///
+/// The wire order is preserved exactly as received — the first five entries become [`Self::buy`]
+/// and the next five [`Self::sell`], which is what the reference client does. Whether Zerodha
+/// sends them **best-first** has *not* been confirmed against a live socket, and the constructed
+/// fixtures cannot establish it because their ordering was chosen by whoever wrote them.
+///
+/// Do not rely on `buy[0]` being the best bid until that is measured. Anything building an order
+/// book from this should sort explicitly.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct KiteDepth {
-    /// The five bid levels, best first.
+    /// The five bid levels, in the order the venue sent them.
     pub buy: Vec<KiteDepthEntry>,
-    /// The five ask levels, best first.
+    /// The five ask levels, in the order the venue sent them.
     pub sell: Vec<KiteDepthEntry>,
 }
 
