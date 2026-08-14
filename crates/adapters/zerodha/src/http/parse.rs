@@ -70,6 +70,13 @@ pub struct KiteInstrument {
     pub exchange: String,
     /// `EQ`, `FUT`, `CE`, `PE`, …
     pub instrument_type: String,
+    /// The venue's segment, e.g. `NSE`, `NFO-OPT`, `NFO-FUT`, `INDICES`, `MCX-FUT`.
+    ///
+    /// ⚠️ **This is not redundant with `instrument_type`.** The live NSE dump carries 136 index
+    /// rows — `NIFTY 50`, `NIFTY BANK` — whose `instrument_type` is `EQ` and whose `segment` is
+    /// `INDICES`. `instrument_type` alone cannot tell an index from a share, so any consumer
+    /// deciding what an instrument *is* must read this column too.
+    pub segment: String,
     /// The option strike, `0` for every instrument that is not an option.
     pub strike: f64,
     /// The minimum price increment, as the venue wrote it.
@@ -161,12 +168,7 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         index_of("lot_size")?,
         index_of("expiry")?,
     );
-    let widest = [
-        i_token, i_symbol, i_name, i_exchange, i_type, i_strike, i_tick, i_lot, i_expiry,
-    ]
-    .into_iter()
-    .max()
-    .unwrap_or(0);
+    let i_seg = index_of("segment")?;
 
     let mut instruments = Vec::new();
     let mut skipped = 0usize;
@@ -177,7 +179,27 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         }
 
         let fields: Vec<&str> = line.split(',').collect();
-        if fields.len() <= widest {
+
+        // An EXACT match against the header, not merely "enough fields".
+        //
+        // # This is the guard against an embedded comma, and `<= widest` was not one
+        //
+        // The split is naive: it does not honour CSV quoting. **106,683 of the 114,851 rows in the
+        // live dump are quoted** (measured 2026-08-14 across all nine exchanges), every one of them
+        // in `name` — a column this parser does not read — and **zero rows currently contain a
+        // comma inside those quotes**. So the naive split is correct today, by luck rather than by
+        // design.
+        //
+        // The day a `name` does contain a comma, that row gains a field and **everything after it
+        // shifts**: `tick_size` would be read from `lot_size`, `instrument_type` from `segment`.
+        // A length check of `<= widest` passes such a row — it has *more* than enough fields — and
+        // the instrument parses with a plausible wrong precision and a wrong type. No error.
+        //
+        // Requiring the exact count converts that silent misread into a counted skip, which
+        // `skipped` already surfaces to the caller. It is strictly better than a full CSV reader
+        // for the risk that actually exists: no dependency, and it fails loudly on **any** shape
+        // change rather than only on quoting.
+        if fields.len() != columns.len() {
             skipped += 1;
             continue;
         }
@@ -190,6 +212,7 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
                 name: fields[i_name].trim().to_string(),
                 exchange: fields[i_exchange].trim().to_string(),
                 instrument_type: fields[i_type].trim().to_string(),
+                segment: fields[i_seg].trim().to_string(),
                 strike: {
                     // The venue writes `0` for everything that is not an option, but an empty
                     // cell says the same thing -- and equities are the majority of the dump, so
@@ -277,6 +300,28 @@ mod tests {
         );
     }
 
+    // The live NSE dump carries 136 rows whose `instrument_type` is EQ but whose `segment` is
+    // INDICES -- `NIFTY 50`, `NIFTY BANK`. Both columns have to survive parsing, because
+    // `instrument_type` alone cannot tell an index from a share.
+    #[rstest]
+    fn test_segment_and_instrument_type_are_both_carried() {
+        let csv = dump(&[
+            "256265,1001,NIFTY 50,NIFTY 50,0,,0,0,0,EQ,INDICES,NSE",
+            "408065,1594,RELIANCE,RELIANCE,0,,0,0.05,1,EQ,NSE,NSE",
+        ]);
+
+        let (instruments, skipped) = parse_instruments(&csv).expect("valid dump");
+
+        assert_eq!(skipped, 0, "an index row with a zero tick and zero lot still parses");
+        assert_eq!(instruments[0].instrument_type, "EQ");
+        assert_eq!(
+            instruments[0].segment, "INDICES",
+            "the segment is the only column that separates NIFTY 50 from a share",
+        );
+        assert_eq!(instruments[1].instrument_type, "EQ");
+        assert_eq!(instruments[1].segment, "NSE");
+    }
+
     // Equities carry an empty expiry. The vendor client only parses the column when it is exactly
     // 10 characters, so a parser treating expiry as mandatory would reject most of the dump.
     #[rstest]
@@ -318,6 +363,29 @@ mod tests {
 
         assert_eq!(instruments.len(), 2, "good rows survive a bad neighbour");
         assert_eq!(skipped, 2, "the count is what distinguishes odd rows from a schema change");
+    }
+
+    // THE DISCRIMINATING TEST FOR AN EMBEDDED COMMA. This is what a quoted `name` containing a
+    // comma looks like once the naive split has run: one extra field, and everything after it
+    // shifted. A `fields.len() <= widest` guard PASSES this row -- it has more than enough fields
+    // -- and parses `tick_size` from the `lot_size` column, yielding precision 0 and instrument
+    // type `NSE`. A plausible wrong value, with nothing raised.
+    #[rstest]
+    fn test_a_row_with_an_extra_field_is_skipped_not_misread() {
+        let csv = dump(&[
+            "408065,1594,RELIANCE,RELIANCE,0,,0,0.05,1,EQ,NSE,NSE",
+            // `name` split by an embedded comma: 13 fields where the header declares 12.
+            "12345,999,ACME,\"ACME LTD, INC\",0,,0,0.05,1,EQ,NSE,NSE",
+        ]);
+
+        let (instruments, skipped) = parse_instruments(&csv).expect("valid header");
+
+        assert_eq!(skipped, 1, "the shifted row must be rejected, not parsed from the wrong columns");
+        assert_eq!(instruments.len(), 1);
+        assert_eq!(
+            instruments[0].tradingsymbol, "RELIANCE",
+            "the surviving row must be the intact one",
+        );
     }
 
     #[rstest]
