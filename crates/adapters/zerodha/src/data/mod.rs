@@ -29,13 +29,25 @@ use async_trait::async_trait;
 use nautilus_common::clients::DataClient;
 use nautilus_model::identifiers::{ClientId, Venue};
 
-use crate::{common::consts::NSE_VENUE, config::ZerodhaDataClientConfig};
+use crate::{
+    common::{
+        consts::NSE_VENUE,
+        credential::{ZerodhaCredential, credential_env_vars},
+    },
+    config::ZerodhaDataClientConfig,
+};
 
 /// A Nautilus data client for the Zerodha Kite Connect streaming API.
+///
+/// `Debug` is derived; [`ZerodhaCredential`] redacts itself, so formatting this client cannot
+/// print a live session token.
 #[derive(Debug)]
 pub struct ZerodhaDataClient {
     client_id: ClientId,
     config: ZerodhaDataClientConfig,
+    /// Resolved at construction from the config or the environment.
+    #[expect(dead_code, reason = "consumed once the WebSocket transport is wired")]
+    credential: ZerodhaCredential,
     is_connected: AtomicBool,
 }
 
@@ -46,13 +58,18 @@ impl ZerodhaDataClient {
     ///
     /// Returns an error if the configuration is missing credentials.
     pub fn new(client_id: ClientId, config: ZerodhaDataClientConfig) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            config.has_credentials(),
-            "Zerodha data client requires both an API key and an access token \
-             (set them on the config, or via ZERODHA_API_KEY / ZERODHA_ACCESS_TOKEN)"
-        );
+        // Resolved once here rather than re-read later, so the client cannot pick up a different
+        // credential mid-session if the environment changes under it.
+        let (key_var, token_var) = credential_env_vars();
+        let credential = config.credential().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Zerodha data client requires both an API key and an access token \
+                 (set them on the config, or via {key_var} / {token_var})"
+            )
+        })?;
 
         Ok(Self {
+            credential,
             client_id,
             config,
             is_connected: AtomicBool::new(false),

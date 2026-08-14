@@ -51,8 +51,12 @@
 //! `KiteTicker._parse_binary`. It is a reimplementation, not a translation, and it differs from the
 //! reference in three deliberate ways, each of which is a bug in the reference:
 //!
-//! 1. **Truncated packets are rejected, not silently mis-decoded.** The reference indexes without
-//!    bounds checks, so a short frame raises an opaque `struct.error` from inside the parse loop.
+//! 1. **Short and truncated input is rejected with a *specific* error, not silently mis-decoded.**
+//!    The reference indexes without bounds checks, so a short frame raises an opaque `struct.error`
+//!    from inside the parse loop. Here a packet whose length matches no layout is
+//!    [`ZerodhaWsError::UnknownPacketLength`], and a declared length running past the end of the
+//!    frame is [`ZerodhaWsError::Truncated`] — two different faults that need two different
+//!    operational responses.
 //! 2. **Timestamps stay as Unix epoch seconds.** The reference calls `datetime.fromtimestamp()`
 //!    with no timezone, producing a naive datetime in the *host's local zone*; read as UTC that is
 //!    wrong by the host's offset (5h30m for an IST host). Callers convert explicitly here.
