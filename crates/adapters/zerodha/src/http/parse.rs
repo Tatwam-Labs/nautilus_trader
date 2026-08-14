@@ -297,7 +297,10 @@ mod tests {
 
     #[rstest]
     fn test_a_missing_required_column_is_fatal() {
-        let csv = "instrument_token,tradingsymbol,exchange\n1,X,NSE";
+        // Every required column EXCEPT tick_size, so the error names the one under test
+        // rather than whichever happens to be looked up first.
+        let csv = "instrument_token,lot_size,expiry,exchange,tradingsymbol,instrument_type,\
+strike,name,last_price,segment,exchange_token\n1,1,,NSE,X,EQ,0,X,0,NSE,1";
         let err = match parse_instruments(csv) {
             Ok(_) => panic!("a dump without tick_size cannot yield a usable precision"),
             Err(e) => e.to_string(),
