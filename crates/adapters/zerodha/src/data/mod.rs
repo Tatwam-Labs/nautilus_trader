@@ -380,7 +380,24 @@ impl DataClient for ZerodhaDataClient {
             // may have crossed a session boundary. See `data::parse::TradeTracker`.
             let mut trades = TradeTracker::new();
 
+            // A HEARTBEAT, because the absence of one cost an evening. This task previously
+            // logged nothing at INFO, so a run receiving 150 ticks and a run receiving none
+            // produced identical output -- and the first live node run could not be diagnosed
+            // from its logs at all. Counters are cheap; silence is not.
+            let mut received = 0usize;
+            let mut published = 0usize;
+            let mut unmapped = 0usize;
+
             while let Some(tick) = ticks.recv().await {
+                received += 1;
+
+                if received == 1 || received % 25 == 0 {
+                    log::info!(
+                        "Zerodha tick path: {received} received, {published} published as quotes, \
+                         {unmapped} with no registered instrument"
+                    );
+                }
+
                 let details = match instruments.read() {
                     Ok(guard) => guard.by_token(tick.instrument_token).copied(),
                     Err(e) => {
@@ -390,6 +407,7 @@ impl DataClient for ZerodhaDataClient {
                 };
 
                 let Some(details) = details else {
+                    unmapped += 1;
                     // Not an error: the venue streams every token we ever subscribed, and a token
                     // can outlive its registration. Logged at debug so an unregistered instrument
                     // does not drown the log at tick rates.
@@ -407,6 +425,8 @@ impl DataClient for ZerodhaDataClient {
                     ts_init,
                 ) {
                     Ok(quote) => {
+                        published += 1;
+
                         if sender.send(DataEvent::Data(quote.into())).is_err() {
                             log::debug!("Data event receiver dropped; stopping Zerodha feed");
                             return;
