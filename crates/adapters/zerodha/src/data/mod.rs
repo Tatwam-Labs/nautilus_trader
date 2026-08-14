@@ -196,12 +196,57 @@ impl ZerodhaDataClient {
             registry.register(instrument.to_details());
         }
 
+        // Release the write lock before publishing: the send below is not instant at 16k
+        // instruments, and holding a writer that long blocks every token lookup on the tick path.
+        drop(registry);
+
+        // ⚠️ PUBLISHING TO THE ENGINE IS SEPARATE FROM REGISTERING, AND BOTH ARE REQUIRED.
+        //
+        // The registry above answers "which token is this instrument?" on the tick path. It is
+        // private to this crate and the engine cannot see it. The Nautilus **cache** is what
+        // prices orders, and until an instrument reaches it the execution client cannot fill.
+        //
+        // This was found by a live paper run on 2026-08-14: every client connected, the sandbox
+        // started, and the strategy stopped with `CRUDEOIL26AUGFUT.MCX is not in the cache`.
+        // `to_instrument_any` had existed for hours and **nothing outside its own tests called
+        // it** — the construction was complete and unreachable.
+        //
+        // Without the strategy's own guard that would have been a silent no-fill run: quotes
+        // arriving, orders submitted, nothing filling, and the feed the obvious thing to blame.
+        let sender = get_data_event_sender();
+        let mut published = 0usize;
+        let mut unconvertible = 0usize;
+        let ts_init = get_atomic_clock_realtime().get_time_ns();
+
+        for instrument in &instruments {
+            match instrument.to_instrument_any(ts_init) {
+                Ok(any) => {
+                    if sender.send(DataEvent::Instrument(any)).is_err() {
+                        log::error!("Data event receiver dropped while publishing instruments");
+                        break;
+                    }
+                    published += 1;
+                }
+                // Expected and not an error: index rows carry a zero tick and zero lot, and the
+                // dump also holds types this adapter does not map. Counted rather than silent, so
+                // "a few odd rows" stays distinguishable from "the schema changed".
+                Err(e) => {
+                    unconvertible += 1;
+
+                    if unconvertible <= 3 {
+                        log::debug!("Instrument not convertible, skipping: {e}");
+                    }
+                }
+            }
+        }
+
         log::info!(
-            "Registered {} Zerodha instruments ({})",
-            registry.len(),
+            "Zerodha instruments ({}): {} parsed, {published} published to the cache, \
+             {unconvertible} not convertible",
             exchange.unwrap_or("all exchanges"),
+            instruments.len(),
         );
-        Ok(instruments.len())
+        Ok(published)
     }
 
     /// Resolves an instrument id to the Zerodha token the streaming API subscribes by.

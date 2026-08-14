@@ -90,15 +90,30 @@ class MinimalRoundTrip(Strategy):
         self.fills = 0
         self.entered = False
         self.exited = False
+        # Set when startup found no instrument. Checked by the report so a run that could never
+        # have filled says why, instead of looking like a market that was simply quiet.
+        self.aborted_reason: str | None = None
 
     def on_start(self) -> None:
         instrument = self.cache.instrument(INSTRUMENT_ID)
 
         if instrument is None:
             # A missing instrument is the single most likely reason for a silent no-fill run: the
-            # sandbox cannot fill what the cache cannot price. Fail loudly rather than sit quiet.
-            self.log.error(f"{INSTRUMENT_ID} is not in the cache; nothing can fill. Stopping.")
-            self.stop()
+            # sandbox cannot fill what the cache cannot price. Record it and subscribe to nothing.
+            #
+            # ⚠️ DO NOT CALL `self.stop()` HERE. Stopping from inside `on_start` re-enters the
+            # actor while the engine still holds a mutable borrow of it, and PyO3 raises
+            # `RuntimeError: Already borrowed` — which then masks the real error. Observed on the
+            # 2026-08-14 paper run: the useful message ("not in the cache") was buried under two
+            # layers of borrow-failure traceback.
+            #
+            # Returning without subscribing achieves the same thing: no quotes, no orders, and the
+            # report explains why.
+            self.aborted_reason = (
+                f"{INSTRUMENT_ID} was not in the cache at startup, so nothing could be priced "
+                f"or filled"
+            )
+            self.log.error(f"{self.aborted_reason}. Not subscribing.")
             return
 
         self.lot = instrument.lot_size or Quantity.from_int(1)
@@ -250,6 +265,12 @@ def report(node: LiveNode, strategy: MinimalRoundTrip | None) -> None:
     # The verdict separates outcomes a count cannot. "Submitted but never filled" is the likeliest
     # failure and must not read as success.
     print("\n  VERDICT")
+
+    if strategy.aborted_reason is not None:
+        # Distinguished from "no quotes" deliberately: this run could never have traded, and
+        # reporting it as a quiet market would send the next person to look at the feed.
+        print(f"  ABORTED AT STARTUP — {strategy.aborted_reason}")
+        return
 
     if strategy.quotes == 0:
         verdict = "NO QUOTES — the data client never delivered. Market closed, or the adapter is not wired."
