@@ -21,13 +21,21 @@
 //!
 //! # Status
 //!
-//! **Incomplete — the tick decoder is done and the transport is not.** The binary streaming
-//! decoder ([`websocket::parse`]) is implemented and covered by fixture tests; the WebSocket and
-//! REST transports are not yet wired.
+//! **Incomplete, and the parts differ in how well they are established.**
 //!
-//! [`data::ZerodhaDataClient::connect`] returns an error, but note that a `connect` failure does
-//! **not** stop a node starting — see the note in [`data`]. The guard that does is the credential
-//! check in the constructor, which the node builder propagates.
+//! | area | state |
+//! |---|---|
+//! | binary tick decoder ([`websocket::parse`]) | complete; checked against captured venue bytes |
+//! | subscription messages ([`websocket::subscription`]) | complete; checked against the vendor client's source |
+//! | tick → [`QuoteTick`] mapping ([`data::parse`]) | complete; unit-tested |
+//! | WebSocket transport ([`websocket::client`]) | written, **never run against Zerodha** |
+//! | REST client and instrument provider | **not started** — and instrument tokens come only from there |
+//! | execution client | **not started** |
+//!
+//! **No part of the live path has carried a real tick.** A passing test suite says nothing about
+//! the transport, because nothing in the suite exercises it.
+//!
+//! [`QuoteTick`]: nautilus_model::data::QuoteTick
 //!
 //! # NautilusTrader
 //!
