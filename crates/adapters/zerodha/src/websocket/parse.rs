@@ -148,7 +148,10 @@ pub fn split_packets(frame: &[u8]) -> Result<Vec<&[u8]>, ZerodhaWsError> {
 /// Returns an error if the frame is truncated or if a packet has a length that does not correspond
 /// to any documented layout.
 pub fn parse_binary(frame: &[u8]) -> Result<Vec<KiteTick>, ZerodhaWsError> {
-    split_packets(frame)?.into_iter().map(parse_packet).collect()
+    split_packets(frame)?
+        .into_iter()
+        .map(parse_packet)
+        .collect()
 }
 
 /// The wire layout of a packet.
@@ -244,6 +247,7 @@ pub fn parse_packet(packet: &[u8]) -> Result<KiteTick, ZerodhaWsError> {
                 open: be_price(packet, 16, divisor)?,
                 close: be_price(packet, 20, divisor)?,
             });
+
             if layout == PacketLayout::IndexFull {
                 tick.exchange_timestamp = Some(be_u32(packet, 28)?);
             }

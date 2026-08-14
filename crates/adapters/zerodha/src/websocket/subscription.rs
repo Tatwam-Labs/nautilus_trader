@@ -145,6 +145,7 @@ impl SubscriptionState {
         use strum::IntoEnumIterator;
 
         let mut plan = Vec::new();
+
         for mode in ZerodhaTickMode::iter() {
             // `filter_map` rather than `filter` + `map`: `filter` hands the closure a *reference*
             // to the item, so `|(_, &m)|` would bind `m: &ZerodhaTickMode` and the comparison

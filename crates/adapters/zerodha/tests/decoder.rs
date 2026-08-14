@@ -26,7 +26,7 @@
 
 use nautilus_zerodha::{
     common::enums::{ZerodhaSegment, ZerodhaTickMode},
-    websocket::{parse::parse_binary, ZerodhaWsError},
+    websocket::{ZerodhaWsError, parse::parse_binary},
 };
 use rstest::rstest;
 use serde_json::Value;
@@ -64,8 +64,8 @@ fn assert_close(actual: f64, expected: f64, case: &str, field: &str) {
 fn assert_opt_u32(actual: Option<u32>, expected: Option<&Value>, case: &str, field: &str) {
     match expected {
         Some(v) => {
-            let want = u32::try_from(v.as_u64().expect("expected an integer"))
-                .expect("value exceeds u32");
+            let want =
+                u32::try_from(v.as_u64().expect("expected an integer")).expect("value exceeds u32");
             assert_eq!(actual, Some(want), "{case}: {field}");
         }
         None => assert_eq!(actual, None, "{case}: {field} should be absent"),
@@ -81,7 +81,9 @@ fn every_fixture_case_matches_the_reference_client() {
     for case in cases {
         let name = case["name"].as_str().expect("case needs a name");
         let frame = decode_hex(case["frame_hex"].as_str().expect("case needs frame_hex"));
-        let expected = case["expected"].as_array().expect("expected must be an array");
+        let expected = case["expected"]
+            .as_array()
+            .expect("expected must be an array");
 
         let ticks = parse_binary(&frame).unwrap_or_else(|e| panic!("{name}: decode failed: {e}"));
 
@@ -147,7 +149,12 @@ fn every_fixture_case_matches_the_reference_client() {
                 name,
                 "last_traded_quantity",
             );
-            assert_opt_u32(tick.volume_traded, want.get("volume_traded"), name, "volume_traded");
+            assert_opt_u32(
+                tick.volume_traded,
+                want.get("volume_traded"),
+                name,
+                "volume_traded",
+            );
             assert_opt_u32(
                 tick.total_buy_quantity,
                 want.get("total_buy_quantity"),
@@ -161,7 +168,12 @@ fn every_fixture_case_matches_the_reference_client() {
                 "total_sell_quantity",
             );
             assert_opt_u32(tick.oi, want.get("oi"), name, "oi");
-            assert_opt_u32(tick.oi_day_high, want.get("oi_day_high"), name, "oi_day_high");
+            assert_opt_u32(
+                tick.oi_day_high,
+                want.get("oi_day_high"),
+                name,
+                "oi_day_high",
+            );
             assert_opt_u32(tick.oi_day_low, want.get("oi_day_low"), name, "oi_day_low");
             assert_opt_u32(
                 tick.exchange_timestamp,
@@ -177,9 +189,10 @@ fn every_fixture_case_matches_the_reference_client() {
             );
 
             if let Some(w) = want.get("depth") {
-                let depth = tick.depth.as_ref().unwrap_or_else(|| {
-                    panic!("{name}: reference decoded depth, decoder did not")
-                });
+                let depth = tick
+                    .depth
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{name}: reference decoded depth, decoder did not"));
                 for (side, entries) in [("buy", &depth.buy), ("sell", &depth.sell)] {
                     let w_side = w[side].as_array().expect("depth side");
                     assert_eq!(entries.len(), w_side.len(), "{name}: {side} depth levels");
@@ -211,8 +224,16 @@ fn every_fixture_case_matches_the_reference_client() {
 
 #[rstest]
 fn heartbeat_frame_decodes_to_no_ticks() {
-    assert!(parse_binary(&[0x00]).expect("heartbeat must not error").is_empty());
-    assert!(parse_binary(&[]).expect("empty frame must not error").is_empty());
+    assert!(
+        parse_binary(&[0x00])
+            .expect("heartbeat must not error")
+            .is_empty()
+    );
+    assert!(
+        parse_binary(&[])
+            .expect("empty frame must not error")
+            .is_empty()
+    );
 }
 
 #[rstest]
@@ -292,7 +313,11 @@ fn ltp_and_quote_modes_are_distinguished_by_packet_length_alone() {
         .collect();
 
     // The fixture set must exercise every mode, or a mode-selection bug hides in an untested arm.
-    for mode in [ZerodhaTickMode::Ltp, ZerodhaTickMode::Quote, ZerodhaTickMode::Full] {
+    for mode in [
+        ZerodhaTickMode::Ltp,
+        ZerodhaTickMode::Quote,
+        ZerodhaTickMode::Full,
+    ] {
         assert!(modes.contains(&mode), "no fixture exercises {mode:?}");
     }
 }

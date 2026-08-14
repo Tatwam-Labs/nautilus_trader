@@ -79,10 +79,7 @@
 //! readings, and the byte offsets in question. `kiteconnect` is one implementation reading real
 //! bytes; it is not an authority.
 
-use nautilus_zerodha::{
-    common::enums::ZerodhaSegment,
-    websocket::parse::parse_packet,
-};
+use nautilus_zerodha::{common::enums::ZerodhaSegment, websocket::parse::parse_packet};
 use rstest::rstest;
 use serde_json::Value;
 
@@ -123,13 +120,13 @@ fn close_enough(a: f64, b: f64) -> bool {
 fn expect_opt_u32(actual: Option<u32>, expected: Option<&Value>, field: &str, hex: &str) {
     match expected {
         Some(v) => {
-            let want = v
-                .as_u64()
-                .unwrap_or_else(|| panic!(
+            let want = v.as_u64().unwrap_or_else(|| {
+                panic!(
                     "{field} is not an integer in the fixture: {v}. Timestamps must be emitted as \
                      epoch SECONDS, not a rendered datetime string -- a string is host-timezone \
                      dependent and silently shifts by the deriving machine's UTC offset."
-                ));
+                )
+            });
             assert_eq!(
                 actual,
                 Some(u32::try_from(want).expect("exceeds u32")),
@@ -138,7 +135,8 @@ fn expect_opt_u32(actual: Option<u32>, expected: Option<&Value>, field: &str, he
             );
         }
         None => assert_eq!(
-            actual, None,
+            actual,
+            None,
             "{}",
             disagreement(field, hex, &format!("{actual:?}"), "absent"),
         ),
@@ -160,8 +158,12 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
             let packet = decode_hex(hex);
             let want = &pair["expected"];
 
-            let tick = parse_packet(&packet)
-                .unwrap_or_else(|e| panic!("{}", disagreement("decode", hex, &e.to_string(), "decoded ok")));
+            let tick = parse_packet(&packet).unwrap_or_else(|e| {
+                panic!(
+                    "{}",
+                    disagreement("decode", hex, &e.to_string(), "decoded ok")
+                )
+            });
 
             lengths.push(packet.len());
             checked += 1;
@@ -169,12 +171,24 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
             assert_eq!(
                 u64::from(tick.instrument_token),
                 want["instrument_token"].as_u64().expect("instrument_token"),
-                "{}", disagreement("instrument_token", hex, &tick.instrument_token.to_string(), &want["instrument_token"].to_string()),
+                "{}",
+                disagreement(
+                    "instrument_token",
+                    hex,
+                    &tick.instrument_token.to_string(),
+                    &want["instrument_token"].to_string()
+                ),
             );
             assert_eq!(
                 tick.tradable,
                 want["tradable"].as_bool().expect("tradable"),
-                "{}", disagreement("tradable", hex, &tick.tradable.to_string(), &want["tradable"].to_string()),
+                "{}",
+                disagreement(
+                    "tradable",
+                    hex,
+                    &tick.tradable.to_string(),
+                    &want["tradable"].to_string()
+                ),
             );
             assert_eq!(
                 tick.mode.to_string(),
@@ -182,13 +196,20 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
                 // `.as_ref()`, not `.to_string()`: ZerodhaTickMode derives `strum::AsRefStr`, so it
                 // already IS a `&str`. The `want[...]` side stays allocated -- `serde_json::Value`
                 // has no `AsRef<str>`.
-                "{}", disagreement("mode", hex, tick.mode.as_ref(), &want["mode"].to_string()),
+                "{}",
+                disagreement("mode", hex, tick.mode.as_ref(), &want["mode"].to_string()),
             );
 
             let lp = want["last_price"].as_f64().expect("last_price");
             assert!(
                 close_enough(tick.last_price, lp),
-                "{}", disagreement("last_price", hex, &tick.last_price.to_string(), &lp.to_string()),
+                "{}",
+                disagreement(
+                    "last_price",
+                    hex,
+                    &tick.last_price.to_string(),
+                    &lp.to_string()
+                ),
             );
 
             // OHLC. The FIELD ORDER differs between index and tradable layouts, and a
@@ -205,36 +226,92 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
                         let theirs = w[key].as_f64().unwrap_or_else(|| panic!("ohlc.{key}"));
                         assert!(
                             close_enough(ours, theirs),
-                            "{}", disagreement(&format!("ohlc.{key}"), hex, &ours.to_string(), &theirs.to_string()),
+                            "{}",
+                            disagreement(
+                                &format!("ohlc.{key}"),
+                                hex,
+                                &ours.to_string(),
+                                &theirs.to_string()
+                            ),
                         );
                     }
                     let ch = want["change"].as_f64().expect("change");
                     assert!(
                         close_enough(tick.change, ch),
-                        "{}", disagreement("change", hex, &tick.change.to_string(), &ch.to_string()),
+                        "{}",
+                        disagreement("change", hex, &tick.change.to_string(), &ch.to_string()),
                     );
                 }
                 (None, None) => {}
                 (a, w) => panic!(
-                    "{}", disagreement("ohlc presence", hex, &a.is_some().to_string(), &w.is_some().to_string()),
+                    "{}",
+                    disagreement(
+                        "ohlc presence",
+                        hex,
+                        &a.is_some().to_string(),
+                        &w.is_some().to_string()
+                    ),
                 ),
             }
 
-            expect_opt_u32(tick.last_traded_quantity, want.get("last_traded_quantity"), "last_traded_quantity", hex);
-            expect_opt_u32(tick.volume_traded, want.get("volume_traded"), "volume_traded", hex);
-            expect_opt_u32(tick.total_buy_quantity, want.get("total_buy_quantity"), "total_buy_quantity", hex);
-            expect_opt_u32(tick.total_sell_quantity, want.get("total_sell_quantity"), "total_sell_quantity", hex);
+            expect_opt_u32(
+                tick.last_traded_quantity,
+                want.get("last_traded_quantity"),
+                "last_traded_quantity",
+                hex,
+            );
+            expect_opt_u32(
+                tick.volume_traded,
+                want.get("volume_traded"),
+                "volume_traded",
+                hex,
+            );
+            expect_opt_u32(
+                tick.total_buy_quantity,
+                want.get("total_buy_quantity"),
+                "total_buy_quantity",
+                hex,
+            );
+            expect_opt_u32(
+                tick.total_sell_quantity,
+                want.get("total_sell_quantity"),
+                "total_sell_quantity",
+                hex,
+            );
             expect_opt_u32(tick.oi, want.get("oi"), "oi", hex);
-            expect_opt_u32(tick.oi_day_high, want.get("oi_day_high"), "oi_day_high", hex);
+            expect_opt_u32(
+                tick.oi_day_high,
+                want.get("oi_day_high"),
+                "oi_day_high",
+                hex,
+            );
             expect_opt_u32(tick.oi_day_low, want.get("oi_day_low"), "oi_day_low", hex);
-            expect_opt_u32(tick.exchange_timestamp, want.get("exchange_timestamp"), "exchange_timestamp", hex);
-            expect_opt_u32(tick.last_trade_time, want.get("last_trade_time"), "last_trade_time", hex);
+            expect_opt_u32(
+                tick.exchange_timestamp,
+                want.get("exchange_timestamp"),
+                "exchange_timestamp",
+                hex,
+            );
+            expect_opt_u32(
+                tick.last_trade_time,
+                want.get("last_trade_time"),
+                "last_trade_time",
+                hex,
+            );
 
             if let Some(avg) = want.get("average_traded_price").and_then(Value::as_f64) {
-                let ours = tick.average_traded_price.expect("decoder produced no average_traded_price");
+                let ours = tick
+                    .average_traded_price
+                    .expect("decoder produced no average_traded_price");
                 assert!(
                     close_enough(ours, avg),
-                    "{}", disagreement("average_traded_price", hex, &ours.to_string(), &avg.to_string()),
+                    "{}",
+                    disagreement(
+                        "average_traded_price",
+                        hex,
+                        &ours.to_string(),
+                        &avg.to_string()
+                    ),
                 );
             }
 
@@ -245,29 +322,63 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
                     for (side, ours) in [("buy", &depth.buy), ("sell", &depth.sell)] {
                         let theirs = w[side].as_array().unwrap_or_else(|| panic!("depth.{side}"));
                         assert_eq!(
-                            ours.len(), theirs.len(),
-                            "{}", disagreement(&format!("depth.{side}.len"), hex, &ours.len().to_string(), &theirs.len().to_string()),
+                            ours.len(),
+                            theirs.len(),
+                            "{}",
+                            disagreement(
+                                &format!("depth.{side}.len"),
+                                hex,
+                                &ours.len().to_string(),
+                                &theirs.len().to_string()
+                            ),
                         );
+
                         for (i, (a, b)) in ours.iter().zip(theirs).enumerate() {
                             assert_eq!(
-                                u64::from(a.quantity), b["quantity"].as_u64().expect("quantity"),
-                                "{}", disagreement(&format!("depth.{side}[{i}].quantity"), hex, &a.quantity.to_string(), &b["quantity"].to_string()),
+                                u64::from(a.quantity),
+                                b["quantity"].as_u64().expect("quantity"),
+                                "{}",
+                                disagreement(
+                                    &format!("depth.{side}[{i}].quantity"),
+                                    hex,
+                                    &a.quantity.to_string(),
+                                    &b["quantity"].to_string()
+                                ),
                             );
                             assert_eq!(
-                                u64::from(a.orders), b["orders"].as_u64().expect("orders"),
-                                "{}", disagreement(&format!("depth.{side}[{i}].orders"), hex, &a.orders.to_string(), &b["orders"].to_string()),
+                                u64::from(a.orders),
+                                b["orders"].as_u64().expect("orders"),
+                                "{}",
+                                disagreement(
+                                    &format!("depth.{side}[{i}].orders"),
+                                    hex,
+                                    &a.orders.to_string(),
+                                    &b["orders"].to_string()
+                                ),
                             );
                             let bp = b["price"].as_f64().expect("price");
                             assert!(
                                 close_enough(a.price, bp),
-                                "{}", disagreement(&format!("depth.{side}[{i}].price"), hex, &a.price.to_string(), &bp.to_string()),
+                                "{}",
+                                disagreement(
+                                    &format!("depth.{side}[{i}].price"),
+                                    hex,
+                                    &a.price.to_string(),
+                                    &bp.to_string()
+                                ),
                             );
                         }
                     }
                 }
                 (None, None) => {}
                 (a, w) => panic!(
-                    "{}", disagreement("depth presence", hex, &a.is_some().to_string(), &w.is_some().to_string()),
+                    "{}",
+                    disagreement(
+                        "depth presence",
+                        hex,
+                        &a.is_some().to_string(),
+                        &w.is_some().to_string()
+                    ),
                 ),
             }
         }
@@ -283,7 +394,10 @@ fn decoder_agrees_with_the_vendor_client_on_every_captured_packet() {
         "the captured corpus no longer spans all five layouts (saw {lengths:?}); a subset passing \
          is NOT the same evidence, and the 184-byte depth layout is the one that matters most",
     );
-    assert_eq!(checked, 20, "expected 20 captured packets, checked {checked}");
+    assert_eq!(
+        checked, 20,
+        "expected 20 captured packets, checked {checked}"
+    );
 }
 
 /// The deep-OTM corpus: same shape as the main fixtures, captured to separate the two timestamps.
@@ -309,10 +423,26 @@ fn decoder_agrees_with_the_vendor_client_on_the_deep_otm_packets() {
             assert_eq!(
                 u64::from(tick.instrument_token),
                 want["instrument_token"].as_u64().expect("instrument_token"),
-                "{}", disagreement("instrument_token", hex, &tick.instrument_token.to_string(), &want["instrument_token"].to_string()),
+                "{}",
+                disagreement(
+                    "instrument_token",
+                    hex,
+                    &tick.instrument_token.to_string(),
+                    &want["instrument_token"].to_string()
+                ),
             );
-            expect_opt_u32(tick.exchange_timestamp, want.get("exchange_timestamp"), "exchange_timestamp", hex);
-            expect_opt_u32(tick.last_trade_time, want.get("last_trade_time"), "last_trade_time", hex);
+            expect_opt_u32(
+                tick.exchange_timestamp,
+                want.get("exchange_timestamp"),
+                "exchange_timestamp",
+                hex,
+            );
+            expect_opt_u32(
+                tick.last_trade_time,
+                want.get("last_trade_time"),
+                "last_trade_time",
+                hex,
+            );
             checked += 1;
         }
     }
@@ -340,6 +470,7 @@ fn a_frame_is_never_stamped_before_the_trade_it_reports() {
             let (Some(ts), Some(ltt)) = (tick.exchange_timestamp, tick.last_trade_time) else {
                 panic!("a 184-byte packet decoded without both timestamps: {hex}");
             };
+
             if ts == ltt {
                 continue; // Trade landed in the same second the frame was stamped.
             }
@@ -383,8 +514,21 @@ fn captured_corpus_carries_no_decoded_values() {
     let doc: Value = serde_json::from_str(raw).expect("corpus is not valid JSON");
 
     for record in doc["records"].as_array().expect("records") {
-        let keys: Vec<&str> = record.as_object().expect("record").keys().map(String::as_str).collect();
-        for forbidden in ["reference_decoded", "expected", "last_price", "ohlc", "depth", "oi"] {
+        let keys: Vec<&str> = record
+            .as_object()
+            .expect("record")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        for forbidden in [
+            "reference_decoded",
+            "expected",
+            "last_price",
+            "ohlc",
+            "depth",
+            "oi",
+        ] {
             assert!(
                 !keys.contains(&forbidden),
                 "the raw corpus contains a decoded field {forbidden:?}. It must hold bytes only -- \
@@ -408,8 +552,10 @@ fn sensex_index_token_decodes_as_a_real_captured_index_packet() {
         .find(|p| p["expected"]["instrument_token"].as_u64() == Some(265))
         .expect("no captured packet for SENSEX (token 265)");
 
-    let tick = parse_packet(&decode_hex(found["packet_hex"].as_str().expect("packet_hex")))
-        .expect("SENSEX packet failed to decode");
+    let tick = parse_packet(&decode_hex(
+        found["packet_hex"].as_str().expect("packet_hex"),
+    ))
+    .expect("SENSEX packet failed to decode");
 
     assert_eq!(tick.segment, ZerodhaSegment::Indices);
     assert!(!tick.tradable, "an index must decode as non-tradable");

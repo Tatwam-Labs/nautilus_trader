@@ -80,7 +80,9 @@ impl ZerodhaCredential {
         let (key_var, token_var) = credential_env_vars();
         let (key, token) = resolve_env_var_pair(
             api_key.filter(|s| !s.trim().is_empty()).map(String::from),
-            access_token.filter(|s| !s.trim().is_empty()).map(String::from),
+            access_token
+                .filter(|s| !s.trim().is_empty())
+                .map(String::from),
             key_var,
             token_var,
         )?;
@@ -186,24 +188,34 @@ mod tests {
 
     #[rstest]
     fn test_debug_and_display_redact_the_access_token() {
-        let cred = ZerodhaCredential::new("abcdef123456".to_string(), "supersecrettoken".to_string());
+        let cred =
+            ZerodhaCredential::new("abcdef123456".to_string(), "supersecrettoken".to_string());
 
         let debug = format!("{cred:?}");
         let display = format!("{cred}");
 
         // The token must not appear in either rendering, in whole or in part.
-        assert!(!debug.contains("supersecrettoken"), "token leaked into Debug");
+        assert!(
+            !debug.contains("supersecrettoken"),
+            "token leaked into Debug"
+        );
         assert!(
             !display.contains("supersecrettoken"),
             "token leaked into Display"
         );
         // Nor may the full key — only its prefix.
-        assert!(!debug.contains("abcdef123456"), "full API key leaked into Debug");
+        assert!(
+            !debug.contains("abcdef123456"),
+            "full API key leaked into Debug"
+        );
         assert!(
             !display.contains("abcdef123456"),
             "full API key leaked into Display"
         );
-        assert!(debug.contains("abcd"), "masked prefix should still be present");
+        assert!(
+            debug.contains("abcd"),
+            "masked prefix should still be present"
+        );
     }
 
     #[rstest]
