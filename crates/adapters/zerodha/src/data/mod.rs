@@ -18,9 +18,11 @@
 //! # Status
 //!
 //! [`DataClient::connect`] loads the instrument dump, opens a real socket, and
-//! [`DataClient::subscribe_quotes`] issues a real subscription. **None of it has been run against
-//! Zerodha.** The decoder is checked against captured bytes and the CSV and tick mappings are
-//! unit-tested, but no request has been made and no live tick has reached the engine.
+//! [`DataClient::subscribe_quotes`] and [`DataClient::subscribe_trades`] issue real subscriptions.
+//! **None of it has been run against Zerodha.** The decoder is checked against captured bytes and
+//! the CSV and tick mappings are unit-tested, but no request has been made and no live tick has
+//! reached the engine. The trade path in particular rests on an *argued* reading of
+//! `volume_traded` that no captured corpus can settle — see [`crate::data::parse`].
 //!
 //! # Instruments load BEFORE the socket, and the order is deliberate
 //!
@@ -58,6 +60,22 @@
 //! be constructed. See [`crate::data::parse`].
 //!
 //! [`QuoteTick`]: nautilus_model::data::QuoteTick
+//!
+//! # One tick can produce BOTH a quote and a trade
+//!
+//! Quotes and trades are not alternatives here. A full-mode packet carries the book *and* the
+//! session's traded volume, so the feed task offers every tick to both mappers: the quote mapper
+//! reads the ladder, and [`TradeTracker`] compares the volume against the previous tick for that
+//! instrument. Most ticks yield a quote and no trade — Kite pushes a snapshot roughly once a
+//! second whether or not anything traded, and emitting a trade per tick would fabricate one per
+//! second per instrument. That argument is made in full in [`crate::data::parse`].
+//!
+//! Because trades come off the same packet, [`DataClient::subscribe_trades`] issues the *same*
+//! full-mode subscription as [`DataClient::subscribe_quotes`] rather than a second one. Repeating
+//! it for a token already subscribed is a mode set, not growth: see
+//! [`SubscriptionState::subscribe`], which counts only new tokens against the venue's cap.
+//!
+//! [`SubscriptionState::subscribe`]: crate::websocket::subscription::SubscriptionState::subscribe
 
 pub mod parse;
 
@@ -70,10 +88,13 @@ use async_trait::async_trait;
 use nautilus_common::{
     clients::DataClient,
     live::{get_runtime, runner::get_data_event_sender},
-    messages::{DataEvent, data::SubscribeQuotes},
+    messages::{
+        DataEvent,
+        data::{SubscribeQuotes, SubscribeTrades},
+    },
 };
 use nautilus_core::time::get_atomic_clock_realtime;
-use nautilus_model::identifiers::{ClientId, Venue};
+use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
 
 use crate::{
     common::{
@@ -83,7 +104,7 @@ use crate::{
         instruments::InstrumentRegistry,
     },
     config::ZerodhaDataClientConfig,
-    data::parse::quote_tick_from,
+    data::parse::{TradeTracker, quote_tick_from},
     http::client::ZerodhaHttpClient,
     websocket::client::ZerodhaWebSocketClient,
 };
@@ -183,6 +204,48 @@ impl ZerodhaDataClient {
         Ok(instruments.len())
     }
 
+    /// Resolves an instrument id to the Zerodha token the streaming API subscribes by.
+    ///
+    /// Shared by every `subscribe_*`: the resolution and its failure message are the same for all
+    /// of them, and a second copy of this is a second place for the message to drift.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the registry lock is poisoned, or if the instrument is not registered.
+    fn resolve_token(&self, instrument_id: &InstrumentId) -> anyhow::Result<u32> {
+        let token = self
+            .instruments
+            .read()
+            .map_err(|e| anyhow::anyhow!("instrument registry lock poisoned: {e}"))?
+            .token_of(instrument_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no Zerodha instrument token registered for {instrument_id}; the streaming \
+                     API subscribes by token and tokens come only from the REST instrument dump",
+                )
+            })?;
+
+        Ok(token)
+    }
+
+    /// Subscribes `token` in FULL mode, the only mode from which quotes or trades can be built.
+    ///
+    /// Calling this twice for one token is a **mode set**, not a second subscription: the
+    /// subscription state overwrites the token's mode and counts only new tokens against the
+    /// venue's 3,000-token cap. That is what lets quotes and trades share one subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is not connected, or if the subscription cannot be sent.
+    fn subscribe_full(&self, token: u32) -> anyhow::Result<()> {
+        let websocket = self
+            .websocket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Zerodha data client is not connected"))?;
+
+        websocket.subscribe(ZerodhaTickMode::Full, vec![token])
+    }
+
     /// Returns the primary venue for this client.
     ///
     /// Zerodha brokers both NSE and BSE through one connection, so the venue on the client is the
@@ -266,6 +329,12 @@ impl DataClient for ZerodhaDataClient {
         get_runtime().spawn(async move {
             let clock = get_atomic_clock_realtime();
 
+            // Owned by this task alone -- the single reader of the tick stream -- so the
+            // per-instrument volume baseline needs no lock. It is also per-connection: a
+            // reconnect starts fresh and rebaselines rather than differencing across a gap that
+            // may have crossed a session boundary. See `data::parse::TradeTracker`.
+            let mut trades = TradeTracker::new();
+
             while let Some(tick) = ticks.recv().await {
                 let details = match instruments.read() {
                     Ok(guard) => guard.by_token(tick.instrument_token).copied(),
@@ -302,6 +371,31 @@ impl DataClient for ZerodhaDataClient {
                     // the reason `subscribe_quotes` subscribes in FULL mode.
                     Err(e) => log::debug!("Skipping tick that cannot become a quote: {e}"),
                 }
+
+                // The same tick, offered to the trade path as well -- NOT as an alternative. One
+                // full-mode packet legitimately carries both a book and evidence of a trade.
+                match trades.observe(
+                    &tick,
+                    details.instrument_id,
+                    details.price_precision,
+                    details.size_precision,
+                    ts_init,
+                ) {
+                    Ok(Some(trade)) => {
+                        if sender.send(DataEvent::Data(trade.into())).is_err() {
+                            log::debug!("Data event receiver dropped; stopping Zerodha feed");
+                            return;
+                        }
+                    }
+                    // The COMMON case, and not a problem: the venue pushes a snapshot roughly once
+                    // a second whether or not anything traded, and only a change in the session's
+                    // cumulative volume is evidence that it did. Not logged -- it would fire on
+                    // most ticks, for every instrument.
+                    Ok(None) => {}
+                    // Unlike `Ok(None)`, this IS a lost trade: one was detected and could not be
+                    // represented.
+                    Err(e) => log::warn!("Skipping a detected trade that cannot be published: {e}"),
+                }
             }
 
             log::debug!("Zerodha tick stream ended");
@@ -314,31 +408,33 @@ impl DataClient for ZerodhaDataClient {
     }
 
     fn subscribe_quotes(&mut self, cmd: SubscribeQuotes) -> anyhow::Result<()> {
-        let token = self
-            .instruments
-            .read()
-            .map_err(|e| anyhow::anyhow!("instrument registry lock poisoned: {e}"))?
-            .token_of(&cmd.instrument_id)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no Zerodha instrument token registered for {}; the streaming API subscribes \
-                     by token and tokens come only from the REST instrument dump",
-                    cmd.instrument_id,
-                )
-            })?;
-
-        let websocket = self
-            .websocket
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Zerodha data client is not connected"))?;
+        let token = self.resolve_token(&cmd.instrument_id)?;
 
         // FULL, not Quote. Kite's 44-byte `quote` packet carries no book -- only the 184-byte full
         // packet does -- so subscribing in quote mode yields a stream from which no `QuoteTick`
         // can ever be built. See `data::parse`.
-        websocket.subscribe(ZerodhaTickMode::Full, vec![token])?;
+        self.subscribe_full(token)?;
 
         log::info!(
             "Subscribed quotes for {} (token {token}) in full mode",
+            cmd.instrument_id,
+        );
+        Ok(())
+    }
+
+    fn subscribe_trades(&mut self, cmd: SubscribeTrades) -> anyhow::Result<()> {
+        let token = self.resolve_token(&cmd.instrument_id)?;
+
+        // The SAME full-mode subscription quotes use, deliberately. Trades are derived from
+        // `volume_traded`, which rides on the same packet as the book, so a token already
+        // subscribed for quotes needs nothing further -- and repeating the request is a mode set
+        // rather than a second subscription. Trade emission is not gated on this call: the feed
+        // task offers every tick to the tracker, so a token subscribed for quotes alone will also
+        // produce trades. That is the venue's shape, not a decision this client can undo.
+        self.subscribe_full(token)?;
+
+        log::info!(
+            "Subscribed trades for {} (token {token}) in full mode",
             cmd.instrument_id,
         );
         Ok(())
