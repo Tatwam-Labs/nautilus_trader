@@ -36,8 +36,8 @@
 //! | bytes | layout                                          |
 //! |-------|-------------------------------------------------|
 //! | 8     | LTP: token + last price                          |
-//! | 28    | index quote: no traded quantities                |
-//! | 32    | index full: index quote + exchange timestamp     |
+//! | 28    | index quote: no traded quantities. Carries an UNREAD net-change at [24:28] |
+//! | 32    | index full: index quote + exchange timestamp. Same unread [24:28] |
 //! | 44    | quote: traded quantities + OHLC                  |
 //! | 184   | full: quote + timestamps + open interest + depth |
 //!
@@ -274,8 +274,17 @@ pub fn parse_packet(packet: &[u8]) -> Result<KiteTick, ZerodhaWsError> {
         }
     }
 
-    // The venue does not send `change`; it is derived. A zero previous close (a freshly listed
-    // instrument, or an index before its first close) would divide by zero.
+    // `change` here is a PERCENTAGE and is derived, not read.
+    //
+    // ⚠️ The index layouts DO carry a net-change field the decoder does not read: bytes[24:28] as
+    // big-endian i32 / divisor equals `last_price - close` exactly on all 10 captured index
+    // packets. It is an ABSOLUTE change; the percentage below is a different quantity, so deriving
+    // it is correct — but the field exists, is currently dropped, and is absent from the layout
+    // table above. An earlier version of this comment asserted the venue sends no change field at
+    // all, which the crate's own corpus contradicts.
+    //
+    // A zero previous close (a freshly listed instrument, or an index before its first close) would
+    // divide by zero.
     if let Some(ohlc) = tick.ohlc
         && ohlc.close != 0.0
     {

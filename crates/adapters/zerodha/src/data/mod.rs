@@ -39,8 +39,13 @@ use crate::{
 
 /// A Nautilus data client for the Zerodha Kite Connect streaming API.
 ///
-/// `Debug` is derived; [`ZerodhaCredential`] redacts itself, so formatting this client cannot
-/// print a live session token.
+/// `Debug` is derived, and both credential-bearing fields redact themselves:
+/// [`ZerodhaCredential`] by a hand-written impl, and [`ZerodhaDataClientConfig`] likewise.
+///
+/// The config's redaction is load-bearing rather than belt-and-braces. It derived `Debug` until
+/// 2026-08-14, which meant formatting this client printed the access token in full whenever it was
+/// supplied on the config rather than through the environment — through a field the doc comment
+/// asserted was safe.
 #[derive(Debug)]
 pub struct ZerodhaDataClient {
     client_id: ClientId,
