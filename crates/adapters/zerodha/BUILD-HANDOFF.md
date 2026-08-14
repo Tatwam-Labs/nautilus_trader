@@ -21,7 +21,8 @@ for every build.
 | 2 | `e8e65a4b61` | **17/17** decoder (ordering fix correct) · **13/13** credential, first ever compile · clippy clean · hook clean · 121 pytest · surface #11 closed |
 | 3 | `554fe5191d` | **35/35** — adds `live_frames.rs` against **real captured bytes**. Build 2m02s. `Cargo.lock` untouched. ❌ clippy: `needless_pass_by_value` |
 | 4 | `89c1bc6701` | clippy re-run: first lint gone. ❌ second lint **uncovered, not caused** — `unnecessary_to_owned` |
-| 5 | `92cdcaa146` | **PENDING** — `as_ref()` fix applied here, verified sufficient on the build host before sending |
+| 5 | `92cdcaa146` | ✅ **FULLY GREEN.** 35/35 · clippy **exit 0, 0 warnings** · hook clean · 121 pytest · build 2m05s · tree clean, `Cargo.lock` untouched |
+| 6 | `9aa68acf38` | documentation only — no Rust changed, so row 5 still describes the code |
 
 **Anything committed after the last VERIFIED row is unverified** unless this table says otherwise.
 
