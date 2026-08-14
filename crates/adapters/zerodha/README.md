@@ -19,8 +19,9 @@ rather than reporting a connected client that never streams.
 
 | area | state |
 |---|---|
-| Binary tick decoder (LTP / quote / full, all segments, depth) | implemented, fixture-tested |
-| Config, factory, PyO3 registration | implemented, **not yet compiled** |
+| Binary tick decoder (LTP / quote / full, all segments, depth) | implemented, **17/17 fixture tests passing** |
+| Config, factory, credential resolution | implemented, **13/13 unit tests passing** |
+| PyO3 registration | implemented, builds into the extension module |
 | WebSocket transport | not started |
 | REST instrument provider | not started |
 | Historical requests, execution client | not started |
@@ -28,19 +29,28 @@ rather than reporting a connected client that never streams.
 ## Venue notes
 
 Several Zerodha behaviours are unusual enough to be worth stating, because each one fails quietly
-rather than loudly:
+rather than loudly. **Each is tagged with how it is known**, because they are not equally
+established and a reader should be able to tell which they can lean on.
 
-- **Instrument tokens come only from the REST instrument dump.** They are not present in historical
-  data, so the dump is the sole source rather than a cache warmer.
-- **The streaming segment is the low byte of the instrument token**, and it is not the same thing as
-  the exchange you fetched the instrument from. SENSEX (token `265`) is retrieved from the `BSE`
-  dump but streams under the `INDICES` segment, so it decodes as non-tradable.
-- **`INDICES` is not a valid argument to the instruments endpoint** — it returns `AccessDenied`.
-  Index definitions come from the parent exchange's dump.
+Covered by this crate's tests — a regression would fail CI:
+
 - **Packet layout is selected by length, not by a type tag.** There is no discriminator field, so an
   unrecognised length cannot be partially decoded.
 - **Currency segments use different price divisors from each other**: `CDS` scales by 10^7 and
   `BCD` by 10^4, against 10^2 everywhere else.
+- **The streaming segment is the low byte of the instrument token**, and it is not the same thing as
+  the exchange you fetched the instrument from. SENSEX (token `265`) is retrieved from the `BSE`
+  dump but streams under the `INDICES` segment — `265 & 0xff == 9` — so it decodes as non-tradable.
+
+Observed on a live session (2026-08-13), **not** exercised by any test here:
+
+- **Instrument tokens come only from the REST instrument dump.** They are not present in historical
+  data, so the dump is the sole source rather than a cache warmer.
+- **`INDICES` is not a valid argument to the instruments endpoint** — it returned `AccessDenied`.
+  Index definitions come from the parent exchange's dump.
+
+From the venue's documentation, not independently confirmed:
+
 - **The access token is a session token** issued by the daily login flow, and expires each morning.
 
 ## Fixtures
