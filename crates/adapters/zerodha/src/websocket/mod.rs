@@ -20,6 +20,7 @@ pub mod error;
 pub mod messages;
 pub mod parse;
 pub mod subscription;
+pub mod watchdog;
 
 pub use crate::websocket::{
     client::{ZERODHA_WS_URL, ZerodhaWebSocketClient},
@@ -27,4 +28,5 @@ pub use crate::websocket::{
     messages::{KiteDepth, KiteDepthEntry, KiteOhlc, KiteTick},
     parse::{parse_binary, parse_packet, split_packets},
     subscription::{KiteRequest, SubscriptionState},
+    watchdog::{FeedHealth, FeedStatus, FeedWatchdog, SessionState},
 };
