@@ -14,8 +14,12 @@ Indian equities, futures and options on the **NSE** and **BSE**.
 ## Status
 
 **Incomplete.** The binary streaming tick decoder is implemented and covered by fixture tests. The
-WebSocket and REST transports are not yet wired, so `ZerodhaDataClient::connect` returns an error
-rather than reporting a connected client that never streams.
+WebSocket and REST transports are not yet wired.
+
+`ZerodhaDataClient::connect` returns an error — but that alone does not prevent a node starting.
+`DataEngine::connect` logs client connect failures and continues, by design. The check that
+actually aborts is the credential validation in the constructor, which `LiveNodeBuilder` propagates
+with `?`.
 
 | area | state |
 |---|---|
