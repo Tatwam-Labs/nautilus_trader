@@ -26,7 +26,7 @@ rather than reporting a connected client that never streams.
 | REST instrument provider | not started |
 | Historical requests, execution client | not started |
 
-**35 tests total**, last verified on a build host at `554fe5191d`. The two decoder suites are not
+**35 tests total**, last verified on a build host at `92cdcaa146`. The two decoder suites are not
 equal evidence — see *Fixtures* below.
 
 ## Venue notes
@@ -45,12 +45,19 @@ Covered by this crate's tests — a regression would fail CI:
   the exchange you fetched the instrument from. SENSEX (token `265`) is retrieved from the `BSE`
   dump but streams under the `INDICES` segment — `265 & 0xff == 9` — so it decodes as non-tradable.
 
-Observed on a live session (2026-08-13), **not** exercised by any test here:
+Observed on a live session, **not** exercised by any test here:
 
 - **Instrument tokens come only from the REST instrument dump.** They are not present in historical
-  data, so the dump is the sole source rather than a cache warmer.
+  data, so the dump is the sole source rather than a cache warmer. *(2026-08-13)*
 - **`INDICES` is not a valid argument to the instruments endpoint** — it returned `AccessDenied`.
-  Index definitions come from the parent exchange's dump.
+  Index definitions come from the parent exchange's dump. *(2026-08-13)*
+- **Heartbeats arrive every ~3s.** 139 intervals measured: median **3.000s**, range 2.844–3.156.
+  This is the figure a liveness timeout should be built on. *(2026-08-14, one 7-minute window)*
+- **No subscription acknowledgement was seen.** 1,810 binary frames arrived in the same window and
+  no ack text frame did. **An observation, not a conclusion** — an ack sent before the handler
+  attached would look identical. *(2026-08-14, one window)*
+- **The venue sends `instruments_meta`**, a text type the vendor's client does not handle. See
+  *Fixtures* below. *(2026-08-14, observed once)*
 
 From the venue's documentation, not independently confirmed:
 
@@ -79,6 +86,25 @@ single reading is baked into the evidence.
 **What even the real set does not establish:** that the oracle is right. If `kiteconnect` misreads
 a field, the derived fixtures encode the same misreading. Irreducible without vendor documentation
 or a third implementation.
+
+**That bound is not hypothetical — it has been hit.** A third capture recorded a text frame the
+vendor's own client has no branch for:
+
+```json
+{"type": "instruments_meta", "data": {"count": 114823, "etag": "W/…"}}
+```
+
+`kiteconnect.ticker._parse_text_message` branches on `order` and `error` only; `instruments_meta`
+appears nowhere in that module, so the reference **silently drops it**. This is information that
+could not exist in any artefact derived from the reference, because the reference does not know it.
+
+> **If the oracle can be blind to an entire message type, it can be wrong about a field.** That is
+> now an existence proof rather than an argument, and it is why "agrees with the vendor's client"
+> is the honest claim and "venue fidelity verified" is not.
+
+*(`instruments_meta` looks like an instrument-cache invalidation signal — count plus etag — and is
+a **pointer for whoever builds the instrument provider, observed once**. One message in one window
+is not a contract.)*
 
 **One claim here does not depend on the oracle at all.** In packets where they separate,
 `bytes[60:64]` is always later than `bytes[44:48]` — and a venue cannot stamp a frame before the

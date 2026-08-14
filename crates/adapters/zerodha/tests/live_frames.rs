@@ -40,6 +40,10 @@
 //! the same misreading, and the decoder would be "wrong" for agreeing with reality. That residue
 //! is irreducible without vendor documentation or a third independent implementation.
 //!
+//! **And that bound has been observed, not just argued.** A live capture recorded a text frame of
+//! type `instruments_meta`, which `kiteconnect._parse_text_message` has no branch for and silently
+//! drops. If the oracle can be blind to an entire message type, it can be wrong about a field.
+//!
 //! So the honest sentence is **"agrees with the vendor's client on N real packets"**, never
 //! "venue fidelity verified".
 //!
