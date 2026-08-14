@@ -15,6 +15,8 @@
 
 //! Configuration structures for the Zerodha adapter.
 
+use std::fmt::Debug;
+
 use serde::{Deserialize, Serialize};
 
 use crate::common::{
@@ -76,7 +78,7 @@ nautilus_core::impl_pyo3_config_getters!(ZerodhaDataClientConfig {
     update_instruments_interval_mins: u64,
 });
 
-impl std::fmt::Debug for ZerodhaDataClientConfig {
+impl Debug for ZerodhaDataClientConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct(stringify!(ZerodhaDataClientConfig))
             .field("api_key", &self.api_key.as_ref().map(|_| "***redacted***"))
@@ -148,9 +150,11 @@ impl ZerodhaDataClientConfig {
 
 #[cfg(test)]
 mod tests {
+    use nautilus_model::identifiers::ClientId;
     use rstest::rstest;
 
     use super::*;
+    use crate::data::ZerodhaDataClient;
 
     const TOKEN: &str = "ldyr-live-session-token-value";
     const KEY: &str = "c5gabz-api-key-value";
@@ -179,8 +183,8 @@ mod tests {
         // The leak reached `Debug` on the CLIENT through its `config` field, which is the path the
         // client's own doc comment wrongly asserted was safe. Asserted at that level too, because
         // fixing the config alone would not have been visible here.
-        let client = crate::data::ZerodhaDataClient::new(
-            nautilus_model::identifiers::ClientId::from("ZERODHA-DEBUG-TEST"),
+        let client = ZerodhaDataClient::new(
+            ClientId::from("ZERODHA-DEBUG-TEST"),
             populated(),
         )
         .expect("a fully populated config should construct");
