@@ -35,7 +35,13 @@ pub struct KiteOhlc {
     pub high: f64,
     /// The low price for the session.
     pub low: f64,
-    /// The close price of the *previous* session.
+    /// The close price of the **previous** session — *not* today's, and routinely **outside**
+    /// `[low, high]`.
+    ///
+    /// Confirmed against live frames captured 2026-08-14: `close` fell outside the session range
+    /// in three of four sampled packets (e.g. `close=282.70` with `low=298.80`). **That is
+    /// correct.** A plausible-looking sanity assertion such as `low <= close <= high` will go red
+    /// against a decoder that is working, and the natural next move is to "fix" the decoder.
     pub close: f64,
 }
 
