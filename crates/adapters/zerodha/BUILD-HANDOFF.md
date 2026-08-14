@@ -126,20 +126,28 @@ bash .pre-commit-hooks/check_nautilus_conventions.sh
 cd python && VIRTUAL_ENV= uv run --no-sync pytest -rfE tests/unit/adapters/test_public_exports.py
 ```
 
-> ⚠️ **This command was wrong in an earlier revision** and the correction is worth reading, because
-> the wrong form may still appear to work.
+> ⚠️ **This command was wrong in an earlier revision, and the wrong form DOES NOT FAIL.** That is
+> what makes it worth reading.
 >
-> It previously read `uv run --no-sync pytest python/tests/...` **from the repo root**. There is no
-> `pyproject.toml` at the repo root — the only one is `python/pyproject.toml` — and `uv` resolves a
-> project by searching the working directory and its **ancestors**, never its descendants. Every
-> `pytest` invocation in the `Makefile` is `cd python && VIRTUAL_ENV= uv run --no-sync pytest …`,
-> and the `VIRTUAL_ENV=` prefix is there deliberately, to stop an already-activated venv from
-> hijacking the run.
+> It previously read `uv run --no-sync pytest python/tests/…` **from the repo root**, where there is
+> no `pyproject.toml` (the only one is `python/pyproject.toml`).
 >
-> **UNKNOWN, and it is yours to settle:** the first build reported this test as `121 passed` while
-> quoting the repo-root form. Either it was actually run from `python/`, or `uv` did something I
-> cannot predict from here. Please say which — if the root form genuinely works, this note is the
-> thing that is wrong, and I would rather know that than leave a correction that is itself untrue.
+> **It still runs.** Measured: with no `pyproject.toml` in the working directory or any ancestor,
+> `uv run` falls back to **non-project mode** — it picks an interpreter, creates an ephemeral venv,
+> and executes. It does not error.
+>
+> **So the hazard is not failure, it is running somewhere else.** Non-project mode gets none of the
+> project's dependencies, so the result depends entirely on what happens to be ambiently installed:
+>
+> - on a machine that has just built and installed the wheel — **passes**
+> - on a clean machine — fails
+> - on a machine with a **stale** wheel — **passes, while testing the wrong build**
+>
+> A command that fails is self-correcting. A command that silently resolves to a different
+> environment is not. That is also why the `Makefile` form carries `VIRTUAL_ENV=` — the same hazard
+> from the other direction, an already-activated venv hijacking the run.
+>
+> *(Side effect worth knowing: non-project mode **creates a `.venv`** wherever it is run from.)*
 
 ## 4. Where the first errors were predicted — and what actually happened
 
