@@ -304,6 +304,97 @@ impl ZerodhaDataClient {
         websocket.subscribe(ZerodhaTickMode::Full, vec![token])
     }
 
+    /// Builds a tick stream from a captured frame corpus instead of a socket.
+    ///
+    /// Reads the `records[].frame_hex` written by `test_data/capture_live_frames.py`, decodes each
+    /// with the SAME [`parse_binary`] the live feed task uses, and delivers the ticks on an
+    /// equivalent channel. Nothing downstream can tell the difference, which is the point.
+    ///
+    /// # ⚠️ What a replay run does and does not establish
+    ///
+    /// It exercises decode -> token resolution -> quote/trade/open-interest mapping -> publication
+    /// to the engine. It does **not** touch auth, subscribe, mode, reconnect or the socket, so a
+    /// green replay says nothing about a live session. The two are different claims and a replay
+    /// must never be reported as the stronger one.
+    ///
+    /// Frames are sent as fast as they decode rather than at their captured cadence. Timing is not
+    /// being measured, and a real-time replay would make an already slow test slower.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the corpus cannot be read, is not the expected JSON shape, or contains
+    /// no decodable frame — an empty stream would otherwise look exactly like a quiet market.
+    fn replay_tick_stream(
+        path: &str,
+    ) -> anyhow::Result<tokio::sync::mpsc::UnboundedReceiver<crate::websocket::messages::KiteTick>> {
+        let body = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("cannot read the Zerodha frame corpus at {path}: {e}"))?;
+        let corpus: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("frame corpus at {path} is not JSON: {e}"))?;
+
+        let records = corpus
+            .get("records")
+            .and_then(|r| r.as_array())
+            .ok_or_else(|| anyhow::anyhow!("frame corpus at {path} has no `records` array"))?;
+
+        let mut ticks = Vec::new();
+        let mut undecodable = 0usize;
+
+        for record in records {
+            let Some(hex) = record.get("frame_hex").and_then(|h| h.as_str()) else {
+                undecodable += 1;
+                continue;
+            };
+
+            let Ok(bytes) = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+                .collect::<Result<Vec<u8>, _>>()
+            else {
+                undecodable += 1;
+                continue;
+            };
+
+            match crate::websocket::parse::parse_binary(&bytes) {
+                Ok(decoded) => ticks.extend(decoded),
+                Err(e) => {
+                    undecodable += 1;
+                    log::warn!("Skipping an undecodable corpus frame: {e}");
+                }
+            }
+        }
+
+        // An empty stream is indistinguishable from a quiet market downstream, so it fails here
+        // rather than producing a run that reports zero and looks like a finding.
+        anyhow::ensure!(
+            !ticks.is_empty(),
+            "frame corpus at {path} yielded NO decodable ticks ({} record(s), {undecodable} \
+             unusable); a replay that publishes nothing would look like a quiet feed rather than \
+             a broken corpus",
+            records.len(),
+        );
+
+        log::info!(
+            "Zerodha replay: {} tick(s) decoded from {} corpus record(s), {undecodable} unusable",
+            ticks.len(),
+            records.len(),
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+        get_runtime().spawn(async move {
+            for tick in ticks {
+                if tx.send(tick).is_err() {
+                    log::debug!("Replay receiver dropped; stopping");
+                    return;
+                }
+            }
+            log::info!("Zerodha replay: corpus exhausted");
+        });
+
+        Ok(rx)
+    }
+
 }
 
 #[async_trait(?Send)]
@@ -397,13 +488,38 @@ impl DataClient for ZerodhaDataClient {
             self.load_instruments(None).await?;
         }
 
-        let mut websocket =
-            ZerodhaWebSocketClient::new(self.credential.clone(), self.config.base_url_ws.clone());
-        websocket.connect().await?;
+        // ⭐ OFFLINE REPLAY. When `replay_frames_path` is set the socket is never opened and ticks
+        // come from a captured corpus instead. Everything downstream -- decode, token resolution,
+        // quote/trade/OI mapping, publication to the engine -- is the SAME CODE on the same channel.
+        //
+        // What this exercises and what it does not: the transport is NOT exercised, so a replay run
+        // says nothing about auth, subscribe, mode or reconnect. It does exercise every step from
+        // the decoder onward, which is what carriage questions are about. Stating that split matters
+        // more than the feature: a green replay is not a green session.
+        //
+        // A real capability rather than test scaffolding -- it makes the decode-to-engine path
+        // reproducible on a shut market, which is most of the week for MCX.
+        let mut websocket = None;
 
-        let mut ticks = websocket
-            .take_tick_stream()
-            .ok_or_else(|| anyhow::anyhow!("tick stream was already taken"))?;
+        let mut ticks = if let Some(path) = self.config.replay_frames_path.clone() {
+            log::warn!(
+                "Zerodha data client {} is in REPLAY MODE from {path} -- NO SOCKET IS OPEN and no \
+                 venue is contacted. Ticks are decoded from a captured corpus.",
+                self.client_id,
+            );
+            Self::replay_tick_stream(&path)?
+        } else {
+            let mut client =
+                ZerodhaWebSocketClient::new(self.credential.clone(), self.config.base_url_ws.clone());
+            client.connect().await?;
+
+            let stream = client
+                .take_tick_stream()
+                .ok_or_else(|| anyhow::anyhow!("tick stream was already taken"))?;
+
+            websocket = Some(client);
+            stream
+        };
 
         let instruments = Arc::clone(&self.instruments);
         let sender = get_data_event_sender();
@@ -559,7 +675,7 @@ impl DataClient for ZerodhaDataClient {
             log::debug!("Zerodha tick stream ended");
         });
 
-        self.websocket = Some(websocket);
+        self.websocket = websocket;
         self.is_connected.store(true, Ordering::Release);
         log::info!("Zerodha data client {} connected", self.client_id);
         Ok(())
