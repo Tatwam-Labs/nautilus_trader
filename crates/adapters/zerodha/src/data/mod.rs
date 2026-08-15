@@ -17,12 +17,19 @@
 //!
 //! # Status
 //!
-//! [`DataClient::connect`] loads the instrument dump, opens a real socket, and
-//! [`DataClient::subscribe_quotes`] and [`DataClient::subscribe_trades`] issue real subscriptions.
-//! **None of it has been run against Zerodha.** The decoder is checked against captured bytes and
-//! the CSV and tick mappings are unit-tested, but no request has been made and no live tick has
-//! reached the engine. The trade path in particular rests on an *argued* reading of
-//! `volume_traded` that no captured corpus can settle — see [`crate::data::parse`].
+//! **Proven against the live venue on 2026-08-14**, across five runs on MCX CRUDEOIL: the REST
+//! instrument dump (114,851 rows, nine exchanges), WebSocket auth, subscribe and mode honoured
+//! (full-mode depth on every tick), binary decode on a live socket, and the volume-delta trade path
+//! (25 trades from 89 ticks, 64 correctly suppressed). Ticks reached a Python strategy through the
+//! engine and drove simulated fills that matched the venue's own book — a marketable buy at the ask
+//! and a marketable sell at the bid.
+//!
+//! ⚠️ **That is proof for ONE instrument, ONE venue, ONE session and the happy path only.** No order
+//! rejection, no partial fill, no mid-run reconnect, no illiquid or wide-spread instrument, and no
+//! venue other than MCX. It works on the path you walk deliberately, not the paths a live system
+//! falls down. The trade path still rests on an *argued* reading of `volume_traded` that no captured
+//! corpus can settle — see [`crate::data::parse`] — and the live run is consistent with that reading
+//! rather than a test of it.
 //!
 //! # Instruments load BEFORE the socket, and the order is deliberate
 //!
@@ -77,6 +84,7 @@
 //!
 //! [`SubscriptionState::subscribe`]: crate::websocket::subscription::SubscriptionState::subscribe
 
+pub mod open_interest;
 pub mod parse;
 
 use std::sync::{
@@ -94,7 +102,10 @@ use nautilus_common::{
     },
 };
 use nautilus_core::time::get_atomic_clock_realtime;
-use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
+use nautilus_model::{
+    data::{Data, DataType, custom::{CustomData, CustomDataTrait}},
+    identifiers::{ClientId, InstrumentId, Venue},
+};
 
 use crate::{
     common::{
@@ -103,7 +114,10 @@ use crate::{
         instruments::InstrumentRegistry,
     },
     config::ZerodhaDataClientConfig,
-    data::parse::{TradeTracker, quote_tick_from},
+    data::{
+        open_interest::ZerodhaOpenInterest,
+        parse::{TradeTracker, quote_tick_from, venue_time_to_unix_nanos},
+    },
     http::client::ZerodhaHttpClient,
     websocket::client::ZerodhaWebSocketClient,
 };
@@ -412,6 +426,7 @@ impl DataClient for ZerodhaDataClient {
             let mut received = 0usize;
             let mut published = 0usize;
             let mut unmapped = 0usize;
+            let mut oi_published = 0usize;
 
             while let Some(tick) = ticks.recv().await {
                 received += 1;
@@ -419,7 +434,7 @@ impl DataClient for ZerodhaDataClient {
                 if received == 1 || received.is_multiple_of(25) {
                     log::info!(
                         "Zerodha tick path: {received} received, {published} published as quotes, \
-                         {unmapped} with no registered instrument"
+                         {oi_published} as open interest, {unmapped} with no registered instrument"
                     );
                 }
 
@@ -485,6 +500,59 @@ impl DataClient for ZerodhaDataClient {
                     // Unlike `Ok(None)`, this IS a lost trade: one was detected and could not be
                     // represented.
                     Err(e) => log::warn!("Skipping a detected trade that cannot be published: {e}"),
+                }
+
+                // ⭐ OPEN INTEREST — the third thing this one packet carries.
+                //
+                // `QuoteTick` has no OI field, so this rides its own custom type rather than
+                // travelling with the quote. Decoded since before the type existed; a decoded value
+                // with nowhere to go is not delivered.
+                //
+                // Only the 184-byte full packet carries OI, so `tick.oi` is `None` for ltp and
+                // quote-mode packets and for index packets. Absent is the ordinary case, not a
+                // failure, so it is not logged — it would fire on most ticks for most instruments.
+                if let Some(open_interest) = tick.oi {
+                    let oi = ZerodhaOpenInterest::new(
+                        details.instrument_id,
+                        open_interest,
+                        // Day high/low share the packet with `oi` and are absent only if it is, but
+                        // they are decoded independently, so they are defaulted rather than
+                        // unwrapped. A panic here would kill the feed task for a cosmetic field.
+                        tick.oi_day_high.unwrap_or(open_interest),
+                        tick.oi_day_low.unwrap_or(open_interest),
+                        venue_time_to_unix_nanos(tick.exchange_timestamp).unwrap_or(ts_init),
+                        ts_init,
+                    );
+                    oi_published += 1;
+
+                    let data_type = DataType::new(
+                        ZerodhaOpenInterest::type_name_static(),
+                        None,
+                        Some(details.instrument_id.to_string()),
+                    );
+
+                    // ⚠️ THE TOPIC IS PART OF THE MEASUREMENT, NOT DECORATION. A subscriber that
+                    // derives a different topic string gets SILENCE, which is indistinguishable
+                    // from the data never being published at all. Logged once so the receiving side
+                    // can be compared against what was actually emitted rather than against what
+                    // someone believed it would be.
+                    if oi_published == 1 {
+                        log::info!(
+                            "Zerodha open interest: first item published, data_type topic = {:?}",
+                            data_type.topic(),
+                        );
+                    }
+
+                    if sender
+                        .send(DataEvent::Data(Data::Custom(CustomData::new(
+                            Arc::new(oi),
+                            data_type,
+                        ))))
+                        .is_err()
+                    {
+                        log::debug!("Data event receiver dropped; stopping Zerodha feed");
+                        return;
+                    }
                 }
             }
 
