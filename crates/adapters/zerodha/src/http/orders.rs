@@ -971,7 +971,8 @@ impl ZerodhaHttpClient {
                 Err(e) => {
                     skipped += 1;
                     log::error!(
-                        "Zerodha {operation}: order {order_id} could not be parsed and is                          INVISIBLE to this client -- it may be a live position: {e}"
+                        "Zerodha {operation}: row {row_id} could not be parsed and is INVISIBLE to this \
+                         client -- it may be a live order or fill: {e}"
                     );
                 }
             }
@@ -979,7 +980,8 @@ impl ZerodhaHttpClient {
 
         if skipped > 0 {
             log::error!(
-                "⚠️ Zerodha {operation} returned an INCOMPLETE order book: {} of {total} row(s)                  parsed, {skipped} skipped. Do NOT treat this as the full set of working orders.",
+                "⚠️ Zerodha {operation} returned an INCOMPLETE order book: {} of {total} row(s) \
+                 parsed, {skipped} skipped. Do NOT treat this as the full set of working orders.",
                 parsed.len(),
             );
         }
