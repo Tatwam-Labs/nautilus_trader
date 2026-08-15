@@ -57,6 +57,10 @@ impl ZerodhaDataClientConfig {
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
+            // Not exposed as a `py_new` parameter: replay is a local-file debugging affordance
+            // driven from Rust, and a Python caller has no path that should silently divert a
+            // client away from the venue.
+            replay_frames_path: None,
         }
     }
 
