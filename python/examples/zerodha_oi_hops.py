@@ -135,7 +135,7 @@ def build_node() -> tuple[LiveNode, OpenInterestProbe]:
     builder = builder.add_data_client(
         name="ZERODHA",
         factory=ZerodhaDataClientFactory(),
-        # The whole point: replay, no socket, no venue.
+        # Replay: an offline TICK SOURCE. The instrument dump is still fetched.
         config=ZerodhaDataClientConfig(replay_frames_path=CORPUS),
         routing=RoutingConfig(default=False, venues=ZERODHA_VENUES),
     )
