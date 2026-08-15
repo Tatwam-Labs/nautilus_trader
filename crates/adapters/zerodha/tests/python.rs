@@ -48,7 +48,7 @@ use nautilus_zerodha::{
     common::consts::ZERODHA, config::ZerodhaDataClientConfig, factories::ZerodhaDataClientFactory,
     python,
 };
-use pyo3::{Py, Python, types::PyModule};
+use pyo3::{Py, Python, types::{PyAnyMethods, PyModule}};
 use rstest::rstest;
 
 fn register_zerodha_python_module(py: Python<'_>) {
@@ -180,8 +180,6 @@ fn test_factory_rejects_a_config_of_the_wrong_type() {
 // client contacts the venue at all must never become write-only without something noticing.
 #[rstest]
 fn test_replay_frames_path_survives_the_round_trip_to_python_and_back() {
-    pyo3::prepare_freethreaded_python();
-
     Python::attach(|py| {
         register_zerodha_python_module(py);
 
