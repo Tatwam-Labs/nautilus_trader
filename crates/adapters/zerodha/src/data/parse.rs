@@ -106,6 +106,18 @@ pub struct TopOfBook {
 /// returns **0**, which is a valid-looking `Price` and would cross every book in the system. The
 /// filter is not tidiness.
 ///
+/// ⭐ **THIS GUARD IS BACKED BY AN OBSERVED FRAME, NOT ONLY BY REASONING — do not "simplify" it.**
+/// It was originally written from an argument (a fixed five-slot ladder must be paddable, so some
+/// slots must arrive empty). On 2026-08-14 a live MCX socket then delivered a **fully zero-filled
+/// side, at one instrument in four**, in a single captured frame. The argument was right and the
+/// case is common rather than pathological.
+///
+/// This note exists because a defence written from reasoning and a defence written from evidence
+/// are **indistinguishable from the outside**: same code, same test, same green build. So the next
+/// reader cannot tell whether the filter is load-bearing or belt-and-braces — and belt-and-braces
+/// is precisely what gets deleted in a tidy-up. Recording the frame is cheap now and unrecoverable
+/// after the deletion.
+///
 /// Returns `None` when either side has no non-zero level.
 #[must_use]
 pub fn top_of_book(depth: &KiteDepth) -> Option<TopOfBook> {
