@@ -37,7 +37,7 @@
 
 #![cfg(feature = "python")]
 
-use std::{cell::RefCell, rc::Rc, sync::OnceLock};
+use std::{cell::RefCell, rc::Rc};
 
 use nautilus_common::{
     cache::Cache, clock::TestClock, live::runner::set_data_event_sender, messages::DataEvent,
@@ -51,29 +51,35 @@ use nautilus_zerodha::{
 use pyo3::{Bound, Py, Python, types::{PyAnyMethods, PyModule}};
 use rstest::rstest;
 
-/// Registers the Zerodha Python module ONCE PER PROCESS and returns it.
+/// Registers the Zerodha Python module and returns it, tolerating a repeat registration.
 ///
-/// ⚠️ `python::zerodha` registers a factory extractor in a GLOBAL registry that rejects a second
-/// registration with "Factory extractor 'ZERODHA' is already registered". Every test in this binary
-/// shares that process, so a helper that registered on each call made the tests order- and
-/// composition-dependent: each passed alone, and adding a third turned a previously-green sibling
-/// red with a message pointing at the registration code, which was fine.
+/// ⚠️ NO `OnceLock`. An earlier version used one to stop the second registration failing, and it
+/// DEADLOCKED against the GIL under parallel test execution — one thread holding the GIL waiting on
+/// the cell while another held the cell waiting for the GIL. Each test alone touches only one order,
+/// so it passed individually and hung roughly half the time together. It survived into a published
+/// wheel and into a "349 passed" report that was a coin flip.
 ///
-/// `OnceLock` makes the registration happen once and hands every caller the same module, so a test
-/// can pull a class off it without touching global state. Returning the module also removes the
-/// reason a test would otherwise `py.import("nautilus_trader...")` — that package is only importable
-/// from an INSTALLED WHEEL, which a `cargo test` process does not have.
+/// This takes the error instead of the lock. `python::zerodha` adds every class BEFORE it registers
+/// the global extractors, so when the second call fails **the module is already fully populated** —
+/// which is what makes ignoring the error safe rather than merely convenient.
+///
+/// The string match is the weak part and is deliberately narrow: any other error still panics. If
+/// the upstream message ever changes, this starts panicking rather than silently passing, which is
+/// the correct direction for a test helper to fail in.
 fn register_zerodha_python_module(py: Python<'_>) -> Bound<'_, PyModule> {
-    static MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
+    let module = PyModule::new(py, "zerodha").expect("Zerodha module should be created");
 
-    MODULE
-        .get_or_init(|| {
-            let module = PyModule::new(py, "zerodha").expect("Zerodha module should be created");
-            python::zerodha(py, &module).expect("Zerodha Python module should register");
-            module.unbind()
-        })
-        .bind(py)
-        .clone()
+    match python::zerodha(py, &module) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("already registered") => {
+            // Expected on every call after the first: the extractor registry is global and process
+            // wide, while each test builds its own module object. The classes are on `module`
+            // already.
+        }
+        Err(e) => panic!("Zerodha Python module should register: {e}"),
+    }
+
+    module
 }
 
 fn setup_data_event_sender() {
