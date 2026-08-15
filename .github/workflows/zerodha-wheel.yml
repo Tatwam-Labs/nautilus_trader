@@ -229,6 +229,7 @@ jobs:
           set -euo pipefail
           SHA=$(git rev-parse --short HEAD)
           gh release create "wheel-${SHA}" dist/*.whl \
+            --target "${GITHUB_SHA}" \
             --title "Zerodha adapter wheels (${SHA})" \
             --notes "Built from \`$(git rev-parse --abbrev-ref HEAD)\` at \`${SHA}\` with \`maturin build --release\`.
 
@@ -253,6 +254,7 @@ jobs:
           # so `latest` could end up a mix of two builds. Recreating cannot.
           gh release delete wheel-latest --yes --cleanup-tag 2>/dev/null || true
           gh release create wheel-latest dist/*.whl \
+            --target "${GITHUB_SHA}" \
             --title "Zerodha adapter wheels — LATEST (${SHA})" \
             --notes "⚠️ **A MOVING POINTER. Currently \`${SHA}\`.**
 
