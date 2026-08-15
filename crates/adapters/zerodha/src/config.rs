@@ -91,6 +91,10 @@ nautilus_core::impl_pyo3_config_getters!(ZerodhaDataClientConfig {
     http_timeout_secs: u64,
     ws_timeout_secs: u64,
     update_instruments_interval_mins: u64,
+    // Readable from Python on purpose: a caller inspecting a client needs to be able to SEE that
+    // it is replaying rather than live. A field that changes whether the venue is contacted at all
+    // should never be write-only.
+    replay_frames_path: Option<String>,
 });
 
 impl Debug for ZerodhaDataClientConfig {

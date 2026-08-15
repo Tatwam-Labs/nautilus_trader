@@ -46,6 +46,7 @@ impl ZerodhaDataClientConfig {
         http_timeout_secs: Option<u64>,
         ws_timeout_secs: Option<u64>,
         update_instruments_interval_mins: Option<u64>,
+        replay_frames_path: Option<String>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -57,10 +58,27 @@ impl ZerodhaDataClientConfig {
             ws_timeout_secs: ws_timeout_secs.unwrap_or(defaults.ws_timeout_secs),
             update_instruments_interval_mins: update_instruments_interval_mins
                 .unwrap_or(defaults.update_instruments_interval_mins),
-            // Not exposed as a `py_new` parameter: replay is a local-file debugging affordance
-            // driven from Rust, and a Python caller has no path that should silently divert a
-            // client away from the venue.
-            replay_frames_path: None,
+            // ⭐ EXPOSED DELIBERATELY, REVERSING AN EARLIER DECISION TO WITHHOLD IT.
+            //
+            // The reasoning for withholding was sound in intent -- no Python caller should be able
+            // to silently divert a client away from the venue -- but it does not achieve that, and
+            // it costs the thing replay exists for.
+            //
+            // It does not achieve it because this config derives `Deserialize` with
+            // `#[serde(default)]`, so `replay_frames_path` is ALREADY settable by any config that
+            // arrives serialised. Withholding it from `py_new` closes the EXPLICIT, VISIBLE,
+            // named-argument route while leaving the implicit one open -- which is backwards: the
+            // dangerous path is the one nobody can see at the call site.
+            //
+            // What actually guards against a client silently replaying is not an absent parameter:
+            //   * the name is explicit at the call site -- `replay_frames_path="corpus.json"`
+            //   * `connect()` logs a WARN naming replay mode and stating no socket is open
+            //   * `Debug` prints the field UNREDACTED, so a dumped config shows it
+            // Those make a replaying client visible. An absent parameter only made it undrivable.
+            //
+            // And the cost was total: the question replay exists to answer is whether data reaches
+            // a PYTHON strategy, which requires a Python-driven node.
+            replay_frames_path,
         }
     }
 
