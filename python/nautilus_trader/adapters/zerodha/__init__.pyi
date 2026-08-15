@@ -3,9 +3,12 @@
 import enum
 import typing
 
+from nautilus_trader import model
+
 __all__ = [
     "ZerodhaDataClientConfig",
     "ZerodhaDataClientFactory",
+    "ZerodhaOpenInterest",
     "ZerodhaSegment",
     "ZerodhaTickMode",
 ]
@@ -37,6 +40,21 @@ class ZerodhaDataClientConfig:
 class ZerodhaDataClientFactory:
     def __init__(self) -> None: ...
     def name(self) -> str: ...
+
+@typing.final
+class ZerodhaOpenInterest:
+    @property
+    def instrument_id(self) -> model.InstrumentId: ...
+    @property
+    def open_interest(self) -> int: ...
+    @property
+    def open_interest_day_high(self) -> int: ...
+    @property
+    def open_interest_day_low(self) -> int: ...
+    @property
+    def ts_event(self) -> int: ...
+    @property
+    def ts_init(self) -> int: ...
 
 @typing.final
 class ZerodhaSegment(enum.Enum):

@@ -22,6 +22,7 @@ from nautilus_trader._libnautilus.zerodha import *  # noqa: F403 (undefined-loca
 __all__ = [
     "ZerodhaDataClientConfig",
     "ZerodhaDataClientFactory",
+    "ZerodhaOpenInterest",
     "ZerodhaSegment",
     "ZerodhaTickMode",
 ]
