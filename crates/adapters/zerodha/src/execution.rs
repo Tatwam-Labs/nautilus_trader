@@ -841,8 +841,42 @@ impl ZerodhaExecutionClient {
         let runtime = get_runtime();
 
         let handle = runtime.spawn(async move {
-            if let Err(e) = fut.await {
-                log::warn!("Zerodha {description} failed: {e:?}");
+            // ⚠️ A PANIC IN HERE USED TO VANISH. Tokio catches a panicking task at the join
+            // handle — and nothing joins these, so the task died, its unpublished order event
+            // died with it, and NOTHING WAS LOGGED. For a submit or a cancel that means the
+            // engine waits forever for an event that no longer has a sender.
+            //
+            // `catch_unwind` turns that into a loud line. It cannot recover the event — the state
+            // needed to build it is gone with the unwound stack — but "an order operation died"
+            // is a fact an operator can act on, and silence is not.
+            //
+            // Detected through tokio's own join handle rather than `catch_unwind`. The crate has
+            // no `futures` dependency, and adding one to observe a panic would be the wrong trade
+            // when the runtime already reports it — `JoinError::is_panic` is exactly this signal.
+            let inner = get_runtime().spawn(async move {
+                if let Err(e) = fut.await {
+                    log::warn!("Zerodha {description} failed: {e:?}");
+                }
+            });
+
+            if let Err(join_err) = inner.await
+                && join_err.is_panic()
+            {
+                // The payload is usually a &str or String; anything else still prints something,
+                // so the line is never empty.
+                let panic = join_err.into_panic();
+                let detail = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string());
+
+                log::error!(
+                    "Zerodha {description} PANICKED and its order event was lost: {detail}. \
+                     The engine will not receive an event for this operation and may wait \
+                     indefinitely for one. Reconciliation would recover the true state and is \
+                     not implemented."
+                );
             }
         });
 
@@ -1607,12 +1641,51 @@ impl ExecutionClient for ZerodhaExecutionClient {
                 !cache.order_exists(client_order_id) || cache.is_order_open(client_order_id)
             });
 
+        // ⚠️ THE GAP BETWEEN "OPEN AT THE VENUE" AND "CANCELLABLE BY US" IS THE WHOLE FINDING.
+        //
+        // This fans out over THIS PROCESS'S registry. After a restart that registry is empty, so
+        // cancel-all cancelled nothing and returned `Ok(())` — the engine saw success and the
+        // operator believed they were flat. The limitation was documented in a `log::info!`, and a
+        // log line is not a gate.
+        //
+        // The cache knows what is actually open. Anything open there that this client cannot
+        // address is an order that will survive a "cancel everything" request, and that is an
+        // ERROR-level fact rather than an informational one.
+        let addressable: std::collections::HashSet<ClientOrderId> =
+            contexts.iter().map(|c| c.client_order_id).collect();
+
+        let unreachable: Vec<ClientOrderId> = {
+            let cache = self.cache.borrow();
+            cache
+                .orders_open(None, Some(&cmd.instrument_id), None, None, None)
+                .into_iter()
+                .map(|order| order.client_order_id())
+                .filter(|id| !addressable.contains(id))
+                .collect()
+        };
+
         log::info!(
             "Cancelling {} OPEN tracked Zerodha order(s) for {}; already-closed tracked orders are \
-             excluded, and orders this process did not place are not covered at all",
+             excluded",
             contexts.len(),
             cmd.instrument_id,
         );
+
+        if !unreachable.is_empty() {
+            // Deliberately ERROR and deliberately enumerated. A count alone ("3 not covered") does
+            // not let anyone go and cancel them by hand, which is the only remedy available until
+            // reconciliation exists.
+            log::error!(
+                "⚠️ CANCEL-ALL IS INCOMPLETE for {}: {} order(s) are OPEN in the cache but were \
+                 NOT placed by this process, so their venue `variety` is unknown and they CANNOT \
+                 be cancelled here. They will still be live after this call returns: {:?}. \
+                 Cancel them manually or through the process that placed them. Reconciliation \
+                 would close this gap and is not implemented.",
+                cmd.instrument_id,
+                unreachable.len(),
+                unreachable,
+            );
+        }
 
         for context in contexts {
             self.cancel_with_context(context);

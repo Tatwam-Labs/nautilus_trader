@@ -927,7 +927,64 @@ impl ZerodhaHttpClient {
     ///
     /// Returns an error if the transport fails or if the venue's envelope reports a failure.
     pub async fn list_orders(&self) -> anyhow::Result<Vec<KiteOrder>> {
-        self.get_json("/orders", "list_orders").await
+        let rows: Vec<serde_json::Value> = self.get_json("/orders", "list_orders").await?;
+        Ok(Self::parse_rows(rows, "list_orders"))
+    }
+
+    /// Parses order rows INDIVIDUALLY so one bad row cannot hide the whole book.
+    ///
+    /// # ⚠️ Why this is not a plain `Vec<KiteOrder>` deserialisation
+    ///
+    /// It used to be, and that made the poll ATOMIC: one row missing a field this crate happens to
+    /// declare required failed the entire response, and every other working order became invisible
+    /// at the same moment. For a reconciliation poll that is the worst possible failure — you lose
+    /// sight of the orders you *can* parse in order to be strict about the one you cannot.
+    ///
+    /// And the required/optional split is JUDGEMENT, not vendor-backed. The vendor's own probe
+    /// accepts a two-field order row without complaint and hands back raw dicts, so every
+    /// `#[serde(default)]` in [`KiteOrder`] is this crate's guess about what Zerodha always sends.
+    /// A guess that fails closed over the whole book is a guess with far too much leverage.
+    ///
+    /// **A skipped row is logged at ERROR, not warn, and the count is returned to the caller's log
+    /// line.** An unparseable INSTRUMENT is one you cannot trade; an unparseable ORDER is a LIVE
+    /// POSITION YOU CANNOT SEE. Both deserve to be loud, but only the second can lose money, so it
+    /// must never be silent — the risk of per-row parsing is that it quietly degrades into a
+    /// partial book that reads like a complete one.
+    fn parse_rows<T: DeserializeOwned>(rows: Vec<serde_json::Value>, operation: &str) -> Vec<T> {
+        let total = rows.len();
+        let mut parsed = Vec::with_capacity(total);
+        let mut skipped = 0usize;
+
+        for row in rows {
+            // Pulled out BEFORE the parse attempt so a failure can still name WHICH row it was.
+            // "a row failed" is nearly useless; "order 240814000123456 failed" is actionable.
+            // Trades carry `trade_id`, orders carry `order_id`; try both rather than assume.
+            let row_id = row
+                .get("order_id")
+                .or_else(|| row.get("trade_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("<no id>")
+                .to_string();
+
+            match serde_json::from_value::<T>(row) {
+                Ok(order) => parsed.push(order),
+                Err(e) => {
+                    skipped += 1;
+                    log::error!(
+                        "Zerodha {operation}: order {order_id} could not be parsed and is                          INVISIBLE to this client -- it may be a live position: {e}"
+                    );
+                }
+            }
+        }
+
+        if skipped > 0 {
+            log::error!(
+                "⚠️ Zerodha {operation} returned an INCOMPLETE order book: {} of {total} row(s)                  parsed, {skipped} skipped. Do NOT treat this as the full set of working orders.",
+                parsed.len(),
+            );
+        }
+
+        parsed
     }
 
     /// Fetches the state transitions of one order.
@@ -940,8 +997,10 @@ impl ZerodhaHttpClient {
     ///
     /// Returns an error if the transport fails or if the venue's envelope reports a failure.
     pub async fn order_history(&self, order_id: &str) -> anyhow::Result<Vec<KiteOrder>> {
-        self.get_json(&format!("/orders/{order_id}"), "order_history")
-            .await
+        let rows: Vec<serde_json::Value> = self
+            .get_json(&format!("/orders/{order_id}"), "order_history")
+            .await?;
+        Ok(Self::parse_rows(rows, "order_history"))
     }
 
     /// Fetches the day's executed trades.
@@ -952,7 +1011,8 @@ impl ZerodhaHttpClient {
     ///
     /// Returns an error if the transport fails or if the venue's envelope reports a failure.
     pub async fn list_trades(&self) -> anyhow::Result<Vec<KiteTrade>> {
-        self.get_json("/trades", "list_trades").await
+        let rows: Vec<serde_json::Value> = self.get_json("/trades", "list_trades").await?;
+        Ok(Self::parse_rows(rows, "list_trades"))
     }
 
     /// Issues an authenticated `GET` and unwraps the Kite envelope.
@@ -1321,6 +1381,53 @@ mod tests {
             !error.contains("Bad Gateway"),
             "the body must not be echoed into the error: {error}",
         );
+    }
+
+    // ⭐ THE REGRESSION TEST FOR "ONE BAD ROW HID THE WHOLE BOOK".
+    //
+    // Deserialisation used to be atomic over the response: a single row missing a field this crate
+    // declares required failed the ENTIRE poll, and every working order became invisible at the
+    // same moment. For a reconciliation poll that is the worst available failure — you lose sight
+    // of the orders you CAN read in order to be strict about the one you cannot.
+    //
+    // The fixture deliberately contains a row that CANNOT parse (no `order_id`, no `status`), so
+    // this test would have failed before the change rather than passing for a new reason.
+    #[rstest]
+    fn test_one_unparseable_row_does_not_hide_the_others() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"order_id":"240814000000001","status":"OPEN","exchange":"NSE",
+                 "tradingsymbol":"RELIANCE","order_type":"LIMIT","transaction_type":"BUY",
+                 "quantity":10},
+                {"garbage":"this row cannot become a KiteOrder"},
+                {"order_id":"240814000000002","status":"COMPLETE","exchange":"NSE",
+                 "tradingsymbol":"INFY","order_type":"MARKET","transaction_type":"SELL",
+                 "quantity":5}
+            ]"#,
+        )
+        .expect("fixture is valid json");
+
+        let parsed: Vec<KiteOrder> = ZerodhaHttpClient::parse_rows(rows, "test");
+
+        assert_eq!(
+            parsed.len(),
+            2,
+            "the two good orders must survive a bad neighbour; atomically failing the poll would \
+             make live positions invisible",
+        );
+        assert_eq!(parsed[0].order_id, "240814000000001");
+        assert_eq!(
+            parsed[1].order_id, "240814000000002",
+            "the row AFTER the bad one must also survive -- a parser that stops at the first \
+             failure is only marginally better than one that fails the batch",
+        );
+    }
+
+    // An empty response is not an error and must not be confused with a skipped row.
+    #[rstest]
+    fn test_an_empty_order_book_yields_nothing_without_complaint() {
+        let parsed: Vec<KiteOrder> = ZerodhaHttpClient::parse_rows(Vec::new(), "test");
+        assert!(parsed.is_empty(), "no orders is a valid state, not a parse failure");
     }
 
     #[rstest]
