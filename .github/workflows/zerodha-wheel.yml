@@ -1,0 +1,143 @@
+name: zerodha-wheel
+
+# Build a cp314 / manylinux / x86_64 wheel from the zerodha-adapter fork and
+# PROVE THE ZERODHA SYMBOLS IMPORT. A wheel that installs is not the
+# deliverable; eleven of thirteen PyO3 registration surfaces fail silently, so
+# "it built" and "it exports" are different claims and only the second counts.
+#
+# Deliberately self-contained rather than reusing build.yml: that workflow is
+# wired to release planning and publication, and this needs neither.
+#
+# TARGET: cp314, NOT cp312. The interpreter is COUPLED TO THE NAUTILUS MAJOR —
+# prod runs the older interpreter because it still runs nautilus v1, and this
+# adapter is a v2 artefact that cannot load into a v1 runtime at all. The
+# correct question is the interpreter of the ARTEFACT'S deployment target
+# (at-base:2.0.0rc3 -> python 3.14.7, abi cpython-314-x86_64-linux-gnu), not of
+# the currently deployed app. main already builds 3.14 (Dockerfile:84 FROM
+# at-base:2.0.0rc3, :141 python:3.14-slim); the deployed image predates that
+# switch, so the running artefact and the build recipe had already diverged.
+#
+# HOST: ubuntu-latest is x86_64 NATIVELY — no QEMU, and x86_64 matches prod
+# hardware (13.202.251.163 uname -m = x86_64). Only the interpreter moved.
+
+on:
+  # Push trigger as well as dispatch: a workflow_dispatch-only file on a
+  # NON-DEFAULT branch is not reliably addressable by the API, and this file
+  # deliberately does not go near the default branch.
+  push:
+    branches: [ci/zerodha-wheel]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to build
+        required: false
+        default: feat/zerodha-data-client
+
+env:
+  PACKAGE_DIR: python
+  # Fat LTO OOMs on these runners. Thin is not a preference, it is the only
+  # setting that completes.
+  CARGO_PROFILE_RELEASE_LTO: thin
+  # Matches upstream build.yml's limit for GitHub-hosted runners.
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    # A git-ref pin forces a SOURCE build of nautilus — prebuilt wheels do not
+    # apply here — so this is long by nature, not by accident.
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          submodules: recursive
+
+      - name: Record exactly what is being built
+        run: |
+          echo "ref_input=${{ inputs.ref }}"
+          echo "sha=$(git rev-parse HEAD)"
+          echo "branch=$(git rev-parse --abbrev-ref HEAD)"
+          echo "runner_arch=$(uname -m)"
+
+      # A nautilus source build fills the default runner disk.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: false
+          large-packages: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Show the interpreter (ASK IT, do not read a Dockerfile)
+        run: |
+          python -c "import sys, sysconfig; print('python', sys.version.split()[0]); print('tag', sysconfig.get_config_var('SOABI'))"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install maturin at the pinned version
+        run: |
+          MATURIN_VERSION="$(bash scripts/maturin-version.bash 2>/dev/null || echo 1.14.1)"
+          echo "maturin==${MATURIN_VERSION}"
+          python -m pip install --upgrade pip
+          python -m pip install "maturin==${MATURIN_VERSION}" patchelf
+
+      # The zerodha crate gates PyO3 behind a separate `python` feature
+      # (default = ["high-precision"]). Two routes already enable it on this
+      # branch — crates/pyo3/Cargo.toml declares
+      # `nautilus-zerodha = { features = ["python"] }`, and maturin's
+      # `extension-module` pulls `nautilus-zerodha/extension-module` which
+      # includes `python`. Asserted here so a config change that removes both
+      # fails LOUDLY rather than producing a wheel that exports nothing.
+      - name: Assert the zerodha python feature is actually wired
+        run: |
+          set -euo pipefail
+          grep -q 'nautilus-zerodha.*features.*python' crates/pyo3/Cargo.toml \
+            || { echo "FAIL: crates/pyo3 no longer enables nautilus-zerodha/python"; exit 1; }
+          grep -q 'nautilus-zerodha/extension-module' crates/pyo3/Cargo.toml \
+            || echo "NOTE: extension-module route absent; relying on the direct dependency feature"
+          echo "zerodha python feature: WIRED"
+
+      - name: Build the wheel
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: maturin build --release --out ../dist
+
+      - name: Report what was actually produced
+        run: |
+          ls -la dist/
+          echo "--- wheel tags ---"
+          for w in dist/*.whl; do echo "$w"; done
+
+      # ── ACCEPTANCE ──────────────────────────────────────────────────────
+      # Run INSIDE a clean linux/amd64 python:3.14 container, not on the bare
+      # runner: that also proves the manylinux tag is satisfiable somewhere
+      # other than the machine that built it.
+      - name: ACCEPTANCE — the zerodha symbols must IMPORT
+        run: |
+          set -euo pipefail
+          cat > /tmp/accept.py <<'PY'
+          import platform, sys
+          print("arch:", platform.machine())
+          print("python:", sys.version.split()[0])
+          import nautilus_trader
+          print("nautilus_trader:", getattr(nautilus_trader, "__version__", "?"))
+          import nautilus_trader.adapters.zerodha as z
+          names = [n for n in dir(z) if not n.startswith("_")]
+          print("zerodha symbols:", len(names))
+          print("sample:", sorted(names)[:15])
+          assert names, "zerodha package imported but exports NOTHING"
+          print("ACCEPTANCE: OK")
+          PY
+          docker run --rm --platform linux/amd64 \
+            -v "$PWD/dist":/dist:ro -v /tmp/accept.py:/accept.py:ro \
+            python:3.14-slim bash -lc \
+              "pip install --quiet /dist/*.whl && python /accept.py"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zerodha-wheel-cp314-manylinux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error
