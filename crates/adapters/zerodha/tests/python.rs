@@ -37,7 +37,7 @@
 
 #![cfg(feature = "python")]
 
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, sync::OnceLock};
 
 use nautilus_common::{
     cache::Cache, clock::TestClock, live::runner::set_data_event_sender, messages::DataEvent,
@@ -48,12 +48,32 @@ use nautilus_zerodha::{
     common::consts::ZERODHA, config::ZerodhaDataClientConfig, factories::ZerodhaDataClientFactory,
     python,
 };
-use pyo3::{Py, Python, types::{PyAnyMethods, PyModule}};
+use pyo3::{Bound, Py, Python, types::{PyAnyMethods, PyModule}};
 use rstest::rstest;
 
-fn register_zerodha_python_module(py: Python<'_>) {
-    let module = PyModule::new(py, "zerodha").expect("Zerodha module should be created");
-    python::zerodha(py, &module).expect("Zerodha Python module should register");
+/// Registers the Zerodha Python module ONCE PER PROCESS and returns it.
+///
+/// ⚠️ `python::zerodha` registers a factory extractor in a GLOBAL registry that rejects a second
+/// registration with "Factory extractor 'ZERODHA' is already registered". Every test in this binary
+/// shares that process, so a helper that registered on each call made the tests order- and
+/// composition-dependent: each passed alone, and adding a third turned a previously-green sibling
+/// red with a message pointing at the registration code, which was fine.
+///
+/// `OnceLock` makes the registration happen once and hands every caller the same module, so a test
+/// can pull a class off it without touching global state. Returning the module also removes the
+/// reason a test would otherwise `py.import("nautilus_trader...")` — that package is only importable
+/// from an INSTALLED WHEEL, which a `cargo test` process does not have.
+fn register_zerodha_python_module(py: Python<'_>) -> Bound<'_, PyModule> {
+    static MODULE: OnceLock<Py<PyModule>> = OnceLock::new();
+
+    MODULE
+        .get_or_init(|| {
+            let module = PyModule::new(py, "zerodha").expect("Zerodha module should be created");
+            python::zerodha(py, &module).expect("Zerodha Python module should register");
+            module.unbind()
+        })
+        .bind(py)
+        .clone()
 }
 
 fn setup_data_event_sender() {
@@ -188,7 +208,7 @@ fn test_replay_frames_path_survives_the_round_trip_to_python_and_back() {
     Python::initialize();
 
     Python::attach(|py| {
-        register_zerodha_python_module(py);
+        let module = register_zerodha_python_module(py);
 
         let config = Py::new(
             py,
@@ -218,10 +238,24 @@ fn test_replay_frames_path_survives_the_round_trip_to_python_and_back() {
         // The constructor half. A missing `#[pyo3(signature)]` entry is a compile error, but a
         // parameter accepted and then DROPPED on the floor is not — so this checks the value
         // actually reached the struct rather than that the call was accepted.
-        let built = py
-            .import("nautilus_trader.adapters.zerodha")
-            .and_then(|m| m.getattr("ZerodhaDataClientConfig"))
-            .and_then(|c| c.call1((py.None(), py.None(), py.None(), py.None(), py.None(), py.None(), py.None(), "from-kwarg.json")))
+        // From the LOCALLY REGISTERED module, not `py.import("nautilus_trader...")`. The embedded
+        // interpreter in a `cargo test` process has no `nautilus_trader` on `sys.path` — that
+        // package exists only in an installed wheel, which is precisely what this build has not
+        // produced yet. Importing it would make the test depend on the artefact it helps validate.
+        let built = module
+            .getattr("ZerodhaDataClientConfig")
+            .and_then(|c| {
+                c.call1((
+                    py.None(),
+                    py.None(),
+                    py.None(),
+                    py.None(),
+                    py.None(),
+                    py.None(),
+                    py.None(),
+                    "from-kwarg.json",
+                ))
+            })
             .expect("the constructor must accept replay_frames_path positionally");
 
         let round_tripped: Option<String> = built
