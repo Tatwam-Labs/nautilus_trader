@@ -101,7 +101,7 @@ impl ZerodhaHttpClient {
     ///
     /// **The returned map contains a live session token.** It is constructed at the call site and
     /// dropped with the request rather than stored.
-    fn auth_headers(&self) -> HashMap<String, String> {
+    pub(crate) fn auth_headers(&self) -> HashMap<String, String> {
         let mut headers = HashMap::new();
         headers.insert(
             "Authorization".to_string(),
@@ -112,6 +112,24 @@ impl ZerodhaHttpClient {
             ),
         );
         headers
+    }
+
+    /// Returns the REST root this client was built against.
+    ///
+    /// `pub(crate)` so [`crate::http::orders`] can extend this client rather than construct a
+    /// second one. Privacy in Rust is per-module and `http::orders` is a *sibling* of this module,
+    /// not a child, so a private field is not reachable from there — and the alternative, a second
+    /// `HttpClient` with its own connection pool and its own copy of the credential, is exactly
+    /// what the module docs of the order surface argue against.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Returns the shared transport.
+    ///
+    /// See [`Self::base_url`] for why this is `pub(crate)` rather than private.
+    pub(crate) fn transport(&self) -> &HttpClient {
+        &self.client
     }
 
     /// Fetches the instrument dump, for one exchange or for all of them.

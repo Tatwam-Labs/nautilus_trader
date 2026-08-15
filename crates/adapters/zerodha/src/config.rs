@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::{
     consts::{ZERODHA_HTTP_URL, ZERODHA_WS_URL},
     credential::ZerodhaCredential,
+    enums::{ZerodhaProduct, ZerodhaVariety},
 };
 
 /// Configuration for the Zerodha data client.
@@ -151,6 +152,110 @@ impl ZerodhaDataClientConfig {
     }
 }
 
+/// Configuration for the Zerodha execution client.
+///
+/// [`Debug`] is implemented BY HAND for the same reason as [`ZerodhaDataClientConfig`]: the factory
+/// formats `{config:?}` into its wrong-config error, and a derived `Debug` on a config holding an
+/// access token puts a live session credential into that error string.
+///
+/// # ⭐ `default_product` has NO default, and that is the point
+///
+/// Zerodha's `product` decides margin and intraday square-off (see [`ZerodhaProduct`]). Nothing in
+/// a Nautilus order carries it, so it has to come from configuration — and every candidate default
+/// is wrong for somebody:
+///
+/// - `MIS` silently arms the broker to force-close every position around 15:20 IST.
+/// - `CNC` silently demands full delivery margin and rejects a leveraged strategy for funds.
+/// - `NRML` is meaningless on an equity segment.
+///
+/// So there is no default. A client configured without one fails to **construct**, which the live
+/// node builder surfaces at build time — not at 09:15 on the first order.
+///
+/// A per-order override is available through `SubmitOrder.params["product"]`, so a strategy that
+/// legitimately mixes products can say so per order without changing the account-wide setting.
+///
+/// # There is no Python binding on this type, deliberately
+///
+/// The data config carries `pyclass` attributes; this one does not. Exposing it would require
+/// [`ZerodhaProduct`] and [`ZerodhaVariety`] to be `pyclass` enums as well, and adding a Python
+/// surface for an execution path that has never placed an order is a decision to take separately
+/// from writing the path.
+#[derive(Clone, Serialize, Deserialize, bon::Builder)]
+#[serde(default, deny_unknown_fields)]
+pub struct ZerodhaExecClientConfig {
+    /// The Kite Connect API key (falls back to the `ZERODHA_API_KEY` env var).
+    pub api_key: Option<String>,
+    /// The session access token from the daily login flow (falls back to `ZERODHA_ACCESS_TOKEN`).
+    pub access_token: Option<String>,
+    /// Override for the REST API base URL.
+    pub base_url_http: Option<String>,
+    /// HTTP timeout in seconds.
+    #[builder(default = 10)]
+    pub http_timeout_secs: u64,
+    /// The margin and square-off regime every order is placed under unless a per-order
+    /// `params["product"]` overrides it.
+    ///
+    /// **Required.** See the type docs for why this has no default.
+    pub default_product: Option<ZerodhaProduct>,
+    /// The order variety used for placement unless a per-order `params["variety"]` overrides it.
+    ///
+    /// Unlike `default_product` this *does* default, and the difference is not inconsistency:
+    /// `regular` is the only variety whose placement, modification and cancellation parameter sets
+    /// this adapter builds. `amo`, `co`, `iceberg` and `auction` each need fields the request types
+    /// do not carry, so a client cannot silently end up using one.
+    #[builder(default)]
+    pub default_variety: ZerodhaVariety,
+}
+
+impl Debug for ZerodhaExecClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ZerodhaExecClientConfig))
+            .field("api_key", &self.api_key.as_ref().map(|_| "***redacted***"))
+            .field(
+                "access_token",
+                &self.access_token.as_ref().map(|_| "***redacted***"),
+            )
+            .field("base_url_http", &self.base_url_http)
+            .field("http_timeout_secs", &self.http_timeout_secs)
+            .field("default_product", &self.default_product)
+            .field("default_variety", &self.default_variety)
+            .finish()
+    }
+}
+
+impl Default for ZerodhaExecClientConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
+}
+
+impl ZerodhaExecClientConfig {
+    /// Creates a new [`ZerodhaExecClientConfig`] with default settings.
+    ///
+    /// The result is **not usable as-is**: `default_product` is `None` and a client built from it
+    /// returns an error. That is deliberate; see the type docs.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Resolves the credential pair from this config, falling back to the environment.
+    ///
+    /// Returns `None` unless **both** halves resolve.
+    #[must_use]
+    pub fn credential(&self) -> Option<ZerodhaCredential> {
+        ZerodhaCredential::resolve(self.api_key.as_deref(), self.access_token.as_deref())
+    }
+
+    /// Returns the REST API base URL, respecting any override.
+    #[must_use]
+    pub fn http_url(&self) -> String {
+        self.base_url_http
+            .clone()
+            .unwrap_or_else(|| ZERODHA_HTTP_URL.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nautilus_model::identifiers::ClientId;
@@ -237,5 +342,77 @@ mod tests {
             serde_json::from_str(&json).expect("config should deserialize");
         assert_eq!(back.access_token.as_deref(), Some(TOKEN));
         assert_eq!(back.api_key.as_deref(), Some(KEY));
+    }
+
+    fn populated_exec() -> ZerodhaExecClientConfig {
+        ZerodhaExecClientConfig {
+            api_key: Some(KEY.to_string()),
+            access_token: Some(TOKEN.to_string()),
+            default_product: Some(ZerodhaProduct::Nrml),
+            ..ZerodhaExecClientConfig::default()
+        }
+    }
+
+    // The exec config reaches the SAME wrong-config error path in `factories.rs` that leaked a
+    // token from the data config, so it needs the same hand-written redaction rather than
+    // inheriting the habit by assumption.
+    #[rstest]
+    fn test_exec_debug_does_not_print_credentials() {
+        let rendered = format!("{:?}", populated_exec());
+
+        assert!(
+            !rendered.contains(TOKEN),
+            "access token leaked into Debug: {rendered}"
+        );
+        assert!(
+            !rendered.contains(KEY),
+            "api key leaked into Debug: {rendered}"
+        );
+        assert!(
+            rendered.contains("redacted"),
+            "redaction marker missing: {rendered}"
+        );
+    }
+
+    // The product is visible on purpose. It is not a secret, and it is the single field most worth
+    // seeing in a log line, because it decides margin and intraday square-off.
+    #[rstest]
+    fn test_exec_debug_shows_the_product_and_variety() {
+        let rendered = format!("{:?}", populated_exec());
+
+        assert!(rendered.contains("Nrml"), "{rendered}");
+        assert!(rendered.contains("Regular"), "{rendered}");
+    }
+
+    // THE DISCRIMINATING TEST FOR THE PRODUCT DEFAULT. A `#[builder(default)]` on this field would
+    // pass every other test in this file and quietly pick a margin regime -- MIS would have the
+    // broker force-close every position intraday, and nothing in the order response says so.
+    #[rstest]
+    fn test_the_default_config_has_no_product() {
+        assert_eq!(
+            ZerodhaExecClientConfig::default().default_product,
+            None,
+            "no product may be inferred; it decides leverage and intraday square-off",
+        );
+    }
+
+    #[rstest]
+    fn test_the_default_variety_is_regular() {
+        assert_eq!(
+            ZerodhaExecClientConfig::default().default_variety,
+            ZerodhaVariety::Regular,
+            "regular is the only variety whose parameter set this adapter builds",
+        );
+    }
+
+    #[rstest]
+    fn test_exec_config_round_trips_through_serde() {
+        let json = serde_json::to_string(&populated_exec()).expect("config should serialize");
+        let back: ZerodhaExecClientConfig =
+            serde_json::from_str(&json).expect("config should deserialize");
+
+        assert_eq!(back.access_token.as_deref(), Some(TOKEN));
+        assert_eq!(back.default_product, Some(ZerodhaProduct::Nrml));
+        assert_eq!(back.default_variety, ZerodhaVariety::Regular);
     }
 }

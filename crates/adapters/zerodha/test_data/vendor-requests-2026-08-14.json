@@ -1,0 +1,526 @@
+{
+  "captured_at": "2026-08-14T17:53:54.082382+00:00",
+  "oracle": "kiteconnect 5.2.0",
+  "vendor_constants": {
+    "exchange": [
+      "BCD",
+      "BFO",
+      "BSE",
+      "CDS",
+      "MCX",
+      "NFO",
+      "NSE"
+    ],
+    "product": [
+      "CNC",
+      "CO",
+      "MIS",
+      "NRML"
+    ],
+    "variety": [
+      "amo",
+      "auction",
+      "co",
+      "iceberg",
+      "regular"
+    ],
+    "transaction_type": [
+      "BUY",
+      "SELL"
+    ],
+    "order_type": [
+      "LIMIT",
+      "MARKET",
+      "SL",
+      "SL-M"
+    ],
+    "validity": [
+      "DAY",
+      "IOC",
+      "TTL"
+    ],
+    "status": [
+      "CANCELLED",
+      "COMPLETE",
+      "REJECTED"
+    ]
+  },
+  "vendor_constants_note": "Read from the KiteConnect class attributes, not from the case matrix below. `status` is INCOMPLETE BY THE VENDOR'S OWN HAND: the SDK names only COMPLETE, REJECTED and CANCELLED, while the v3 order lifecycle has around a dozen states. ZerodhaOrderStatus models twelve; nine of them rest on documentation alone and only a live order-book capture can confirm them.",
+  "note": "Requests kiteconnect WOULD have sent. Nothing was transmitted: the session was replaced by a recorder and socket connection was blocked. Credentials are fabricated.",
+  "comparing_against_the_rust_encoder": {
+    "compare_textually": [
+      "method",
+      "url",
+      "the SET of keys in `data` (this is what proves absent optionals are omitted)",
+      "the ORDER of keys in `data`",
+      "the SET of keys in `params`, after dropping null values",
+      "every non-numeric value: variety, exchange, tradingsymbol, transaction_type, product, order_type, validity, tag"
+    ],
+    "compare_numerically_not_textually": [
+      "price",
+      "trigger_price",
+      "quantity",
+      "disclosed_quantity"
+    ],
+    "why": "kiteconnect passes Python ints and floats to `requests`, which encodes them with str(). So the vendor puts `price=1450.0` on the wire where the Rust encoder puts `price=1450.00`, taken from `Price`'s own fixed-point rendering at the instrument's precision. Both parse to the same number at the venue. DO NOT 'fix' the Rust to match the vendor's text: str() on a float is the lossy side of this difference -- str(0.1 + 0.2) is '0.30000000000000004', and a 4dp CDS tick of 0.0025 has no exact binary form. The Rust approach is deliberate and is the same argument `http::parse` makes for counting precision from tick_size text rather than from a parsed f64. Compare the VALUES, not the spelling.",
+    "null_params_are_not_a_key": "`cancel_order` passes params={'parent_order_id': None} unconditionally (connect.py:442) -- unlike place/modify it does NOT strip None first. `requests` drops null-valued query params, so the wire carries no query string at all. The Rust encoder builds the map only when the value is present, which is the same wire result by a different route."
+  },
+  "requests": [
+    {
+      "case": "place_market_regular_buy_day",
+      "discriminates": "baseline: variety in path AND body; no price key at all",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "validity"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NFO",
+        "tradingsymbol": "NIFTY24AUG24000CE",
+        "transaction_type": "BUY",
+        "quantity": 65,
+        "product": "NRML",
+        "order_type": "MARKET",
+        "validity": "DAY"
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_limit_regular_sell_with_tag",
+      "discriminates": "price is present; tag is present",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "price",
+        "validity",
+        "tag"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "SELL",
+        "quantity": 1,
+        "product": "CNC",
+        "order_type": "LIMIT",
+        "price": 1400.5,
+        "validity": "DAY",
+        "tag": "O-001"
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_slm_regular_buy",
+      "discriminates": "SL-M carries trigger_price and NO price",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "validity",
+        "trigger_price"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "BUY",
+        "quantity": 1,
+        "product": "MIS",
+        "order_type": "SL-M",
+        "validity": "DAY",
+        "trigger_price": 1450.0
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_sl_regular_buy",
+      "discriminates": "SL carries BOTH price and trigger_price",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "price",
+        "validity",
+        "trigger_price"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "BUY",
+        "quantity": 1,
+        "product": "MIS",
+        "order_type": "SL",
+        "price": 1455.0,
+        "validity": "DAY",
+        "trigger_price": 1450.0
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_market_no_validity",
+      "discriminates": "THE OMISSION CASE: validity absent -> the key must not appear at all",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "BUY",
+        "quantity": 1,
+        "product": "CNC",
+        "order_type": "MARKET"
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_market_ioc",
+      "discriminates": "IOC validity",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "validity"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "BUY",
+        "quantity": 1,
+        "product": "MIS",
+        "order_type": "MARKET",
+        "validity": "IOC"
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_market_amo",
+      "discriminates": "THE PATH CASE: a different variety must change the URL, not only the body",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/amo",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "validity"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "amo",
+        "exchange": "NSE",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "BUY",
+        "quantity": 1,
+        "product": "CNC",
+        "order_type": "MARKET",
+        "validity": "DAY"
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_symbol_with_ampersand",
+      "discriminates": "ENCODING: a tradingsymbol containing & must not split the body",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "validity"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": "M&M",
+        "transaction_type": "BUY",
+        "quantity": 1,
+        "product": "CNC",
+        "order_type": "MARKET",
+        "validity": "DAY"
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "place_with_disclosed_quantity",
+      "discriminates": "ORDER PROOF: disclosed_quantity must land between validity and trigger_price",
+      "method": "POST",
+      "url": "https://api.kite.trade/orders/regular",
+      "data_key_order": [
+        "variety",
+        "exchange",
+        "tradingsymbol",
+        "transaction_type",
+        "quantity",
+        "product",
+        "order_type",
+        "price",
+        "validity",
+        "disclosed_quantity",
+        "trigger_price",
+        "tag"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "exchange": "NSE",
+        "tradingsymbol": "RELIANCE",
+        "transaction_type": "BUY",
+        "quantity": 100,
+        "product": "CNC",
+        "order_type": "LIMIT",
+        "price": 1400.5,
+        "validity": "DAY",
+        "disclosed_quantity": 10,
+        "trigger_price": 1390.0,
+        "tag": "O-002"
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "modify_quantity_and_price",
+      "discriminates": "ORDER PROOF: quantity precedes price in the vendor's own dict; one field alone cannot show that, and the Rust encoder had only inferred it from the signature",
+      "method": "PUT",
+      "url": "https://api.kite.trade/orders/regular/240814000123456",
+      "data_key_order": [
+        "variety",
+        "order_id",
+        "quantity",
+        "price"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "order_id": "240814000123456",
+        "quantity": 130,
+        "price": 101.55
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "modify_price_only",
+      "discriminates": "only the changed field travels; order_id is in the PATH",
+      "method": "PUT",
+      "url": "https://api.kite.trade/orders/regular/240814000123456",
+      "data_key_order": [
+        "variety",
+        "order_id",
+        "price"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "order_id": "240814000123456",
+        "price": 101.55
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "modify_quantity_only",
+      "discriminates": "quantity alone",
+      "method": "PUT",
+      "url": "https://api.kite.trade/orders/regular/240814000123456",
+      "data_key_order": [
+        "variety",
+        "order_id",
+        "quantity"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "order_id": "240814000123456",
+        "quantity": 130
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "modify_price_and_trigger",
+      "discriminates": "two fields together",
+      "method": "PUT",
+      "url": "https://api.kite.trade/orders/regular/240814000123456",
+      "data_key_order": [
+        "variety",
+        "order_id",
+        "price",
+        "trigger_price"
+      ],
+      "params_key_order": null,
+      "data": {
+        "variety": "regular",
+        "order_id": "240814000123456",
+        "price": 101.55,
+        "trigger_price": 100.0
+      },
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "cancel_no_parent",
+      "discriminates": "THE DELETE CASE: params go to the QUERY STRING, not a body",
+      "method": "DELETE",
+      "url": "https://api.kite.trade/orders/regular/240814000123456",
+      "data_key_order": null,
+      "params_key_order": [
+        "parent_order_id"
+      ],
+      "data": null,
+      "json_body": null,
+      "params": {
+        "parent_order_id": null
+      },
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "cancel_with_parent",
+      "discriminates": "parent_order_id as a query parameter",
+      "method": "DELETE",
+      "url": "https://api.kite.trade/orders/regular/240814000123456",
+      "data_key_order": null,
+      "params_key_order": [
+        "parent_order_id"
+      ],
+      "data": null,
+      "json_body": null,
+      "params": {
+        "parent_order_id": "240814000123455"
+      },
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "orders_list",
+      "discriminates": "read route: no variety segment",
+      "method": "GET",
+      "url": "https://api.kite.trade/orders",
+      "data_key_order": null,
+      "params_key_order": null,
+      "data": null,
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "order_history",
+      "discriminates": "THE ADJACENT-PATH CASE: /orders/{order_id} has NO variety segment",
+      "method": "GET",
+      "url": "https://api.kite.trade/orders/240814000123456",
+      "data_key_order": null,
+      "params_key_order": null,
+      "data": null,
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    },
+    {
+      "case": "trades_list",
+      "discriminates": "read route",
+      "method": "GET",
+      "url": "https://api.kite.trade/trades",
+      "data_key_order": null,
+      "params_key_order": null,
+      "data": null,
+      "json_body": null,
+      "params": null,
+      "authorization_shape": "token <api_key>:<access_token>",
+      "x_kite_version": "3"
+    }
+  ]
+}
