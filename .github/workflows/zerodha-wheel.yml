@@ -78,6 +78,19 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           submodules: recursive
 
+      # ⚠️ `.cargo/config.toml:16` sets `link-arg=-fuse-ld=lld`, so EVERY target needs lld
+      # present or the build dies with `collect2: fatal error: cannot find 'ld'` — a message that
+      # names the WRONG tool and sends you looking at the linker rather than at a missing package.
+      # ubuntu-latest ships lld; ubuntu-24.04-arm does NOT, which is why aarch64 failed and x86_64
+      # did not. macOS uses its own linker and needs nothing.
+      - name: Install lld (Linux only — the cargo config demands it)
+        if: runner.os == 'Linux'
+        run: |
+          set -eux
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends lld
+          ld.lld --version
+
       - name: Record exactly what is being built
         run: |
           echo "ref_input=${{ inputs.ref }}"
@@ -89,6 +102,7 @@ jobs:
 
       # A nautilus source build fills the default runner disk.
       - name: Free disk space
+        if: runner.os == 'Linux'
         uses: jlumbroso/free-disk-space@v1.3.1
         with:
           tool-cache: false
