@@ -70,10 +70,20 @@ pub struct ZerodhaDataClientConfig {
     pub update_instruments_interval_mins: u64,
     /// A captured frame corpus to replay INSTEAD of opening a socket.
     ///
-    /// ⚠️ **When set, no socket is opened and the venue is never contacted.** Ticks are decoded
+    /// ⚠️ **When set, no socket is opened and no tick comes from the venue.** Ticks are decoded
     /// from the file by the same decoder the live feed uses, so everything from decode onward —
     /// token resolution, quote/trade/open-interest mapping, publication to the engine — is the
     /// identical code path.
+    ///
+    /// ⚠️ **THIS IS NOT AN OFFLINE MODE. It is an offline TICK SOURCE.** `connect()` still calls
+    /// `load_instruments`, which is a REST fetch over the network, because token resolution needs
+    /// the instrument dump and a frame corpus carries no instrument definitions. A run in replay
+    /// mode measurably fetched 114,870 instruments.
+    ///
+    /// This doc previously said "the venue is never contacted", which was false. It is recorded
+    /// rather than silently corrected because that sentence asserted a NETWORK-ISOLATION property
+    /// the code does not have — a reader would reasonably have concluded the process touched
+    /// nothing, and this is the API doc `cargo doc` renders and an IDE shows on hover.
     ///
     /// What it therefore CANNOT tell you: anything about auth, subscribe, mode, reconnect or the
     /// transport. A green replay is not a green session, and reporting one as the other would be
