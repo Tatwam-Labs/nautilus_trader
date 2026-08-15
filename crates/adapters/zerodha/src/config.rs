@@ -81,7 +81,6 @@ pub struct ZerodhaDataClientConfig {
     ///
     /// Exists because MCX is shut for most of the week and a carriage question should not have to
     /// wait for a market.
-    #[builder(default)]
     pub replay_frames_path: Option<String>,
 }
 
