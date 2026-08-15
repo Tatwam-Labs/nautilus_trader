@@ -30,10 +30,16 @@
 //! | tick → [`QuoteTick`] mapping ([`data::parse`]) | complete; unit-tested |
 //! | WebSocket transport ([`websocket::client`]) | written, **never run against Zerodha** |
 //! | REST instrument dump ([`http`]) | written, **never requested**; the CSV parsing is unit-tested |
-//! | execution client | **not started** |
+//! | order enum mapping ([`common::enums`]) | complete; unit-tested both directions |
+//! | order REST surface ([`http::orders`]) | written, **never requested**; encoding and parsing are unit-tested |
+//! | execution client ([`execution`]) | placement, modify and cancel written and **never run**; reports and reconciliation are **stubs that return errors** |
 //!
-//! **No part of the live path has carried a real tick.** A passing test suite says nothing about
-//! the transport, because nothing in the suite exercises it.
+//! **No part of the live path has carried a real tick, and no order has ever been placed.** A
+//! passing test suite says nothing about the transport, because nothing in the suite exercises it.
+//!
+//! ⚠️ A live node configured with [`execution::ZerodhaExecutionClient`] will **fail its
+//! reconciliation pass**: the report generators return errors rather than empty lists, because an
+//! empty list reads as a flat account. See the [`execution`] module docs.
 //!
 //! [`QuoteTick`]: nautilus_model::data::QuoteTick
 //!
@@ -67,6 +73,7 @@
 pub mod common;
 pub mod config;
 pub mod data;
+pub mod execution;
 pub mod factories;
 pub mod http;
 pub mod websocket;
@@ -75,5 +82,8 @@ pub mod websocket;
 pub mod python;
 
 pub use crate::{
-    config::ZerodhaDataClientConfig, data::ZerodhaDataClient, factories::ZerodhaDataClientFactory,
+    config::{ZerodhaDataClientConfig, ZerodhaExecClientConfig},
+    data::ZerodhaDataClient,
+    execution::ZerodhaExecutionClient,
+    factories::{ZerodhaDataClientFactory, ZerodhaExecutionClientFactory},
 };

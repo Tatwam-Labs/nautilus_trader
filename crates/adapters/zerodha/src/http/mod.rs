@@ -17,9 +17,14 @@
 
 pub mod client;
 pub mod instruments;
+pub mod orders;
 pub mod parse;
 
 pub use crate::http::{
     client::{ZERODHA_HTTP_URL, ZerodhaHttpClient},
+    orders::{
+        KITE_MAX_TAG_LEN, KiteOrder, KiteTrade, ModifyOrderRequest, OrderIdResponse,
+        PlaceOrderRequest,
+    },
     parse::{KiteInstrument, decimals_in, parse_instruments},
 };
