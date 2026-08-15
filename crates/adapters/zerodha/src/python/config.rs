@@ -29,6 +29,14 @@ use crate::config::ZerodhaDataClientConfig;
 impl ZerodhaDataClientConfig {
     /// Configuration for the Zerodha live data client.
     #[new]
+    // Eight arguments, one over clippy's threshold of seven, reached by adding
+    // `replay_frames_path`. `betfair` and `architect_ax` carry the same attribute on their own
+    // `py_new` for the same reason.
+    //
+    // Note this could NOT have been added pre-emptively: at exactly seven arguments the lint does
+    // not fire, and an unfulfilled `#[expect]` is itself a warning. The correct code at 7 args and
+    // the correct code at 8 differ, and nothing warns on the way past.
+    #[expect(clippy::too_many_arguments)]
     #[pyo3(signature = (
         api_key = None,
         access_token = None,
