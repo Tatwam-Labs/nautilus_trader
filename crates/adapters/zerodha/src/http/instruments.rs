@@ -186,7 +186,7 @@ impl KiteInstrument {
     /// expiry, or an option with no strike).
     ///
     /// An `INDICES` row never reaches the `instrument_type` match, so the zero tick size and zero
-    /// lot size those rows carry are not errors — see [`Self::to_index_instrument`].
+    /// lot size those rows carry are not errors — see `Self::to_index_instrument`.
     pub fn to_instrument_any(&self, ts_init: UnixNanos) -> anyhow::Result<InstrumentAny> {
         // `segment` is read FIRST and it wins. 136 rows of the live NSE dump carry
         // `instrument_type = EQ` with `segment = INDICES`; falling through to the match below
