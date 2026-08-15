@@ -26,10 +26,14 @@ script prints it that way rather than as a missing value.
 
 ⚠️ WHAT A GREEN RUN HERE DOES NOT SHOW
 --------------------------------------
-This runs in REPLAY MODE from a captured frame corpus. **No socket is opened and the venue is never
-contacted.** Everything from decode onward is the same code as a live session, but auth, subscribe,
-mode and reconnect are NOT exercised. A green replay is not a green session, and the two must not be
-reported as the same claim.
+This runs in REPLAY MODE from a captured frame corpus. No socket is opened and no tick comes from
+the venue, so auth, subscribe, mode and reconnect are NOT exercised. A green replay is not a green
+session.
+
+⚠️ IT IS NOT AN OFFLINE MODE. The instrument dump IS still fetched over the network — token
+resolution needs it and the corpus carries no instrument definitions. An earlier version of this
+note claimed "the venue is never contacted", which was FALSE: the same run fetched 114,870
+instruments. Replay is an offline TICK SOURCE, nothing more.
 
 Replay exists because MCX is shut for most of the week and a carriage question should not have to
 wait for a market.
@@ -166,8 +170,9 @@ def report(node: LiveNode, probe: OpenInterestProbe, polled: int) -> None:
     print("\n" + "=" * 68)
     print("  OPEN INTEREST — HOP BY HOP")
     print("=" * 68)
-    print("\n  ⚠️  REPLAY MODE: no socket was opened and the venue was never contacted.")
+    print("\n  ⚠️  REPLAY MODE: no socket opened, no tick from the venue.")
     print("      Auth, subscribe, mode and reconnect are NOT exercised by this run.")
+    print("      NOT offline: the instrument dump is still fetched over the network.")
     print(f"      corpus: {CORPUS}")
 
     print("\n  SUBSCRIPTION")

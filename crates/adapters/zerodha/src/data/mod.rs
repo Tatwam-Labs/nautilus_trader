@@ -383,13 +383,44 @@ impl ZerodhaDataClient {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
         get_runtime().spawn(async move {
-            for tick in ticks {
-                if tx.send(tick).is_err() {
-                    log::debug!("Replay receiver dropped; stopping");
-                    return;
+            // ⚠️ LOOPED, AND PACED. The first version sent every tick as fast as it decoded and
+            // then stopped -- which drained the whole corpus DURING `connect()`, a full second
+            // before the trader started and any strategy could subscribe. Measured 2026-08-15:
+            //
+            //     11:41:23  corpus exhausted
+            //     11:41:23  open interest: first item published
+            //     11:41:24  Starting trader...          <- the subscriber appears here
+            //
+            // Everything was published correctly and nothing could receive it. A run like that
+            // reports zero and looks exactly like a wall, which is the worst possible failure for
+            // a measurement whose entire purpose is to tell a wall from a gap.
+            //
+            // Looping also matches what the thing being replayed actually does: a live feed does
+            // not stop after four ticks.
+            let mut cycles = 0usize;
+
+            loop {
+                for tick in &ticks {
+                    if tx.send(tick.clone()).is_err() {
+                        log::info!(
+                            "Zerodha replay: receiver dropped after {cycles} cycle(s); stopping"
+                        );
+                        return;
+                    }
+
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+
+                cycles += 1;
+
+                if cycles == 1 {
+                    log::info!(
+                        "Zerodha replay: first pass complete, looping the corpus every {}ms/tick \
+                         until the node stops",
+                        200,
+                    );
                 }
             }
-            log::info!("Zerodha replay: corpus exhausted");
         });
 
         Ok(rx)
@@ -503,8 +534,11 @@ impl DataClient for ZerodhaDataClient {
 
         let mut ticks = if let Some(path) = self.config.replay_frames_path.clone() {
             log::warn!(
-                "Zerodha data client {} is in REPLAY MODE from {path} -- NO SOCKET IS OPEN and no \
-                 venue is contacted. Ticks are decoded from a captured corpus.",
+                "Zerodha data client {} is in REPLAY MODE from {path} -- NO SOCKET IS OPENED and \
+                 no tick comes from the venue; they are decoded from a captured corpus. \
+                 ⚠️ THE INSTRUMENT DUMP IS STILL FETCHED OVER THE NETWORK, because token \
+                 resolution needs it and the corpus carries no instrument definitions. So this is \
+                 not an offline mode: it is an offline TICK SOURCE.",
                 self.client_id,
             );
             Self::replay_tick_stream(&path)?
