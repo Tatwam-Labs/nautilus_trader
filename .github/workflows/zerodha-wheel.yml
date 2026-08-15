@@ -17,8 +17,17 @@ name: zerodha-wheel
 # at-base:2.0.0rc3, :141 python:3.14-slim); the deployed image predates that
 # switch, so the running artefact and the build recipe had already diverged.
 #
-# HOST: ubuntu-latest is x86_64 NATIVELY — no QEMU, and x86_64 matches prod
-# hardware (13.202.251.163 uname -m = x86_64). Only the interpreter moved.
+# HOST: every target builds on a NATIVE runner. No QEMU anywhere — this
+# workspace has a recorded history of QEMU cross-builds running out of memory
+# on fat LTO, and a release build is exactly where that bites.
+#
+# THREE TARGETS, because three different machines run this artefact:
+#   linux/x86_64  — prod (13.202.251.163, uname -m = x86_64)
+#   linux/aarch64 — LOCAL DOCKER on Apple Silicon. Docker on a Mac runs LINUX
+#                   containers, so this is linux/arm64 and NOT the macOS wheel;
+#                   they are different artefacts and neither substitutes.
+#   macos/arm64   — running directly on the Mac mini, outside Docker, which is
+#                   how the adapter is exercised against a live venue.
 
 on:
   # Push trigger as well as dispatch: a workflow_dispatch-only file on a
@@ -43,7 +52,22 @@ env:
 
 jobs:
   wheel:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # fail-fast OFF: one target failing must not hide whether the other two
+      # are healthy. A partial result is still information; a cancelled one is not.
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-latest
+            docker_platform: linux/amd64
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+            docker_platform: linux/arm64
+          - target: macos-arm64
+            runner: macos-14
+            docker_platform: ""   # no container acceptance on macOS; see the step
     # A git-ref pin forces a SOURCE build of nautilus — prebuilt wheels do not
     # apply here — so this is long by nature, not by accident.
     timeout-minutes: 300
@@ -60,6 +84,8 @@ jobs:
           echo "sha=$(git rev-parse HEAD)"
           echo "branch=$(git rev-parse --abbrev-ref HEAD)"
           echo "runner_arch=$(uname -m)"
+          echo "target=${{ matrix.target }}"
+          echo "runner=${{ matrix.runner }}"
 
       # A nautilus source build fills the default runner disk.
       - name: Free disk space
@@ -131,13 +157,93 @@ jobs:
           assert names, "zerodha package imported but exports NOTHING"
           print("ACCEPTANCE: OK")
           PY
-          docker run --rm --platform linux/amd64 \
-            -v "$PWD/dist":/dist:ro -v /tmp/accept.py:/accept.py:ro \
-            python:3.14-slim bash -lc \
-              "pip install --quiet /dist/*.whl && python /accept.py"
+          if [ -n "${{ matrix.docker_platform }}" ]; then
+            # Linux targets: run in a CLEAN container, which also proves the
+            # manylinux tag is satisfiable somewhere other than the builder.
+            docker run --rm --platform ${{ matrix.docker_platform }} \
+              -v "$PWD/dist":/dist:ro -v /tmp/accept.py:/accept.py:ro \
+              python:3.14-slim bash -lc \
+                "pip install --quiet /dist/*.whl && python /accept.py"
+          else
+            # macOS: no container. A throwaway venv is the closest equivalent —
+            # it still proves the wheel INSTALLS and EXPORTS, which is the claim.
+            python -m venv /tmp/accept-venv
+            /tmp/accept-venv/bin/pip install --quiet dist/*.whl
+            /tmp/accept-venv/bin/python /tmp/accept.py
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zerodha-wheel-cp314-manylinux-x86_64
+          name: zerodha-wheel-${{ matrix.target }}
           path: dist/*.whl
           if-no-files-found: error
+
+  # ── PUBLISH ────────────────────────────────────────────────────────────────
+  # Runs only if ALL THREE targets pass. A partial publish is worse than none:
+  # it produces a release where one architecture is silently missing, and the
+  # machine that needs the missing one fails at install time rather than here.
+  publish:
+    needs: wheel
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect and prove all three arrived
+        run: |
+          set -euo pipefail
+          mkdir -p dist && find artifacts -name '*.whl' -exec mv {} dist/ \;
+          ls -la dist/
+          # ⚠️ ASSERT, do not assume. `needs: wheel` succeeding means the JOBS
+          # passed; it does not prove three FILES landed here. Those are
+          # different claims and the second is the one that matters.
+          n=$(ls dist/*.whl | wc -l | tr -d ' ')
+          [ "$n" -eq 3 ] || { echo "expected 3 wheels, found $n"; exit 1; }
+
+      - name: Publish the per-SHA release (the one to PIN)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse --short HEAD)
+          gh release create "wheel-${SHA}" dist/*.whl \
+            --title "Zerodha adapter wheels (${SHA})" \
+            --notes "Built from \`$(git rev-parse --abbrev-ref HEAD)\` at \`${SHA}\` with \`maturin build --release\`.
+
+          cp314. Three targets: linux x86_64, linux aarch64, macOS arm64.
+
+          **PIN THIS URL, not \`wheel-latest\`.** A stable URL plus Docker layer caching means a
+          rebuilt image silently reuses the cached download and keeps running the old wheel. A
+          SHA in the URL changes when the wheel changes, so the cache invalidates *because*
+          something changed — which is the behaviour you want.
+
+          Verify what you are actually running: the node startup banner prints \`git_commit\`." \
+            --prerelease
+
+      - name: Move the `wheel-latest` pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA=$(git rev-parse --short HEAD)
+          # Deleted and recreated rather than edited: `gh release upload --clobber`
+          # leaves assets from a PREVIOUS run in place if this run produced fewer,
+          # so `latest` could end up a mix of two builds. Recreating cannot.
+          gh release delete wheel-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create wheel-latest dist/*.whl \
+            --title "Zerodha adapter wheels — LATEST (${SHA})" \
+            --notes "⚠️ **A MOVING POINTER. Currently \`${SHA}\`.**
+
+          For convenience — a \`curl\` that always fetches the newest build.
+
+          **Do NOT pin this in a Dockerfile.** The URL never changes, so Docker reuses its cached
+          layer and you keep the old wheel with nothing to tell you. Pin \`wheel-<sha>\` instead." \
+            --prerelease
