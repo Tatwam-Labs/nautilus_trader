@@ -180,6 +180,13 @@ fn test_factory_rejects_a_config_of_the_wrong_type() {
 // client contacts the venue at all must never become write-only without something noticing.
 #[rstest]
 fn test_replay_frames_path_survives_the_round_trip_to_python_and_back() {
+    // EXPLICIT, and not because the other tests happen to do it first. `auto-initialize` is off
+    // across this workspace, so the interpreter must be started -- and once ANY test in the binary
+    // starts it, it stays up for the process. Relying on that would make this test's result depend
+    // on execution ORDER, which is not deterministic: it would pass or fail intermittently
+    // depending on which test ran first. An order-dependent test is worse than a failing one.
+    Python::initialize();
+
     Python::attach(|py| {
         register_zerodha_python_module(py);
 
