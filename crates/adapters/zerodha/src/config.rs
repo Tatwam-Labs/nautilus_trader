@@ -68,6 +68,21 @@ pub struct ZerodhaDataClientConfig {
     /// carries no tokens — so this is the sole source and not a cache warmer.
     #[builder(default = 60)]
     pub update_instruments_interval_mins: u64,
+    /// A captured frame corpus to replay INSTEAD of opening a socket.
+    ///
+    /// ⚠️ **When set, no socket is opened and the venue is never contacted.** Ticks are decoded
+    /// from the file by the same decoder the live feed uses, so everything from decode onward —
+    /// token resolution, quote/trade/open-interest mapping, publication to the engine — is the
+    /// identical code path.
+    ///
+    /// What it therefore CANNOT tell you: anything about auth, subscribe, mode, reconnect or the
+    /// transport. A green replay is not a green session, and reporting one as the other would be
+    /// the same error as reporting a passing test suite as a working feature.
+    ///
+    /// Exists because MCX is shut for most of the week and a carriage question should not have to
+    /// wait for a market.
+    #[builder(default)]
+    pub replay_frames_path: Option<String>,
 }
 
 #[cfg(feature = "python")]
@@ -95,6 +110,11 @@ impl Debug for ZerodhaDataClientConfig {
                 "update_instruments_interval_mins",
                 &self.update_instruments_interval_mins,
             )
+            // Shown in full and NOT redacted: it is a local file path, carries no secret, and is
+            // the single field that changes whether this client contacts the venue at all. A
+            // diagnostic that omitted it would let someone read a Debug dump of a replaying client
+            // and conclude it was live.
+            .field("replay_frames_path", &self.replay_frames_path)
             .finish()
     }
 }
