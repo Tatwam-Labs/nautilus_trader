@@ -104,8 +104,20 @@ class OpenInterestProbe(Strategy):
             self.log.error(f"Could not subscribe to the OI custom type: {self.subscribe_error}")
 
     def on_data(self, data) -> None:
-        """Receives every custom data item routed to this strategy."""
-        name = type(data).__name__
+        """Receives every custom data item routed to this strategy.
+
+        ⚠️ THE PAYLOAD ARRIVES WRAPPED. Python receives a `CustomData` whose `.data` holds the
+        concrete type — NOT the concrete type itself. An earlier version of this method matched on
+        `type(data).__name__` and therefore counted 98 genuine open-interest items as "other",
+        reporting **0 received** while the adapter had published 149.
+
+        That zero was indistinguishable from the wall this harness exists to detect, and it would
+        have been reported as one. It was caught only because the same method counted the
+        non-matching items instead of discarding them — a count of what you are NOT looking for is
+        what separates "nothing arrived" from "something arrived and I did not recognise it".
+        """
+        payload = getattr(data, "data", data)
+        name = type(payload).__name__
 
         if "OpenInterest" not in name:
             self.other_data += 1
@@ -113,15 +125,15 @@ class OpenInterestProbe(Strategy):
 
         self.oi_received += 1
 
-        if len(self.samples) < 5:
+        if len(self.samples) < 3:
             self.samples.append(
                 {
-                    "type": name,
-                    "instrument_id": str(getattr(data, "instrument_id", "?")),
-                    "open_interest": getattr(data, "open_interest", None),
-                    "day_high": getattr(data, "open_interest_day_high", None),
-                    "day_low": getattr(data, "open_interest_day_low", None),
-                    "ts_event": getattr(data, "ts_event", None),
+                    "wrapper": type(data).__name__,
+                    "payload": name,
+                    "instrument_id": str(getattr(payload, "instrument_id", "?")),
+                    "open_interest": getattr(payload, "open_interest", None),
+                    "day_high": getattr(payload, "open_interest_day_high", None),
+                    "day_low": getattr(payload, "open_interest_day_low", None),
                 }
             )
 

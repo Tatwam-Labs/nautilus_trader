@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod factories;
+pub mod open_interest;
 
 use nautilus_common::factories::{ClientConfig, DataClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
@@ -72,6 +73,10 @@ fn extract_zerodha_data_config(
 pub fn zerodha(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::enums::ZerodhaSegment>()?;
     m.add_class::<crate::common::enums::ZerodhaTickMode>()?;
+    // Registered so a strategy can name the type; the getters live in
+    // `python::open_interest`. Without the class the payload still ARRIVES -- it is
+    // reachable through `CustomData.data` -- but it cannot be imported or isinstance'd.
+    m.add_class::<crate::data::open_interest::ZerodhaOpenInterest>()?;
     m.add_class::<ZerodhaDataClientConfig>()?;
     m.add_class::<ZerodhaDataClientFactory>()?;
 
