@@ -98,7 +98,6 @@ use nautilus_model::identifiers::{ClientId, InstrumentId, Venue};
 
 use crate::{
     common::{
-        consts::NSE_VENUE,
         credential::{ZerodhaCredential, credential_env_vars},
         enums::ZerodhaTickMode,
         instruments::InstrumentRegistry,
@@ -291,14 +290,6 @@ impl ZerodhaDataClient {
         websocket.subscribe(ZerodhaTickMode::Full, vec![token])
     }
 
-    /// Returns the primary venue for this client.
-    ///
-    /// Zerodha brokers both NSE and BSE through one connection, so the venue on the client is the
-    /// primary one and per-instrument venues come from the instrument definitions.
-    #[must_use]
-    pub fn venue(&self) -> Venue {
-        *NSE_VENUE
-    }
 }
 
 #[async_trait(?Send)]
@@ -307,8 +298,42 @@ impl DataClient for ZerodhaDataClient {
         self.client_id
     }
 
+    /// Returns `None`: Zerodha is a **broker, not an exchange**, so this client has no single venue.
+    ///
+    /// ⚠️ UNBUILT AND UNVERIFIED — edited 2026-08-14 late, deliberately not compiled or run. Verify
+    /// before trusting: a live subscribe on MCX must still resolve, and a node configured WITHOUT
+    /// `RoutingConfig` must now fail CONSISTENTLY rather than working for NSE alone.
+    ///
+    /// This previously returned `Some(NSE)`. The engine registers that venue in its routing map at
+    /// `LiveNodeBuilder` build time, so ONE of the nine exchanges routed by venue and the other
+    /// eight did not: an MCX subscription failed with
+    /// `no client found for client_id=None, venue=Some("MCX")` while an NSE one worked. A claim of
+    /// a single venue is not merely cosmetic here — it is what the routing map is built from.
+    ///
+    /// Returning `None` means venue routing must be declared explicitly, via `RoutingConfig` on
+    /// `add_data_client` (which calls `DataEngine::register_venue_routing` per venue) or by naming
+    /// the client on each subscription. That is a REAL behaviour change for any caller that relied
+    /// on the accidental NSE registration — and the loss is deliberate: failing for every venue is
+    /// better than working for one, because selective success is what made this take an evening to
+    /// find.
+    ///
+    /// ⭐ THE EXECUTION SIDE HAS THE SAME DEFECT AND CANNOT FIX IT FROM INSIDE THE CLIENT.
+    /// `ExecutionEngine::register_client` also inserts `client.venue()` into a routing map, and
+    /// `ExecutionClient::venue` returns a bare `Venue` with no way to decline. So a Zerodha exec
+    /// client is filed under NSE alone, exactly as this one was.
+    ///
+    /// Its `handles_order_venue` override is NECESSARY BUT NOT SUFFICIENT, and the distinction is
+    /// easy to get wrong — I did. That method is a **veto, not a route**: it can only reject an
+    /// order that already reached the client. An NFO or MCX order finds no client in the routing
+    /// map and never reaches the method at all. Two distinct failures — `ClientVenueMismatch` if
+    /// the override is missing, silent non-routing if it is present — and neither is "it works".
+    ///
+    /// The exec side's remedy is therefore at the NODE, not in the client: register it as the
+    /// DEFAULT execution client (correct when Zerodha is the only broker in the node), or call
+    /// `register_venue_routing` once per exchange traded. Do not attempt to make
+    /// `ExecutionClient::venue` return nothing — the trait does not permit it.
     fn venue(&self) -> Option<Venue> {
-        Some(Self::venue(self))
+        None
     }
 
     fn start(&mut self) -> anyhow::Result<()> {
@@ -391,7 +416,7 @@ impl DataClient for ZerodhaDataClient {
             while let Some(tick) = ticks.recv().await {
                 received += 1;
 
-                if received == 1 || received % 25 == 0 {
+                if received == 1 || received.is_multiple_of(25) {
                     log::info!(
                         "Zerodha tick path: {received} received, {published} published as quotes, \
                          {unmapped} with no registered instrument"
