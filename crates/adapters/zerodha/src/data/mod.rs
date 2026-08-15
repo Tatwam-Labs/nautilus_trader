@@ -661,6 +661,22 @@ impl DataClient for ZerodhaDataClient {
                 // Only the 184-byte full packet carries OI, so `tick.oi` is `None` for ltp and
                 // quote-mode packets and for index packets. Absent is the ordinary case, not a
                 // failure, so it is not logged — it would fire on most ticks for most instruments.
+                // ⚠️ A ZERO HERE IS NOT KNOWN TO BE WRONG, AND NOT KNOWN TO BE RIGHT.
+                //
+                // In the 2026-08-14 MCX corpus, `MCXMETLDEX26AUGFUT` reads OI 0 while
+                // `CRUDEOIL26AUGFUT` (7913) and `CRUDEOILM26AUGFUT` (24627) read non-zero from the
+                // SAME frame, the same offsets and this same code. Two of three non-zero rules out
+                // a systematic decode fault, so do not treat a 0 as evidence of a bug here.
+                //
+                // Whether 0 is the TRUE open interest for that contract is UNVERIFIED. It is a
+                // thinly-traded future on a metals index, which plausibly has no open positions —
+                // but plausible is not measured and there is no venue-side figure to compare
+                // against. An earlier note asserted "it is an index and has no OI by nature": that
+                // was WRONG (`type=FUT`, `segment=MCX-FUT` — a future ON an index), and it would
+                // have stopped the next reader from checking.
+                //
+                // Do not remove this note by assuming either answer. One live subscription settles
+                // it.
                 if let Some(open_interest) = tick.oi {
                     let oi = ZerodhaOpenInterest::new(
                         details.instrument_id,

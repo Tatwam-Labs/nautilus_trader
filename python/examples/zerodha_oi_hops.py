@@ -120,6 +120,17 @@ class OpenInterestProbe(Strategy):
         name = type(payload).__name__
 
         if "OpenInterest" not in name:
+            # ⚠️ COUNTED, NOT DISCARDED — and this is load-bearing, not bookkeeping.
+            #
+            # This counter is the only thing that distinguishes "nothing arrived" from "something
+            # arrived and I did not recognise it". It has already earned itself once: an earlier
+            # version matched on `type(data).__name__`, which is `CustomData` rather than the
+            # payload class, and reported 0 RECEIVED while the adapter had published 149. That zero
+            # is indistinguishable from the wall this harness exists to detect, and it was caught
+            # ONLY because this line said 98 instead of 0.
+            #
+            # An instrument that filters must report what it filtered OUT, or its zero is
+            # uninterpretable. Do not "simplify" this to a bare `return`.
             self.other_data += 1
             return
 
