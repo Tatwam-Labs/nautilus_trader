@@ -141,6 +141,39 @@ jobs:
             || echo "NOTE: extension-module route absent; relying on the direct dependency feature"
           echo "zerodha python feature: WIRED"
 
+      # ⚠️ WHY: our wheel self-reports the bare upstream version `2.0.0rc3`, and PyPI ALREADY
+      # carries 2.0.0rc1 and 2.0.0rc2 — so upstream's own 2.0.0rc3 is next in that sequence.
+      # Once it lands, that string names TWO different binaries: theirs (no Zerodha adapter)
+      # and ours (with it). Nothing in the version tells them apart.
+      #
+      # A PEP 440 LOCAL VERSION IDENTIFIER fixes this and is exactly what they exist for.
+      # Precedent: torch ships `torch-2.1.0+cu118-...whl`.
+      #   * a local version CANNOT be uploaded to PyPI, so ours can never be shadowed there
+      #   * `==2.0.0rc3` still matches it (PEP 440 ignores local labels unless the specifier
+      #     names one), so AT's pin keeps working unchanged
+      #   * `==2.0.0rc3+tatwam.zerodha.<sha>` pins OUR exact build when that is wanted
+      #   * `pip freeze` in a container now names the source commit
+      - name: Stamp a PEP 440 local version identifier
+        working-directory: ${{ env.PACKAGE_DIR }}
+        run: |
+          set -eux
+          SHORT=$(git rev-parse --short=7 "${GITHUB_SHA}")
+          python3 - "$SHORT" <<'STAMP'
+          import re, sys
+          short = sys.argv[1]
+          p = "pyproject.toml"
+          s = open(p).read()
+          m = re.search(r'^version = "([^"]+)"$', s, re.M)
+          assert m, "version line not found in pyproject.toml — layout changed, FIX THIS"
+          base = m.group(1).split("+")[0]
+          new = f"{base}+tatwam.zerodha.{short}"
+          s2 = s.replace(m.group(0), f'version = "{new}"', 1)
+          assert s2 != s, "replacement was a no-op"
+          open(p, "w").write(s2)
+          print(f"stamped: {m.group(1)} -> {new}")
+          STAMP
+          grep -n '^version = ' pyproject.toml
+
       - name: Build the wheel
         working-directory: ${{ env.PACKAGE_DIR }}
         run: maturin build --release --out ../dist
