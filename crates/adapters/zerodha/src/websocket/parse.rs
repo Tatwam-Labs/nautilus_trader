@@ -36,8 +36,8 @@
 //! | bytes | layout                                          |
 //! |-------|-------------------------------------------------|
 //! | 8     | LTP: token + last price                          |
-//! | 28    | index quote: no traded quantities. Carries an UNREAD net-change at [24:28] |
-//! | 32    | index full: index quote + exchange timestamp. Same unread [24:28] |
+//! | 28    | index quote: no traded quantities. Carries an UNREAD net-change at `24:28` |
+//! | 32    | index full: index quote + exchange timestamp. Same unread `24:28` |
 //! | 44    | quote: traded quantities + OHLC                  |
 //! | 184   | full: quote + timestamps + open interest + depth |
 //!
@@ -208,7 +208,7 @@ impl PacketLayout {
 /// Returns [`ZerodhaWsError::UnknownPacketLength`] for a length with no documented layout.
 ///
 /// [`ZerodhaWsError::Truncated`] is **not** reachable from this function: the length is resolved to
-/// a [`PacketLayout`] first, and every layout's field offsets are within its own length, so no read
+/// a `PacketLayout` first, and every layout's field offsets are within its own length, so no read
 /// below can run past the end. The reads stay fallible so that a future layout added with wrong
 /// offsets fails loudly rather than reading adjacent bytes. Frame-level truncation — a declared
 /// packet length running past the end of the frame — is caught earlier, by [`split_packets`].
