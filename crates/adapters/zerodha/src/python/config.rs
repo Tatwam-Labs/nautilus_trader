@@ -37,6 +37,7 @@ impl ZerodhaDataClientConfig {
         http_timeout_secs = None,
         ws_timeout_secs = None,
         update_instruments_interval_mins = None,
+        replay_frames_path = None,
     ))]
     fn py_new(
         api_key: Option<String>,

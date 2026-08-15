@@ -162,3 +162,73 @@ fn test_factory_rejects_a_config_of_the_wrong_type() {
         "the error should name the expected config type so the caller can fix it; was: {err}",
     );
 }
+
+// ⭐ THE GUARD FOR A FIELD THAT MUST REACH FIVE PLACES AT ONCE.
+//
+// Adding one config field on this branch required it to land in FIVE parallel sites, and three
+// separate one-line commits were needed because each omission was invisible to the gate that had
+// just passed:
+//
+//   struct field            -> `#[builder(default)]` rejected the bare form on an Option
+//   `Self { .. }` literal   -> E0063, only under `--features python`
+//   `#[pyo3(signature)]`    -> "missing signature entry", only under `--features python`
+//   `impl_pyo3_config_getters!`  -> ⚠️ NO ERROR AT ALL. Silently unreadable.
+//   the hand-written `Debug`     -> no error either; silently absent from diagnostics
+//
+// The first three now fail loudly, because `--features python` is part of the standard check set.
+// **The last two fail SILENTLY**, and this test exists for them: a field that decides whether the
+// client contacts the venue at all must never become write-only without something noticing.
+#[rstest]
+fn test_replay_frames_path_survives_the_round_trip_to_python_and_back() {
+    pyo3::prepare_freethreaded_python();
+
+    Python::attach(|py| {
+        register_zerodha_python_module(py);
+
+        let config = Py::new(
+            py,
+            ZerodhaDataClientConfig {
+                replay_frames_path: Some("corpus.json".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("config into Python");
+
+        // The getter half. A missing entry in `impl_pyo3_config_getters!` compiles cleanly and
+        // leaves the attribute absent, so this asserts on the VALUE rather than on `hasattr` —
+        // absent and present-but-wrong are different bugs and should not share an assertion.
+        let readable: Option<String> = config
+            .getattr(py, "replay_frames_path")
+            .expect("replay_frames_path must be READABLE from Python: a field that diverts the \
+                     client away from the venue must never be write-only")
+            .extract(py)
+            .expect("and it must extract as Option<String>");
+
+        assert_eq!(
+            readable.as_deref(),
+            Some("corpus.json"),
+            "the value must survive the round trip, not merely exist",
+        );
+
+        // The constructor half. A missing `#[pyo3(signature)]` entry is a compile error, but a
+        // parameter accepted and then DROPPED on the floor is not — so this checks the value
+        // actually reached the struct rather than that the call was accepted.
+        let built = py
+            .import("nautilus_trader.adapters.zerodha")
+            .and_then(|m| m.getattr("ZerodhaDataClientConfig"))
+            .and_then(|c| c.call1((py.None(), py.None(), py.None(), py.None(), py.None(), py.None(), py.None(), "from-kwarg.json")))
+            .expect("the constructor must accept replay_frames_path positionally");
+
+        let round_tripped: Option<String> = built
+            .getattr("replay_frames_path")
+            .expect("and expose it back")
+            .extract()
+            .expect("as Option<String>");
+
+        assert_eq!(
+            round_tripped.as_deref(),
+            Some("from-kwarg.json"),
+            "a constructor that accepts the argument and discards it would pass every compile gate",
+        );
+    });
+}
