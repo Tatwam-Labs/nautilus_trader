@@ -261,8 +261,12 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(git rev-parse --short HEAD)
+          # NOTE: deliberately NOT the github.sha env var — on a workflow_dispatch
+          # that is the tip of the branch the WORKFLOW FILE came from
+          # (ci/zerodha-wheel), not the ref being built.
+          FULL_SHA=$(git rev-parse HEAD)
           gh release create "wheel-${SHA}" dist/*.whl \
-            --target "${GITHUB_SHA}" \
+            --target "${FULL_SHA}" \
             --title "Zerodha adapter wheels (${SHA})" \
             --notes "Built from \`$(git rev-parse --abbrev-ref HEAD)\` at \`${SHA}\` with \`maturin build --release\`.
 
@@ -282,12 +286,16 @@ jobs:
         run: |
           set -euo pipefail
           SHA=$(git rev-parse --short HEAD)
+          # NOTE: deliberately NOT the github.sha env var — on a workflow_dispatch
+          # that is the tip of the branch the WORKFLOW FILE came from
+          # (ci/zerodha-wheel), not the ref being built.
+          FULL_SHA=$(git rev-parse HEAD)
           # Deleted and recreated rather than edited: `gh release upload --clobber`
           # leaves assets from a PREVIOUS run in place if this run produced fewer,
           # so `latest` could end up a mix of two builds. Recreating cannot.
           gh release delete wheel-latest --yes --cleanup-tag 2>/dev/null || true
           gh release create wheel-latest dist/*.whl \
-            --target "${GITHUB_SHA}" \
+            --target "${FULL_SHA}" \
             --title "Zerodha adapter wheels — LATEST (${SHA})" \
             --notes "⚠️ **A MOVING POINTER. Currently \`${SHA}\`.**
 
