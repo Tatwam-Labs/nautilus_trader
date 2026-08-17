@@ -157,7 +157,10 @@ jobs:
         working-directory: ${{ env.PACKAGE_DIR }}
         run: |
           set -eux
-          SHORT=$(git rev-parse --short=7 "${GITHUB_SHA}")
+          # ⛔ HEAD, not the github.sha env var. On a workflow_dispatch that variable is the
+          # tip of the branch the WORKFLOW FILE came from, so the stamp would name a commit
+          # the wheel was NOT built from — defeating the whole point of the stamp.
+          SHORT=$(git rev-parse --short=7 HEAD)
           python3 - "$SHORT" <<'STAMP'
           import re, sys
           short = sys.argv[1]
