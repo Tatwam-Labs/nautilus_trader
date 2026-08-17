@@ -40,7 +40,7 @@ on:
       ref:
         description: Branch or SHA to build
         required: false
-        default: feat/zerodha-data-client
+        default: feat/zerodha-adapter
 
 env:
   PACKAGE_DIR: python
