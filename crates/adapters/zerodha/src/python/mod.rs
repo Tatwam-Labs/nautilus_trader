@@ -19,13 +19,13 @@ pub mod config;
 pub mod factories;
 pub mod open_interest;
 
-use nautilus_common::factories::{ClientConfig, DataClientFactory};
+use nautilus_common::factories::{ClientConfig, DataClientFactory, ExecutionClientFactory};
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
 use nautilus_system::get_global_pyo3_registry;
 use pyo3::prelude::*;
 
 use crate::{
-    common::consts::ZERODHA, config::ZerodhaDataClientConfig, factories::ZerodhaDataClientFactory,
+    common::consts::ZERODHA, config::ZerodhaDataClientConfig, ZerodhaExecClientConfig, factories::ZerodhaDataClientFactory, ZerodhaExecutionClientFactory,
 };
 
 #[expect(clippy::needless_pass_by_value)]
@@ -69,6 +69,29 @@ fn extract_zerodha_data_config(
 /// # Errors
 ///
 /// Returns an error if any bindings fail to register with the Python module.
+#[expect(clippy::needless_pass_by_value)]
+fn extract_zerodha_exec_factory(
+    py: Python<'_>,
+    factory: Py<PyAny>,
+) -> PyResult<Box<dyn ExecutionClientFactory>> {
+    match factory.extract::<ZerodhaExecutionClientFactory>(py) {
+        Ok(f) => Ok(Box::new(f)),
+        Err(e) => Err(to_pyvalue_err(format!(
+            "Failed to extract ZerodhaExecutionClientFactory: {e}"
+        ))),
+    }
+}
+
+#[expect(clippy::needless_pass_by_value)]
+fn extract_zerodha_exec_config(py: Python<'_>, config: Py<PyAny>) -> PyResult<Box<dyn ClientConfig>> {
+    match config.extract::<ZerodhaExecClientConfig>(py) {
+        Ok(c) => Ok(Box::new(c)),
+        Err(e) => Err(to_pyvalue_err(format!(
+            "Failed to extract ZerodhaExecClientConfig: {e}"
+        ))),
+    }
+}
+
 #[pymodule]
 pub fn zerodha(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::common::enums::ZerodhaSegment>()?;
@@ -79,6 +102,13 @@ pub fn zerodha(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<crate::data::open_interest::ZerodhaOpenInterest>()?;
     m.add_class::<ZerodhaDataClientConfig>()?;
     m.add_class::<ZerodhaDataClientFactory>()?;
+    // ⛔ EXEC SURFACE. Present so the client can be TESTED from Python, which is ADR-098's own
+    // precondition for moving paper execution to Nautilus. It is NOT clearance to wire it into
+    // the paper rail — that ADR still binds paper fills to the AT-authored actors.
+    m.add_class::<crate::common::enums::ZerodhaProduct>()?;
+    m.add_class::<crate::common::enums::ZerodhaVariety>()?;
+    m.add_class::<ZerodhaExecClientConfig>()?;
+    m.add_class::<ZerodhaExecutionClientFactory>()?;
 
     let registry = get_global_pyo3_registry();
 
@@ -96,6 +126,23 @@ pub fn zerodha(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     ) {
         return Err(to_pyruntime_err(format!(
             "Failed to register Zerodha data config extractor: {e}"
+        )));
+    }
+
+    if let Err(e) =
+        registry.register_exec_factory_extractor(ZERODHA.to_string(), extract_zerodha_exec_factory)
+    {
+        return Err(to_pyruntime_err(format!(
+            "Failed to register Zerodha exec factory extractor: {e}"
+        )));
+    }
+
+    if let Err(e) = registry.register_config_extractor(
+        "ZerodhaExecClientConfig".to_string(),
+        extract_zerodha_exec_config,
+    ) {
+        return Err(to_pyruntime_err(format!(
+            "Failed to register Zerodha exec config extractor: {e}"
         )));
     }
 

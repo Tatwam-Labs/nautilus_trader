@@ -143,6 +143,14 @@ impl DataClientFactory for ZerodhaDataClientFactory {
 /// at once, and which one a given node models is the operator's decision. Putting it on the factory
 /// keeps it out of a serialised config where it would look venue-derived.
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.zerodha", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.zerodha")
+)]
 pub struct ZerodhaExecutionClientFactory {
     trader_id: TraderId,
     account_id: AccountId,

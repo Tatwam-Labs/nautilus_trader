@@ -15,9 +15,16 @@
 
 //! Python bindings for Zerodha factory types.
 
+use nautilus_model::{
+    enums::AccountType,
+    identifiers::{AccountId, TraderId},
+};
 use pyo3::prelude::*;
 
-use crate::{common::consts::ZERODHA, factories::ZerodhaDataClientFactory};
+use crate::{
+    common::consts::ZERODHA,
+    factories::{ZerodhaDataClientFactory, ZerodhaExecutionClientFactory},
+};
 
 /// `name` is a METHOD, not a getter — that is a requirement, not a style choice.
 ///
@@ -32,6 +39,29 @@ impl ZerodhaDataClientFactory {
     #[new]
     fn py_new() -> Self {
         Self::new()
+    }
+
+    #[pyo3(name = "name")]
+    fn py_name(&self) -> &'static str {
+        ZERODHA
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl ZerodhaExecutionClientFactory {
+    /// Factory for creating Zerodha execution clients.
+    ///
+    /// Unlike the data factory this is not a unit type. `ExecutionClientFactory::create` receives
+    /// only `(name, config, cache)` — no trader or account identity — so those arrive here and are
+    /// held until `create` is called. `bybit` carries the same shape for the same reason.
+    ///
+    /// `account_type` sits on the factory rather than the config because it is a Nautilus concept
+    /// with no Zerodha field behind it: an Indian broker account holds cash and margin at once, and
+    /// which one a node models is the operator's choice, not something derived from the venue.
+    #[new]
+    fn py_new(trader_id: TraderId, account_id: AccountId, account_type: AccountType) -> Self {
+        Self::new(trader_id, account_id, account_type)
     }
 
     #[pyo3(name = "name")]
