@@ -138,6 +138,27 @@ pub fn decimals_in(text: &str) -> u8 {
 /// from "the schema changed".
 ///
 /// # Errors
+/// Strips RFC 4180 quoting from one CSV field, after trimming whitespace.
+///
+/// Kite quotes the `name` column on 106,683 of 114,851 rows. `.trim()` removes whitespace and
+/// leaves the quotes, so an unquoted read yields `"NIFTY"` — **six characters, two of them
+/// quotes** — which is non-empty and ASCII and therefore passes every downstream guard before
+/// surfacing as `OptionContract.underlying`. A consumer filtering `underlying == "NIFTY"` then
+/// rejects the entire chain and logs `registered 0 contracts`, which reads as *nothing to trade*.
+///
+/// Applied to every text field, not only `name`. Only `name` is quoted in today's dump, so the
+/// rest are behaviour-neutral — and that is the point: the narrow fix leaves the identical trap
+/// armed for the day Kite starts quoting `tradingsymbol`.
+///
+/// A doubled `""` inside a quoted field is the RFC 4180 escape for one literal quote.
+fn unquote(field: &str) -> String {
+    let trimmed = field.trim();
+    match trimmed.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        Some(inner) => inner.replace("\"\"", "\""),
+        None => trimmed.to_string(),
+    }
+}
+
 ///
 /// Returns an error if the header row is absent or does not carry the columns this parser needs.
 pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usize)> {
@@ -186,9 +207,20 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         //
         // The split is naive: it does not honour CSV quoting. **106,683 of the 114,851 rows in the
         // live dump are quoted** (measured 2026-08-14 across all nine exchanges), every one of them
-        // in `name` — a column this parser does not read — and **zero rows currently contain a
-        // comma inside those quotes**. So the naive split is correct today, by luck rather than by
-        // design.
+        // in `name` — and **zero rows currently contain a comma inside those quotes**. So the
+        // naive split is correct today, by luck rather than by design.
+        //
+        // 🔴 THIS COMMENT ONCE READ "`name` — a column this parser does not read". THAT WAS FALSE
+        // IN THE COMMIT THAT WROTE IT: `name:` was already read twenty lines below, and it is the
+        // sole source of `OptionContract.underlying`. The MEASUREMENT was right and the PREMISE
+        // drawn from it was wrong, so the quoting question was waved off — and the quotes reached
+        // a running paper node as `underlying == "\"NIFTY\""`, where an `== "NIFTY"` filter
+        // discarded all 1,726 contracts and logged `registered 0 NIFTY option contracts`, which
+        // reads as "nothing to trade today". Found by AT-V0.4-Code 2026-08-18.
+        //
+        // ⚠️ A FALSE REASSURANCE IS WORSE THAN NO COMMENT. No comment leaves a reader curious;
+        // "a column this parser does not read" retired the question for four days. Before writing
+        // that something is unused, grep for it.
         //
         // The day a `name` does contain a comma, that row gains a field and **everything after it
         // shifts**: `tick_size` would be read from `lot_size`, `instrument_type` from `segment`.
@@ -208,11 +240,11 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         let parsed = (|| -> Option<KiteInstrument> {
             Some(KiteInstrument {
                 instrument_token: fields[i_token].trim().parse().ok()?,
-                tradingsymbol: fields[i_symbol].trim().to_string(),
-                name: fields[i_name].trim().to_string(),
-                exchange: fields[i_exchange].trim().to_string(),
-                instrument_type: fields[i_type].trim().to_string(),
-                segment: fields[i_seg].trim().to_string(),
+                tradingsymbol: unquote(fields[i_symbol]),
+                name: unquote(fields[i_name]),
+                exchange: unquote(fields[i_exchange]),
+                instrument_type: unquote(fields[i_type]),
+                segment: unquote(fields[i_seg]),
                 strike: {
                     // The venue writes `0` for everything that is not an option, but an empty
                     // cell says the same thing -- and equities are the majority of the dump, so
@@ -227,7 +259,7 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
                 tick_size: tick_text.parse().ok()?,
                 price_precision: decimals_in(tick_text),
                 lot_size: fields[i_lot].trim().parse().ok()?,
-                expiry: fields[i_expiry].trim().to_string(),
+                expiry: unquote(fields[i_expiry]),
             })
         })();
 
@@ -271,6 +303,58 @@ mod tests {
     }
 
     // The reason precision is derived rather than configured: one constant cannot serve both.
+    // ⛔ THE REGRESSION TEST THAT DID NOT EXIST, AND WHOSE ABSENCE IS THE WHOLE STORY.
+    //
+    // Every fixture in this file and in `instruments.rs` writes `name` BARE, so
+    // `test_the_underlying_comes_from_the_name_column` asserted "NIFTY" and passed against a
+    // parser that returned `"\"NIFTY\""` from the real dump. The fixtures were written from a
+    // reading of the format, so they CONFIRMED that reading rather than testing it — a fixture
+    // built from your own understanding of a spec agrees with your misreading by construction.
+    //
+    // 106,683 of 114,851 live rows are quoted. Not one test row was.
+    #[rstest]
+    fn test_a_quoted_name_column_yields_an_unquoted_underlying() {
+        let csv = dump(&[
+            r#"12345,999,NIFTY2690125200PE,"NIFTY",0,2026-09-01,25200,0.05,65,PE,NFO-OPT,NFO"#,
+        ]);
+
+        let (instruments, skipped) = parse_instruments(&csv).expect("valid dump");
+
+        assert_eq!(skipped, 0);
+        assert_eq!(instruments[0].name, "NIFTY", "quotes must not survive into `name`");
+    }
+
+    // Hardening: only `name` is quoted in today's dump, so these are behaviour-neutral NOW. That
+    // is exactly why they are asserted — the narrow fix would leave the trap armed for the day
+    // Kite starts quoting `tradingsymbol`, and nothing would fail until a filter silently emptied.
+    #[rstest]
+    fn test_quoting_is_stripped_from_every_text_column() {
+        let csv = dump(&[
+            r#"12345,999,"NIFTY2690125200PE","NIFTY",0,"2026-09-01",25200,0.05,65,"PE","NFO-OPT","NFO""#,
+        ]);
+
+        let (instruments, skipped) = parse_instruments(&csv).expect("valid dump");
+
+        assert_eq!(skipped, 0);
+        let i = &instruments[0];
+        assert_eq!(i.tradingsymbol, "NIFTY2690125200PE");
+        assert_eq!(i.name, "NIFTY");
+        assert_eq!(i.expiry, "2026-09-01");
+        assert_eq!(i.instrument_type, "PE");
+        assert_eq!(i.segment, "NFO-OPT");
+        assert_eq!(i.exchange, "NFO");
+    }
+
+    // RFC 4180: a doubled `""` inside a quoted field is one literal quote. Unmeasured in the live
+    // dump -- no row currently needs it -- so this pins the helper's behaviour rather than a
+    // venue observation.
+    #[rstest]
+    fn test_an_escaped_quote_inside_a_quoted_field_survives_as_one_quote() {
+        assert_eq!(unquote(r#""BHARTI ""AIRTEL""""#), r#"BHARTI "AIRTEL""#);
+        assert_eq!(unquote("  NIFTY  "), "NIFTY");
+        assert_eq!(unquote(r#""""#), "");
+    }
+
     #[rstest]
     fn test_nse_equity_and_currency_derivative_get_different_precisions() {
         let csv = dump(&[
