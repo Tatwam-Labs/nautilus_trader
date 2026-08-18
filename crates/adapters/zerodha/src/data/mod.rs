@@ -677,6 +677,26 @@ impl DataClient for ZerodhaDataClient {
                 //
                 // Do not remove this note by assuming either answer. One live subscription settles
                 // it.
+                //
+                // ─── 2026-08-18, the live subscription happened. It settled PART of it. ───
+                //
+                // NIFTY/NFO, 12 instruments, FULL mode, 09:14-09:20 IST, 5,266 ticks:
+                //   NIFTY26AUGFUT      oi on 419/419 ticks   e.g. 12,771,330
+                //   all 11 OPTIONS     oi on 100% of ticks   e.g. 6,235,840 / 11,557,130 / 9,780,550
+                //
+                // ⭐ SO OI IS NOT FUTURES-ONLY. Options carry it, on every tick, with distinct
+                // per-strike values. That is basic F&O structure and the code never gated on
+                // instrument kind — `if let Some(open_interest) = tick.oi` below is the whole test.
+                //
+                // ⚠️ WHAT IS STILL OPEN: the zero question above. That capture contained no INDEX
+                // instrument, so whether MCXMETLDEX's 0 is the true figure remains unverified.
+                //
+                // 🔴 AND THE REASON THIS PARAGRAPH EXISTS: the author of the note above went on to
+                // predict, at HIGH confidence, that OI arrives "only for futures" — the exact shape
+                // of assumption this note warns against, made by the person who wrote the warning.
+                // Recording a caution does not transfer it to the next claim you make. If you are
+                // about to state which instruments carry OI, measure it; two people have now been
+                // wrong about it in writing.
                 if let Some(open_interest) = tick.oi {
                     let oi = ZerodhaOpenInterest::new(
                         details.instrument_id,
