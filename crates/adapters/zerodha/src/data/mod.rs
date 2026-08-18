@@ -688,8 +688,26 @@ impl DataClient for ZerodhaDataClient {
                 // per-strike values. That is basic F&O structure and the code never gated on
                 // instrument kind — `if let Some(open_interest) = tick.oi` below is the whole test.
                 //
-                // ⚠️ WHAT IS STILL OPEN: the zero question above. That capture contained no INDEX
-                // instrument, so whether MCXMETLDEX's 0 is the true figure remains unverified.
+                // ─── 2026-08-18 13:19, mode measured. ONE SOCKET, QUOTE AND LTP SIMULTANEOUSLY ───
+                //
+                // 6 instruments QUOTE + 6 LTP on one connection at the same instant, so MODE was
+                // the only variable — two sequential runs would have confounded it with
+                // time-of-session, severely so on expiry day.
+                //   QUOTE  719 ticks · oi-bearing 0 · the `oi` FIELD IS ABSENT, not zero
+                //   LTP    775 ticks · oi-bearing 0 · field absent
+                //   FULL   oi on 100% of ticks, all 12 instruments
+                // ⇒ "OI only in FULL mode" CONFIRMED — and it is OUR gate, not merely the venue's:
+                //   websocket/parse.rs:270 reads offsets 48/52/56 only `if layout == Full`.
+                //
+                // ⭐ AND THAT NARROWS THE ZERO QUESTION ABOVE. Absent-in-other-modes plus
+                // `Some(be_u32(packet, 48))` in Full means a 0 here is a TRANSMITTED zero read from
+                // bytes — it cannot be a defaulted or missing field, because absent OI is None and
+                // the `if let` below drops it entirely rather than emitting 0.
+                //
+                // ⚠️ SO WHAT REMAINS OPEN IS NARROWER THAN IT WAS: not "is this 0 an artefact of
+                // our decode" — it is not — but "does the venue's transmitted 0 reflect true open
+                // interest". That is a question about Zerodha, no longer about this code. It still
+                // needs an index instrument and a venue-side figure to compare against.
                 //
                 // 🔴 AND THE REASON THIS PARAGRAPH EXISTS: the author of the note above went on to
                 // predict, at HIGH confidence, that OI arrives "only for futures" — the exact shape
