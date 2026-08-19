@@ -215,8 +215,9 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         // sole source of `OptionContract.underlying`. The MEASUREMENT was right and the PREMISE
         // drawn from it was wrong, so the quoting question was waved off — and the quotes reached
         // a running paper node as `underlying == "\"NIFTY\""`, where an `== "NIFTY"` filter
-        // discarded all 1,726 contracts and logged `registered 0 NIFTY option contracts`, which
-        // reads as "nothing to trade today". Found by AT-V0.4-Code 2026-08-18.
+        // discarded every NIFTY contract (1,726 on 2026-08-18) and logged `registered 0 NIFTY
+        // option contracts`, which reads as "nothing to trade today".
+        // Found by AT-V0.4-Code 2026-08-18.
         //
         // ─── 2026-08-19: the venue confirmed it, and the count moved ───
         //
@@ -225,10 +226,22 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         // So it is not *some* rows — the bug rejected the ENTIRE NFO universe, which is why AT
         // logged `registered 0` rather than a reduced count.
         //
-        // ⚠️ AND THE EXPECTED POST-FIX COUNT IS 1,670 NIFTY NFO-OPT ROWS, NOT 1,726. The 1,726
-        // figure circulated in the original report and in this file; measured today it is 1,670.
-        // Presumably expiry roll, NOT established. Anyone holding 1,726 will read a correct 1,670
-        // as "still missing 56".
+        // ⛔ DO NOT USE ANY OF THESE COUNTS AS A PASS CRITERION. THEY HAVE A SHELF LIFE AND
+        // NOTHING ABOUT A BARE INTEGER ANNOUNCES THAT.
+        //   1,726 NIFTY NFO-OPT rows — measured 2026-08-18
+        //   1,670 NIFTY NFO-OPT rows — measured 2026-08-19, live, one day later
+        // Difference presumably expiry roll; NOT established. The count moves with the expiry
+        // calendar, so BOTH figures are already historical and a third will differ again.
+        //
+        // ⚠️ WHY THIS IS WORSE THAN A STALE NUMBER: 1,670 against an expectation of 1,726 reads as
+        // FIFTY-SIX MISSING — a plausible shortfall, exactly the shape of a parser that handles
+        // most rows and misses an edge case. A wrong-looking number gets investigated; a
+        // NEARLY-RIGHT one gets explained. So a CORRECT result would be diagnosed as a partial
+        // failure and somebody would hunt 56 contracts that do not exist.
+        //
+        // ⇒ THE PASS CRITERION IS `> 0` AND `underlying == "NIFTY"` WITHOUT QUOTES. If an exact
+        //   count is wanted, re-measure it the same day against
+        //   `GET api.kite.trade/instruments/NFO` — unauthenticated, no socket.
         //
         // ⭐ This is the half the unit tests cannot reach: they prove the parser handles a quoted
         // fixture; this proves the venue SENDS one. Fixture-shaped-correctly and
