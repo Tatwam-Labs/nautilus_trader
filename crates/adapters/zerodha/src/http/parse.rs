@@ -328,16 +328,36 @@ mod tests {
     // built from your own understanding of a spec agrees with your misreading by construction.
     //
     // 106,683 of 114,851 live rows are quoted. Not one test row was.
+    // ⭐ THE FIXTURE IS NOT INVENTED. These two rows are RAW BYTES off
+    // `GET api.kite.trade/instruments/NFO`, captured live 2026-08-19 (unauthenticated, HTTP 200,
+    // 3,086,947 bytes), pasted unmodified.
+    //
+    // That matters more than it looks. Every previous fixture in this crate was written from
+    // somebody's READING of the format — which is why the pre-existing
+    // `test_the_underlying_comes_from_the_name_column` asserted "NIFTY" and PASSED against a parser
+    // that returned `"\"NIFTY\""` from the real dump. A fixture built from your own understanding
+    // of a spec agrees with your misreading by construction; one copied off the wire cannot.
+    //
+    // Measured the same day: 35,584 NFO rows, `name` quoted on 35,584 of them — NFO-OPT 34,944,
+    // NFO-FUT 640, unquoted ZERO. The failure was total, not partial, which is why AT logged
+    // `registered 0` rather than a reduced count.
     #[rstest]
     fn test_a_quoted_name_column_yields_an_unquoted_underlying() {
         let csv = dump(&[
-            r#"12345,999,NIFTY2690125200PE,"NIFTY",0,2026-09-01,25200,0.05,65,PE,NFO-OPT,NFO"#,
+            r#"15775490,61623,NIFTY26AUG24150CE,"NIFTY",0,2026-08-25,24150,0.05,65,CE,NFO-OPT,NFO"#,
+            r#"14866434,58072,NIFTY26AUGFUT,"NIFTY",0,2026-08-25,0,0.1,65,FUT,NFO-FUT,NFO"#,
         ]);
 
         let (instruments, skipped) = parse_instruments(&csv).expect("valid dump");
 
         assert_eq!(skipped, 0);
-        assert_eq!(instruments[0].name, "NIFTY", "quotes must not survive into `name`");
+        assert_eq!(instruments.len(), 2);
+        // The whole defect in one assertion: before the fix these were `"\"NIFTY\""`, six
+        // characters, and an `== "NIFTY"` filter discarded the entire NFO universe.
+        assert_eq!(instruments[0].name, "NIFTY", "option row: quotes must not survive");
+        assert_eq!(instruments[1].name, "NIFTY", "future row: quotes must not survive");
+        assert_eq!(instruments[0].tradingsymbol, "NIFTY26AUG24150CE");
+        assert_eq!(instruments[0].segment, "NFO-OPT");
     }
 
     // Hardening: only `name` is quoted in today's dump, so these are behaviour-neutral NOW. That
