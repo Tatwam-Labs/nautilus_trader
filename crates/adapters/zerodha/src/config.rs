@@ -207,14 +207,32 @@ impl ZerodhaDataClientConfig {
 /// A per-order override is available through `SubmitOrder.params["product"]`, so a strategy that
 /// legitimately mixes products can say so per order without changing the account-wide setting.
 ///
-/// # There is no Python binding on this type, deliberately
+/// # Python binding — added 2026-08-17, resolving an explicit deferral
 ///
-/// The data config carries `pyclass` attributes; this one does not. Exposing it would require
-/// [`ZerodhaProduct`] and [`ZerodhaVariety`] to be `pyclass` enums as well, and adding a Python
-/// surface for an execution path that has never placed an order is a decision to take separately
-/// from writing the path.
+/// This type previously carried a section headed *"There is no Python binding on this type,
+/// deliberately"*, whose stated reason was that exposing it requires [`ZerodhaProduct`] and
+/// [`ZerodhaVariety`] to be `pyclass` enums too, and that *"adding a Python surface for an
+/// execution path that has never placed an order is a decision to take separately from writing
+/// the path."*
+///
+/// That decision has now been taken, and the reason is recorded rather than erased: ADR-098 binds
+/// paper execution to AT-authored actors **until** the Nautilus path is *"set up and tested"*, and
+/// the client cannot be tested from Python without a name for its config. The binding exists to
+/// make the test possible.
+///
+/// ⛔ **Exposing this surface is not endorsing its use.** ADR-098 still binds the paper rail to
+/// AT-authored execution; a Python name for a factory does not change that, and nothing here
+/// should be read as clearance to wire it in.
 #[derive(Clone, Serialize, Deserialize, bon::Builder)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(module = "nautilus_trader.adapters.zerodha", from_py_object)
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.zerodha")
+)]
 pub struct ZerodhaExecClientConfig {
     /// The Kite Connect API key (falls back to the `ZERODHA_API_KEY` env var).
     pub api_key: Option<String>,

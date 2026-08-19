@@ -22,7 +22,10 @@
 
 use pyo3::pymethods;
 
-use crate::config::ZerodhaDataClientConfig;
+use crate::{
+    common::enums::{ZerodhaProduct, ZerodhaVariety},
+    config::{ZerodhaDataClientConfig, ZerodhaExecClientConfig},
+};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -97,6 +100,53 @@ impl ZerodhaDataClientConfig {
     /// non-secret fields visible AND puts the Python repr behind the same redaction the
     /// `config::tests` regression tests already assert on — one guarded path rather than a second
     /// formatting surface that nothing checks.
+    fn __repr__(&self) -> String {
+        format!("{self:?}")
+    }
+}
+
+#[pymethods]
+#[pyo3_stub_gen::derive::gen_stub_pymethods]
+impl ZerodhaExecClientConfig {
+    /// Configuration for the Zerodha execution client.
+    ///
+    /// `default_product` has no default and the omission is load-bearing: `MIS` silently arms the
+    /// broker to square off every position around 15:20 IST, `CNC` silently demands full delivery
+    /// margin, and `NRML` is meaningless on an equity segment. A client configured without one
+    /// fails to construct, which surfaces at node build time rather than at 09:15 on the first
+    /// order. Passing `None` here reproduces that failure deliberately — it does not pick a value.
+    #[new]
+    #[pyo3(signature = (
+        api_key = None,
+        access_token = None,
+        base_url_http = None,
+        http_timeout_secs = None,
+        default_product = None,
+        default_variety = None,
+    ))]
+    fn py_new(
+        api_key: Option<String>,
+        access_token: Option<String>,
+        base_url_http: Option<String>,
+        http_timeout_secs: Option<u64>,
+        default_product: Option<ZerodhaProduct>,
+        default_variety: Option<ZerodhaVariety>,
+    ) -> Self {
+        let defaults = Self::default();
+        Self {
+            api_key,
+            access_token,
+            base_url_http,
+            http_timeout_secs: http_timeout_secs.unwrap_or(defaults.http_timeout_secs),
+            default_product,
+            default_variety: default_variety.unwrap_or(defaults.default_variety),
+        }
+    }
+
+    /// Routed through the hand-written `Debug`, which redacts `api_key` and `access_token`.
+    ///
+    /// Same reasoning as the data config: one guarded formatting path rather than a second surface
+    /// that nothing asserts on.
     fn __repr__(&self) -> String {
         format!("{self:?}")
     }

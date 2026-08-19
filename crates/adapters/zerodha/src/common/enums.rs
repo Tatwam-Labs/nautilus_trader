@@ -366,6 +366,20 @@ impl ZerodhaExchange {
 /// picks a value: see `ZerodhaExecClientConfig::default_product`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.zerodha",
+        eq,
+        eq_int,
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.zerodha")
+)]
 pub enum ZerodhaProduct {
     /// Cash and carry — delivery, full margin, no auto square-off.
     Cnc,
@@ -424,6 +438,20 @@ impl ZerodhaProduct {
 /// That is why the placed variety is recorded per order rather than recomputed at cancel time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(
+    feature = "python",
+    pyo3::pyclass(
+        module = "nautilus_trader.adapters.zerodha",
+        eq,
+        eq_int,
+        from_py_object,
+        rename_all = "SCREAMING_SNAKE_CASE"
+    )
+)]
+#[cfg_attr(
+    feature = "python",
+    pyo3_stub_gen::derive::gen_stub_pyclass_enum(module = "nautilus_trader.adapters.zerodha")
+)]
 pub enum ZerodhaVariety {
     /// A regular order.
     #[default]
