@@ -162,6 +162,17 @@ impl PythonFeeModel {
     pub fn new(obj: Py<PyAny>) -> Self {
         Self { obj }
     }
+
+    /// The wrapped Python object.
+    ///
+    /// Added for the round-trip getter: `fee_model_any_to_pyobject` hands a Python model back
+    /// as the object it came from. The absence of this accessor is itself a signal — nothing
+    /// previously needed to read a Python model BACK OUT, because only backtest accepted one
+    /// and backtest never returns it.
+    #[must_use]
+    pub const fn obj(&self) -> &Py<PyAny> {
+        &self.obj
+    }
 }
 
 impl FeeModel for PythonFeeModel {
@@ -500,6 +511,9 @@ impl TieredNotionalOptionFeeModel {
 /// # Errors
 ///
 /// Returns an error if `obj` is not a supported fee model binding.
+// NOTE: this now mirrors `pyobject_to_fee_model_handle`'s fallback, so the SANDBOX path accepts
+// what the BACKTEST path already accepted. The two surfaces differed only by which converter
+// their Python constructor called.
 pub fn pyobject_to_fee_model_any(obj: &Bound<'_, PyAny>) -> PyResult<FeeModelAny> {
     if let Ok(m) = obj.extract::<PyRef<'_, FixedFeeModel>>() {
         return Ok(FeeModelAny::Fixed((*m).clone()));
@@ -523,6 +537,15 @@ pub fn pyobject_to_fee_model_any(obj: &Bound<'_, PyAny>) -> PyResult<FeeModelAny
 
     if let Ok(m) = obj.extract::<PyRef<'_, TieredNotionalOptionFeeModel>>() {
         return Ok(FeeModelAny::TieredNotionalOption((*m).clone()));
+    }
+
+    // ⭐ FALLBACK, mirroring pyobject_to_fee_model_handle: duck-typed on `get_commission`, so a
+    // plain Python class works and subclassing FeeModel was never the requirement. THIS ONE CALL
+    // is what made the SANDBOX refuse a model the BACKTEST path already accepted.
+    if obj.hasattr("get_commission")? {
+        return Ok(FeeModelAny::Python(PythonFeeModel::new(
+            obj.clone().unbind(),
+        )));
     }
 
     let type_name = obj.get_type().name()?;
@@ -574,6 +597,11 @@ pub fn fee_model_any_to_pyobject(py: Python<'_>, model: &FeeModelAny) -> PyResul
         FeeModelAny::ProbabilityPrice(model) => fee_model_into_py(py, model.clone()),
         FeeModelAny::CappedOption(model) => fee_model_into_py(py, model.clone()),
         FeeModelAny::TieredNotionalOption(model) => fee_model_into_py(py, model.clone()),
+        // ⭐ THE RETURN LEG, and the reason this variant is the right shape: a Python model
+        // round-trips by handing BACK the object it came from. An Rc<dyn FeeModel> could not
+        // — opaque, no variant, no downcast — which is why widening the field to a handle
+        // would have broken this getter rather than extended it.
+        FeeModelAny::Python(model) => Ok(model.obj().clone_ref(py)),
     }
 }
 

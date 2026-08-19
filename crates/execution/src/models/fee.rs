@@ -133,6 +133,13 @@ pub enum FeeModelAny {
     ProbabilityPrice(ProbabilityPriceFeeModel),
     CappedOption(CappedOptionFeeModel),
     TieredNotionalOption(TieredNotionalOptionFeeModel),
+    /// A fee model defined in Python, duck-typed on `get_commission`.
+    ///
+    /// Additive and cfg-gated: a build without the `python` feature sees the original six
+    /// variants and is bit-identical. The payload is a `Py<PyAny>`, which is `Send + Sync` —
+    /// more portable than the Rust model structs already held here.
+    #[cfg(feature = "python")]
+    Python(crate::python::fee::PythonFeeModel),
 }
 
 impl FeeModel for FeeModelAny {
@@ -160,6 +167,8 @@ impl FeeModel for FeeModelAny {
             Self::TieredNotionalOption(model) => {
                 model.get_commission(order, fill_quantity, fill_px, instrument)
             }
+            #[cfg(feature = "python")]
+            Self::Python(model) => model.get_commission(order, fill_quantity, fill_px, instrument),
         }
     }
 
@@ -208,6 +217,14 @@ impl FeeModel for FeeModelAny {
                 underlying_px,
             ),
             Self::TieredNotionalOption(model) => model.get_commission_with_context(
+                order,
+                fill_quantity,
+                fill_px,
+                instrument,
+                underlying_px,
+            ),
+            #[cfg(feature = "python")]
+            Self::Python(model) => model.get_commission_with_context(
                 order,
                 fill_quantity,
                 fill_px,
