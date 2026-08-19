@@ -218,6 +218,22 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         // discarded all 1,726 contracts and logged `registered 0 NIFTY option contracts`, which
         // reads as "nothing to trade today". Found by AT-V0.4-Code 2026-08-18.
         //
+        // ─── 2026-08-19: the venue confirmed it, and the count moved ───
+        //
+        // GET api.kite.trade/instruments/NFO, live, unauthenticated, no socket:
+        //   35,584 rows · `name` QUOTED on 35,584 · unquoted on 0 · NFO-OPT 34,944, NFO-FUT 640
+        // So it is not *some* rows — the bug rejected the ENTIRE NFO universe, which is why AT
+        // logged `registered 0` rather than a reduced count.
+        //
+        // ⚠️ AND THE EXPECTED POST-FIX COUNT IS 1,670 NIFTY NFO-OPT ROWS, NOT 1,726. The 1,726
+        // figure circulated in the original report and in this file; measured today it is 1,670.
+        // Presumably expiry roll, NOT established. Anyone holding 1,726 will read a correct 1,670
+        // as "still missing 56".
+        //
+        // ⭐ This is the half the unit tests cannot reach: they prove the parser handles a quoted
+        // fixture; this proves the venue SENDS one. Fixture-shaped-correctly and
+        // reality-shaped-the-same are different claims. Measured by LocalDockerTests.
+        //
         // ⚠️ A FALSE REASSURANCE IS WORSE THAN NO COMMENT. No comment leaves a reader curious;
         // "a column this parser does not read" retired the question for four days. Before writing
         // that something is unused, grep for it.
