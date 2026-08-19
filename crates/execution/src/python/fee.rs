@@ -175,6 +175,25 @@ impl PythonFeeModel {
     }
 }
 
+// `FeeModelAny` derives `Clone`, so every variant payload must be `Clone`. `Py<T>` is NOT `Clone`
+// in this workspace: pyo3 gates `impl<T> Clone for Py<T>` behind the `py-clone` feature
+// (pyo3-0.29.2 `src/instance.rs:2244`), and `Cargo.toml:204-212` enables hashbrown, indexmap,
+// jiff-02, macros, multiple-pymethods, rust_decimal and serde — not `py-clone`.
+//
+// `clone_ref` is ungated and is the intended idiom: it takes a `Python<'_>` token, so the
+// refcount increment provably happens with the interpreter attached. The derived impl could not
+// do that, which is exactly why upstream gates it — the gated `Clone` *panics* if it is not.
+//
+// `Python::attach` rather than `Python::with_gil`: this tree uses `attach` 858 times and
+// `with_gil` zero times.
+impl Clone for PythonFeeModel {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self {
+            obj: self.obj.clone_ref(py),
+        })
+    }
+}
+
 impl FeeModel for PythonFeeModel {
     fn get_commission(
         &self,
