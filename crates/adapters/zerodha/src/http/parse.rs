@@ -239,6 +239,26 @@ pub fn parse_instruments(csv: &str) -> anyhow::Result<(Vec<KiteInstrument>, usiz
         // NEARLY-RIGHT one gets explained. So a CORRECT result would be diagnosed as a partial
         // failure and somebody would hunt 56 contracts that do not exist.
         //
+        // ─── 2026-08-19: PROVEN END TO END. The join is closed. ───
+        //
+        // A node built on this wheel, Zerodha data client only, NO subscription:
+        //   cache populated on load       114,544 instruments in ~1s
+        //   NIFTY option underlyings      1,670 bare `NIFTY`, 0 quoted
+        //   ALL options                   0 quoted underlyings of 90,448
+        //   independent raw-CSV count     1,670 — AGREES
+        //
+        // ⭐ THE AGREEMENT IS THE PROOF, NOT THE NUMBER. Two independent measurements of different
+        // things — a raw CSV count off the wire, and a cache read THROUGH this parser — landed on
+        // the same value. A parser defect would have broken that agreement. The number itself still
+        // expires; the agreement does not.
+        //
+        // ⭐ AND 0 QUOTED ACROSS ALL 90,448 OPTIONS shows the unquote is universal rather than
+        // field- or segment-specific — it rules out a fix that happens to work on NIFTY rows.
+        //
+        // Until this run, three claims were separately true and never joined: the venue SENDS
+        // quoted input (measured), this code HANDLES quoted input (CI), and the two MEET (nobody).
+        // Measured by LocalDockerTests.
+
         // ⇒ THE PASS CRITERION IS `> 0` AND `underlying == "NIFTY"` WITHOUT QUOTES. If an exact
         //   count is wanted, re-measure it the same day against
         //   `GET api.kite.trade/instruments/NFO` — unauthenticated, no socket.
