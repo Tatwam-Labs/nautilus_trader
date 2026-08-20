@@ -98,13 +98,14 @@ use nautilus_common::{
     live::{get_runtime, runner::get_data_event_sender},
     messages::{
         DataEvent,
-        data::{SubscribeQuotes, SubscribeTrades},
+        data::{SubscribeIndexPrices, SubscribeQuotes, SubscribeTrades},
     },
 };
 use nautilus_core::time::get_atomic_clock_realtime;
 use nautilus_model::{
-    data::{Data, DataType, custom::{CustomData, CustomDataTrait}},
+    data::{Data, DataType, custom::{CustomData, CustomDataTrait}, prices::IndexPriceUpdate},
     identifiers::{ClientId, InstrumentId, Venue},
+    types::Price,
 };
 
 use crate::{
@@ -627,6 +628,64 @@ impl DataClient for ZerodhaDataClient {
                     Err(e) => log::debug!("Skipping tick that cannot become a quote: {e}"),
                 }
 
+                // ⭐ INDEX PRICE — the only path an index instrument has.
+                //
+                // An index has NO BOOK and NO TRADED VOLUME, and the two publishers around this one
+                // are gated on exactly those: `quote_tick_from` requires `tick.depth`, and
+                // `TradeTracker::observe` requires `tick.volume_traded`. Neither is ever present in
+                // the 28/32-byte index layouts, so before this arm an index subscription produced
+                // PERFECT SILENCE — no data, no error, indistinguishable from a closed market or an
+                // unsubscribed token. The last price was decoded on every one of those packets and
+                // then discarded.
+                //
+                // ⚠️ `!tick.tradable` IS THE GATE, and it is a property of the SEGMENT rather than
+                // of the packet length: `websocket/parse.rs:233` sets it from
+                // `segment.is_tradable()`, which is `!matches!(self, Indices)`. Gating on the packet
+                // length instead would be wrong twice over — an 8-byte LTP packet is emitted for
+                // TRADABLE instruments too, and an index in ltp mode would be missed.
+                //
+                // Emitted for tradable instruments as well would be a duplicate of information the
+                // quote and trade paths already carry, so this is deliberately exclusive.
+                // 🔴 PRECISION IS **NOT** `details.price_precision` HERE, AND USING IT SILENTLY
+                // TRUNCATES THE LEVEL.
+                //
+                // `price_precision` is derived from the dump's `tick_size` TEXT
+                // (`http/parse.rs:309`, `decimals_in`), and an INDEX ROW CARRIES `tick_size = 0`:
+                //
+                //   256265,1001,NIFTY 50,"NIFTY 50",0,,0,0,0,EQ,INDICES,NSE
+                //                                        ^ tick_size
+                //
+                // `decimals_in("0")` is 0 — correctly, since an index has no tick size to speak of.
+                // But the WIRE carries two decimals: `segment.price_divisor()` is 100 for every
+                // segment except the two currency ones, so `be_price` yields e.g. 24500.35.
+                // ⇒ `Price::new(24500.35, 0)` would publish **24500**, losing the paise with no
+                //   error and no log — a confidently wrong level, which is worse than none.
+                //
+                // So the precision comes from the DIVISOR, which is what actually determined the
+                // decoded value, rather than from a tick size the instrument does not have.
+                if !tick.tradable {
+                    let index_precision = match tick.segment.price_divisor() as u64 {
+                        10_000_000 => 7,
+                        10_000 => 4,
+                        _ => 2,
+                    };
+
+                    let index_price = IndexPriceUpdate::new(
+                        details.instrument_id,
+                        Price::new(tick.last_price, index_precision),
+                        venue_time_to_unix_nanos(tick.exchange_timestamp).unwrap_or(ts_init),
+                        ts_init,
+                    );
+
+                    if sender
+                        .send(DataEvent::Data(index_price.into()))
+                        .is_err()
+                    {
+                        log::debug!("Data event receiver dropped; stopping Zerodha feed");
+                        return;
+                    }
+                }
+
                 // The same tick, offered to the trade path as well -- NOT as an alternative. One
                 // full-mode packet legitimately carries both a book and evidence of a trade.
                 match trades.observe(
@@ -797,6 +856,56 @@ impl DataClient for ZerodhaDataClient {
 
         log::info!(
             "Subscribed trades for {} (token {token}) in full mode",
+            cmd.instrument_id,
+        );
+        Ok(())
+    }
+
+    /// Subscribes an INDEX instrument, whose price arrives on no other path.
+    ///
+    /// # Why this exists as a third method rather than falling out of the other two
+    ///
+    /// An index has **no book and no traded volume**, and both existing publishers are gated on
+    /// exactly those:
+    ///
+    /// - [`quote_tick_from`] requires `tick.depth` and returns `Err` without it, so no
+    ///   [`QuoteTick`] can ever be built for an index — in any mode. Index packets are 28/32 bytes
+    ///   and carry no ladder at all.
+    /// - [`TradeTracker::observe`] requires `tick.volume_traded`, which
+    ///   `websocket::parse` populates only for the tradable layouts, so it returns `Ok(None)`
+    ///   forever.
+    ///
+    /// ⚠️ Both rejections are silent by design — one logs at debug, the other not at all, because
+    /// for a *tradable* instrument they are the ordinary case. For an index they are the only case,
+    /// so before this method an index subscription produced **perfect silence**: no data, no error,
+    /// indistinguishable from a closed market.
+    ///
+    /// The last price is decoded for every layout including the index ones and was simply
+    /// discarded; this makes it reachable as an [`IndexPriceUpdate`].
+    ///
+    /// # Mode
+    ///
+    /// FULL, like the other two. The index layouts (`IndexQuote` 28, `IndexFull` 32) are what the
+    /// venue sends for an index token regardless of the mode requested — the mode selects the
+    /// *tradable* layout, and asking for full costs nothing here while keeping one subscription
+    /// path for all instrument kinds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the instrument is not registered, or the subscription cannot be sent.
+    ///
+    /// ⚠️ **The instrument id is the venue's `tradingsymbol` verbatim**, so an NSE index is
+    /// `NIFTY 50.NSE` — *with a space* — while BSE's is `SENSEX.BSE` with none. That asymmetry is
+    /// the venues' own house style (127 of 136 NSE index symbols contain a space; 23 of 73 on BSE),
+    /// and per the owner's ruling of 2026-08-20 this client carries the venue's spelling rather
+    /// than normalising it. `NIFTY.NSE` will not resolve, and that is intended.
+    fn subscribe_index_prices(&mut self, cmd: SubscribeIndexPrices) -> anyhow::Result<()> {
+        let token = self.resolve_token(&cmd.instrument_id)?;
+
+        self.subscribe_full(token)?;
+
+        log::info!(
+            "Subscribed index prices for {} (token {token})",
             cmd.instrument_id,
         );
         Ok(())
