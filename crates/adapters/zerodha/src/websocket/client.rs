@@ -62,6 +62,11 @@
 //! Neither case is handled here. A correct response needs a fresh token, which means credential
 //! refresh rather than reconnection, and that is not built.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use nautilus_common::live::get_runtime;
 use nautilus_network::{
     RECONNECTED,
@@ -75,7 +80,7 @@ use crate::{
     websocket::{
         messages::KiteTick,
         parse::parse_binary,
-        subscription::{KiteRequest, SubscriptionState},
+        subscription::{KiteRequest, MAX_TOKENS_PER_CONNECTION, SubscriptionState},
     },
 };
 
@@ -115,9 +120,68 @@ pub struct ZerodhaWebSocketClient {
     credential: ZerodhaCredential,
     cmd_tx: Option<UnboundedSender<Command>>,
     tick_rx: Option<UnboundedReceiver<KiteTick>>,
+    /// Live subscription census, shared with whoever reports it.
+    ///
+    /// # Why a shared counter rather than a log line at the subscribe site
+    ///
+    /// The subscribe burst happens ONCE, at boot. A counter can be RE-REPORTED afterwards; a log
+    /// line cannot be re-read once it has aged out of whatever window the reader is looking at.
+    /// These are read by the tick-path heartbeat, which re-emits every 25 ticks — so the census is
+    /// durable BY REPETITION rather than by anyone happening to look at the right moment.
+    ///
+    /// ⚠️ **AND THE MOTIVATING MEASUREMENT WAS ENVIRONMENT-SPECIFIC — RECORDED BECAUSE IT WAS
+    /// WRONG ABOUT PROD.** A rig measured `json-file 20m x 5` (~25 minutes at that volume) and the
+    /// subscription evidence had indeed rotated away there. Checked on prod 2026-08-21: container
+    /// `LogConfig` is `map[]`, `/etc/docker/daemon.json` does not exist, and there are no rotated
+    /// siblings — **PROD DOES NOT ROTATE AT ALL.** So on prod the original lines persist and this
+    /// counter is not strictly required.
+    ///
+    /// ⇒ IT IS KEPT BECAUSE IT DOES NOT DEPEND ON THE ENVIRONMENT: the same census reads correctly
+    /// whether logs rotate hourly, never, or differently on the next host. **A design that only
+    /// works under one deployment's log settings is a design that has to be re-verified per host.**
+    census: SubscriptionCensus,
+}
+
+/// Counters describing what this connection actually holds, readable from another task.
+#[derive(Clone, Debug, Default)]
+pub struct SubscriptionCensus {
+    subscribed: Arc<AtomicUsize>,
+    refused: Arc<AtomicUsize>,
+}
+
+impl SubscriptionCensus {
+    /// Tokens currently subscribed on this connection.
+    #[must_use]
+    pub fn subscribed(&self) -> usize {
+        self.subscribed.load(Ordering::Relaxed)
+    }
+
+    /// Subscription requests refused locally because they would pass the venue's cap.
+    ///
+    /// ⚠️ NON-ZERO IS NOT SELF-CORRECTING: a refusal means those tokens are NOT streaming and never
+    /// will be on this connection. The venue does not reject the excess, it silently does not send
+    /// it — see [`MAX_TOKENS_PER_CONNECTION`].
+    #[must_use]
+    pub fn refused(&self) -> usize {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    /// Remaining capacity on this connection, saturating at zero.
+    #[must_use]
+    pub fn headroom(&self) -> usize {
+        MAX_TOKENS_PER_CONNECTION.saturating_sub(self.subscribed())
+    }
 }
 
 impl ZerodhaWebSocketClient {
+    /// The live subscription census for this connection.
+    ///
+    /// Clone it before the client is moved; the counters are shared and stay live afterwards.
+    #[must_use]
+    pub fn census(&self) -> SubscriptionCensus {
+        self.census.clone()
+    }
+
     /// Creates a new client for `credential`, against `url` or the public endpoint.
     #[must_use]
     pub fn new(credential: ZerodhaCredential, url: Option<String>) -> Self {
@@ -126,6 +190,7 @@ impl ZerodhaWebSocketClient {
             credential,
             cmd_tx: None,
             tick_rx: None,
+            census: SubscriptionCensus::default(),
         }
     }
 
@@ -201,6 +266,8 @@ impl ZerodhaWebSocketClient {
 
         // `get_runtime().spawn` rather than a bare `tokio::spawn`: the house pattern, and it does
         // not depend on `connect` happening to be polled inside a runtime context.
+        let census = self.census.clone();
+
         get_runtime().spawn(async move {
             let mut state = SubscriptionState::new();
 
@@ -211,9 +278,16 @@ impl ZerodhaWebSocketClient {
                             // Refuse locally rather than let the venue silently not stream the
                             // excess. Nothing is sent when the cap would be passed.
                             if let Err(e) = state.subscribe(mode, &tokens) {
+                                // Counted as well as logged. The log line is a one-shot at boot;
+                                // the counter is re-reported by the tick-path heartbeat for as long
+                                // as the feed lives, so the state stays readable later without
+                                // depending on this line still being in the reader's window.
+                                census.refused.fetch_add(tokens.len(), Ordering::Relaxed);
                                 log::error!("Rejecting Zerodha subscription: {e}");
                                 continue;
                             }
+
+                            census.subscribed.store(state.len(), Ordering::Relaxed);
                             // Subscribe THEN set mode -- a bare subscribe lands the venue at
                             // `quote` regardless of what was asked for. See `subscription`.
                             send_all(&client, &[
@@ -223,6 +297,7 @@ impl ZerodhaWebSocketClient {
                         }
                         Some(Command::Unsubscribe(tokens)) => {
                             state.unsubscribe(&tokens);
+                            census.subscribed.store(state.len(), Ordering::Relaxed);
                             send_all(&client, &[KiteRequest::Unsubscribe(tokens)]).await;
                         }
                         Some(Command::Close) | None => {

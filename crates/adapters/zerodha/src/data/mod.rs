@@ -120,7 +120,10 @@ use crate::{
         parse::{TradeTracker, quote_tick_from, venue_time_to_unix_nanos},
     },
     http::client::ZerodhaHttpClient,
-    websocket::client::ZerodhaWebSocketClient,
+    websocket::{
+        client::{SubscriptionCensus, ZerodhaWebSocketClient},
+        subscription::MAX_TOKENS_PER_CONNECTION,
+    },
 };
 
 /// A Nautilus data client for the Zerodha Kite Connect streaming API.
@@ -533,6 +536,12 @@ impl DataClient for ZerodhaDataClient {
         // reproducible on a shut market, which is most of the week for MCX.
         let mut websocket = None;
 
+        // ⚠️ DEFAULTS TO ZEROS, WHICH IS HONEST FOR REPLAY RATHER THAN CONVENIENT: a replay opens no
+        // socket and holds no subscription, so "0/3000, 0 refused" is the true census of a
+        // connection that does not exist. It must not be read as "a healthy live connection with
+        // nothing refused" — the REPLAY MODE warning logged just below is what distinguishes them.
+        let mut census = SubscriptionCensus::default();
+
         let mut ticks = if let Some(path) = self.config.replay_frames_path.clone() {
             log::warn!(
                 "Zerodha data client {} is in REPLAY MODE from {path} -- NO SOCKET IS OPENED and \
@@ -551,6 +560,10 @@ impl DataClient for ZerodhaDataClient {
             let stream = client
                 .take_tick_stream()
                 .ok_or_else(|| anyhow::anyhow!("tick stream was already taken"))?;
+
+            // Cloned BEFORE the client is moved. The counters are shared, so this stays live
+            // for as long as the connection does.
+            census = client.census();
 
             websocket = Some(client);
             stream
@@ -578,15 +591,76 @@ impl DataClient for ZerodhaDataClient {
             let mut published = 0usize;
             let mut unmapped = 0usize;
             let mut oi_published = 0usize;
+            let mut last_refused = census.refused();
 
             while let Some(tick) = ticks.recv().await {
                 received += 1;
 
                 if received == 1 || received.is_multiple_of(25) {
-                    log::info!(
-                        "Zerodha tick path: {received} received, {published} published as quotes, \
-                         {oi_published} as open interest, {unmapped} with no registered instrument"
-                    );
+                    // ⭐ THE GAUGE. Re-emitted every 25 ticks, so the current census is present
+                    // in the log wherever the reader happens to look, without depending on the
+                    // subscribe burst — which happens ONCE, at boot — still being there.
+                    //
+                    // ⚠️ THE MOTIVATING MEASUREMENT WAS A RIG, NOT PROD, AND IT DID NOT TRANSFER:
+                    // a rig rotates at `json-file 20m x 5` (~25 min) and its subscription evidence
+                    // had aged out; PROD DOES NOT ROTATE AT ALL (`LogConfig map[]`, no
+                    // daemon.json, no rotated siblings — checked 2026-08-21). So this is not
+                    // load-bearing on prod today. It is kept because it holds under BOTH, and a
+                    // gauge that only works under one host's log settings has to be re-verified
+                    // per host.
+                    //
+                    // ⇒ AND IT CARRIES THE HEADROOM ON THE SUCCESS PATH DELIBERATELY. The count
+                    // crept 1,681 → 2,999 → 4,075 across releases; a pass/fail alarm cannot show a
+                    // trend, and the trend is the warning anyone actually wants. A check that only
+                    // speaks when broken is indistinguishable from one nobody wired up.
+                    let subscribed = census.subscribed();
+                    let refused = census.refused();
+                    let headroom = census.headroom();
+
+                    // ⛔ SEVERITY IS PART OF THE SIGNAL, NOT DECORATION. The only automated reader
+                    // greps `ERROR|CRITICAL`, so an INFO line is durable and unread — the same trap
+                    // that hides the existing self-disclosure warnings. The gauge therefore
+                    // ESCALATES ITSELF: it speaks at ERROR exactly while something is refused, and
+                    // at INFO while nothing is.
+                    //
+                    // ⚠️ A REFUSAL IS NOT SELF-CORRECTING: those tokens are not streaming and will
+                    // not start. Repeating at ERROR is correct, not noisy.
+                    // ⛔ ESCALATE ON THE TRANSITION, NOT ON EVERY HEARTBEAT. Measured on a live
+                    // session 2026-08-21: this line fires 462,534 times. Emitting ERROR on each
+                    // one while a refusal persists would (a) make the only automated reader's
+                    // `ERROR|CRITICAL` count meaningless for every OTHER error, and (b) train
+                    // people to filter it — which is how a real alarm becomes background noise.
+                    //
+                    // ⇒ SO: ERROR when the refusal count CHANGES (including 0 -> n at boot), INFO
+                    // on the steady state. Correct severity at the moment it matters, a durable
+                    // gauge afterwards, and no flood.
+                    //
+                    // ⚠️ AND THE TOTAL-REFUSAL CASE IS NOT COVERED HERE AND MUST NOT BE ASSUMED TO
+                    // BE: this line fires PER TICK, so if EVERY subscription were refused there are
+                    // no ticks and no heartbeat at all. That case is carried by the per-refusal
+                    // `log::error!` in `websocket::client`, which runs in the command handler and
+                    // does not depend on the feed.
+                    let transitioned = refused != last_refused;
+                    last_refused = refused;
+
+                    if transitioned && refused > 0 {
+                        log::error!(
+                            "Zerodha tick path: {received} received, {published} published as \
+                             quotes, {oi_published} as open interest, {unmapped} with no \
+                             registered instrument | SUBSCRIPTIONS {subscribed}/{cap}, \
+                             {headroom} headroom, ⛔ {refused} REFUSED — those tokens are NOT \
+                             streaming",
+                            cap = MAX_TOKENS_PER_CONNECTION,
+                        );
+                    } else {
+                        log::info!(
+                            "Zerodha tick path: {received} received, {published} published as \
+                             quotes, {oi_published} as open interest, {unmapped} with no \
+                             registered instrument | SUBSCRIPTIONS {subscribed}/{cap}, \
+                             {headroom} headroom, {refused} refused",
+                            cap = MAX_TOKENS_PER_CONNECTION,
+                        );
+                    }
                 }
 
                 let details = match instruments.read() {
