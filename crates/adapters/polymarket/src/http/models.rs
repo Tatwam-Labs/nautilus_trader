@@ -188,7 +188,12 @@ pub struct GammaMarket {
     /// Whether order book trading is enabled.
     pub enable_order_book: Option<bool>,
     /// Minimum price increment.
-    pub order_price_min_tick_size: Option<f64>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_decimal_from_json_number",
+        serialize_with = "serialize_optional_decimal_as_json_number"
+    )]
+    pub order_price_min_tick_size: Option<Decimal>,
     /// Minimum order size.
     #[serde(
         default,
@@ -249,11 +254,12 @@ pub struct GammaMarket {
     pub neg_risk_market_id: Option<String>,
     /// Fee schedule for this market.
     pub fee_schedule: Option<FeeSchedule>,
-    /// Game ID for sport markets. `null` and `-1` both mean "no game" and
-    /// surface as `None`. Reference shape:
+    /// Game ID for sport markets, kept verbatim because Gamma emits both
+    /// numeric and composite `<uuid>:<away>:<home>` forms. `null` and `-1`
+    /// both mean "no game" and surface as `None`. Reference shape:
     /// <https://github.com/Polymarket/rs-clob-client/blob/main/src/gamma/types/response.rs>.
     #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-    pub game_id: Option<u64>,
+    pub game_id: Option<String>,
     /// Events linked to this gamma market.
     pub events: Option<Vec<GammaEvent>>,
 }
@@ -261,10 +267,22 @@ pub struct GammaMarket {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FeeSchedule {
-    pub exponent: f64,
-    pub rate: f64,
+    #[serde(
+        serialize_with = "serialize_decimal_as_json_number",
+        deserialize_with = "deserialize_decimal_from_json_number"
+    )]
+    pub exponent: Decimal,
+    #[serde(
+        serialize_with = "serialize_decimal_as_json_number",
+        deserialize_with = "deserialize_decimal_from_json_number"
+    )]
+    pub rate: Decimal,
     pub taker_only: bool,
-    pub rebate_rate: f64,
+    #[serde(
+        serialize_with = "serialize_decimal_as_json_number",
+        deserialize_with = "deserialize_decimal_from_json_number"
+    )]
+    pub rebate_rate: Decimal,
 }
 
 /// An event response from the Gamma API `GET /events`.
@@ -304,11 +322,12 @@ pub struct GammaEvent {
     pub neg_risk_market_id: Option<String>,
     /// Whether event is featured.
     pub featured: Option<bool>,
-    /// Game ID for sport markets. `null` and `-1` both mean "no game" and
-    /// surface as `None`. Reference shape:
+    /// Game ID for sport markets, kept verbatim because Gamma emits both
+    /// numeric and composite `<uuid>:<away>:<home>` forms. `null` and `-1`
+    /// both mean "no game" and surface as `None`. Reference shape:
     /// <https://github.com/Polymarket/rs-clob-client/blob/main/src/gamma/types/response.rs>.
     #[serde(default, deserialize_with = "deserialize_optional_polymarket_game_id")]
-    pub game_id: Option<u64>,
+    pub game_id: Option<String>,
 }
 
 /// A tag from the Gamma API `GET /tags`.
@@ -339,7 +358,8 @@ pub struct SearchResponse {
 #[derive(Clone, Debug, Deserialize)]
 pub struct TickSizeResponse {
     /// Minimum tick size (price increment) for a token.
-    pub minimum_tick_size: f64,
+    #[serde(deserialize_with = "deserialize_decimal_from_json_number")]
+    pub minimum_tick_size: Decimal,
 }
 
 /// Fee rate response from CLOB `GET /fee-rate`.
@@ -745,7 +765,50 @@ mod tests {
 
         // one market has no game_id
         assert!(map_handicap.game_id.is_none());
-        assert_eq!(money_line.game_id, Some(1_427_074));
+        assert_eq!(money_line.game_id.as_deref(), Some("1427074"));
+    }
+
+    #[rstest]
+    fn test_gamma_event_composite_sports_game_id() {
+        // Live Gamma record from issue #4771: the event carries a numeric
+        // `gameId` while its first market carries a composite one.
+        let events: Vec<GammaEvent> = load("gamma_event_sports_composite_game_id.json");
+
+        assert_eq!(events.len(), 1);
+
+        let event = &events[0];
+
+        assert_eq!(event.id, "835109");
+        assert_eq!(event.game_id.as_deref(), Some("287011684"));
+        assert_eq!(event.markets.len(), 2);
+        assert_eq!(event.markets[0].id, "3524358");
+        assert_eq!(
+            event.markets[0].game_id.as_deref(),
+            Some("dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:STL:TEX")
+        );
+        assert_eq!(event.markets[1].id, "3554041");
+        assert_eq!(event.markets[1].game_id, None);
+
+        // Re-serialization feeds the Python loader, so the key stays a string
+        // even where Gamma sent a number.
+        let encoded = serde_json::to_value(event).unwrap();
+
+        assert_eq!(encoded["gameId"], serde_json::json!("287011684"));
+        assert_eq!(
+            encoded["markets"][0]["gameId"],
+            serde_json::json!("dd80aae9-52f9-4c7b-a1cf-7b4ab63cd281:STL:TEX")
+        );
+    }
+
+    #[rstest]
+    fn test_fee_schedule_decimal_fields() {
+        let market: GammaMarket = load("gamma_market_sports_market_money_line.json");
+        let schedule = market.fee_schedule.unwrap();
+
+        assert_eq!(schedule.exponent, Decimal::ONE);
+        assert_eq!(schedule.rate, dec!(0.03));
+        assert!(schedule.taker_only);
+        assert_eq!(schedule.rebate_rate, dec!(0.25));
     }
 
     #[rstest]
@@ -1073,6 +1136,17 @@ mod tests {
         assert!(response.tokens[0].winner);
         assert_eq!(response.tokens[1].outcome, "No");
         assert!(!response.tokens[1].winner);
+    }
+
+    #[rstest]
+    fn test_tick_size_response_preserves_json_number() {
+        let response: TickSizeResponse =
+            serde_json::from_str(r#"{"minimum_tick_size":0.1234567890123456789012345678}"#)
+                .unwrap();
+        let precise =
+            rust_decimal::Decimal::from_str_exact("0.1234567890123456789012345678").unwrap();
+
+        assert_eq!(response.minimum_tick_size, precise);
     }
 
     #[rstest]

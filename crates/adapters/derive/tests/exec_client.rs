@@ -383,14 +383,19 @@ async fn handle_get_instrument(
     body: axum::body::Bytes,
 ) -> Response {
     let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-    state.get_instrument_calls.lock().await.push(parsed);
+    state.get_instrument_calls.lock().await.push(parsed.clone());
     let response = state.get_instrument_response.lock().await.clone();
-    let body = if response.is_null() {
-        json!({"id": 1, "result": sample_instrument_json()})
+    let mut result = if response.is_null() {
+        sample_instrument_json()
     } else {
-        json!({"id": 1, "result": response})
+        response
     };
-    (StatusCode::OK, Json(body)).into_response()
+    // Echo the requested name so a fetch for any instrument returns a
+    // definition whose name matches the order that triggered it.
+    if let Some(requested) = parsed.get("instrument_name").and_then(Value::as_str) {
+        result["instrument_name"] = Value::String(requested.to_string());
+    }
+    (StatusCode::OK, Json(json!({"id": 1, "result": result}))).into_response()
 }
 
 async fn start_rest_server(state: RestState) -> SocketAddr {
@@ -1069,6 +1074,7 @@ fn test_config(rest: SocketAddr, ws: SocketAddr) -> DeriveExecClientConfig {
         signature_expiry_secs: 600,
         market_order_slippage_bps: 50,
         max_matching_requests_per_second: None,
+        max_per_instrument_matching_requests_per_second: None,
     }
 }
 
@@ -1172,6 +1178,39 @@ where
     match outcome {
         Some(event) => event,
         None => panic!("timeout waiting for: {label}"),
+    }
+}
+
+/// Drains until `OrderDenied` for `client_order_id`, failing if `OrderSubmitted`
+/// for the same order arrives first.
+async fn drain_denied_without_submitted(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    client_order_id: &ClientOrderId,
+) -> ExecutionEvent {
+    let deadline = Duration::from_secs(5);
+    let outcome = tokio::time::timeout(deadline, async {
+        loop {
+            let event = rx.recv().await?;
+
+            if let ExecutionEvent::Order(OrderEventAny::Submitted(submitted)) = &event
+                && submitted.client_order_id == *client_order_id
+            {
+                panic!("OrderSubmitted emitted for {client_order_id} before OrderDenied");
+            }
+
+            if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = &event
+                && denied.client_order_id == *client_order_id
+            {
+                return Some(event);
+            }
+        }
+    })
+    .await
+    .unwrap_or(None);
+
+    match outcome {
+        Some(event) => event,
+        None => panic!("timeout waiting for OrderDenied for {client_order_id}"),
     }
 }
 
@@ -1573,6 +1612,9 @@ async fn test_submit_order_accepts_signature_ttl_above_minimum() {
 async fn test_deeply_paced_submit_builds_signature_after_matching_quota_wait() {
     let rest_state = RestState::default();
     let ws_state = WsState::default();
+    // The fixed window is aligned to client construction, so measure from
+    // before the build to bound the reset wait.
+    let started = std::time::Instant::now();
     let mut tc = build_client_with_config(rest_state, ws_state.clone(), |mut config| {
         config.signature_expiry_secs = MIN_SIGNATURE_TTL.as_secs() + 1;
         config.max_matching_requests_per_second = Some(1);
@@ -1582,7 +1624,6 @@ async fn test_deeply_paced_submit_builds_signature_after_matching_quota_wait() {
     tc.client.connect().await.expect("connect succeeds");
 
     let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
-    let started = std::time::Instant::now();
 
     for sequence in 0..7 {
         let order = build_limit_order(
@@ -1601,12 +1642,14 @@ async fn test_deeply_paced_submit_builds_signature_after_matching_quota_wait() {
             .expect("submit Ok");
     }
 
-    wait_until(
+    // The fixed-window reset departs the last two writes at the ~5s boundary;
+    // bound the wait from order submission so it cannot race the reset.
+    wait_until_async(
         || {
             let state = ws_state.clone();
             async move { state.submitted_orders.lock().await.len() == 7 }
         },
-        "seven private/order requests posted",
+        Duration::from_secs(15),
     )
     .await;
     let elapsed = started.elapsed();
@@ -1616,8 +1659,9 @@ async fn test_deeply_paced_submit_builds_signature_after_matching_quota_wait() {
     assert_eq!(posts.len(), 7);
     assert_eq!(received_at_secs.len(), 7);
     assert!(
-        elapsed >= Duration::from_millis(1_500),
-        "seven writes must exhaust the five-request burst, elapsed {elapsed:?}",
+        elapsed >= Duration::from_secs(4),
+        "writes past the five-request burst must wait for the discrete window \
+         reset (~5s), elapsed {elapsed:?}",
     );
 
     for (body, received_at_secs) in posts.iter().zip(received_at_secs.iter()) {
@@ -1633,6 +1677,105 @@ async fn test_deeply_paced_submit_builds_signature_after_matching_quota_wait() {
     }
     drop(received_at_secs);
     drop(posts);
+
+    tc.client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_global_matching_allowance_gates_distinct_instrument_until_window_reset() {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    // The fixed window is aligned to client construction, so measure from
+    // before the build to bound the reset wait.
+    let started = std::time::Instant::now();
+    let started_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is after unix epoch")
+        .as_secs();
+    let mut tc = build_client_with_config(rest_state, ws_state.clone(), |config| config).await;
+    tc.client.connect().await.expect("connect succeeds");
+
+    // Five ETH-PERP writes exhaust the Trader account-wide matching window
+    // (and ETH-PERP's own per-instrument window) without touching BTC-PERP's.
+    for sequence in 0..5 {
+        let order = build_limit_order(
+            InstrumentId::from("ETH-PERP.DERIVE"),
+            ClientOrderId::from(format!("STRAT-GLOBAL-ETH-{sequence}")),
+            OrderSide::Buy,
+            Price::from("3500.00"),
+            Quantity::from("1.000"),
+        );
+        tc.cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .expect("cache insert");
+        tc.client
+            .submit_order(submit_cmd(&order))
+            .expect("submit Ok");
+    }
+    wait_until_async(
+        || {
+            let state = ws_state.clone();
+            async move { state.submitted_orders.lock().await.len() == 5 }
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // A BTC-PERP write has a fresh per-instrument allowance, but the global
+    // bucket is drained: it must wait for the discrete window reset.
+    let btc_order = build_limit_order(
+        InstrumentId::from("BTC-PERP.DERIVE"),
+        ClientOrderId::from("STRAT-GLOBAL-BTC-0"),
+        OrderSide::Buy,
+        Price::from("50000.00"),
+        Quantity::from("1.000"),
+    );
+    tc.cache
+        .borrow_mut()
+        .add_order(btc_order.clone(), None, None, false)
+        .expect("cache insert");
+    tc.client
+        .submit_order(submit_cmd(&btc_order))
+        .expect("submit Ok");
+
+    wait_until_async(
+        || {
+            let state = ws_state.clone();
+            async move { state.submitted_orders.lock().await.len() == 6 }
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let posts = ws_state.submitted_orders.lock().await;
+    let received_at_secs = ws_state.submitted_order_received_at_secs.lock().await;
+    assert_eq!(posts.len(), 6);
+    assert_eq!(posts[5]["instrument_name"].as_str(), Some("BTC-PERP"));
+
+    let btc_received_secs = received_at_secs[5];
+    let eth_received_secs = received_at_secs[..5].to_vec();
+    assert!(
+        btc_received_secs >= started_secs + 4,
+        "global bucket must gate the BTC-PERP write until the ~5s window reset, \
+         started {started_secs}, BTC-PERP received {btc_received_secs}",
+    );
+    assert!(
+        eth_received_secs
+            .iter()
+            .all(|&secs| secs <= btc_received_secs),
+        "the five ETH-PERP writes must depart within the first window",
+    );
+    drop(received_at_secs);
+    drop(posts);
+    drop(eth_received_secs);
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(12),
+        "smoke bound: the reset wait must be one window, elapsed {elapsed:?}",
+    );
 
     tc.client.disconnect().await.expect("disconnect");
 }
@@ -1867,7 +2010,7 @@ async fn test_submit_order_posts_supported_time_in_force(
 #[case(TimeInForce::Ioc, true, "post-only Derive orders only support GTC")]
 #[case(TimeInForce::Fok, true, "post-only Derive orders only support GTC")]
 #[tokio::test]
-async fn test_submit_order_rejects_unsupported_time_in_force_before_posting(
+async fn test_submit_order_denies_unsupported_time_in_force_before_posting(
     #[case] time_in_force: TimeInForce,
     #[case] post_only: bool,
     #[case] reason_fragment: &str,
@@ -1900,27 +2043,14 @@ async fn test_submit_order_rejects_unsupported_time_in_force_before_posting(
         .submit_order(submit_cmd(&order))
         .expect("submit Ok");
 
-    let _ = drain_until(
-        &mut tc.rx,
-        |event| matches!(event, ExecutionEvent::Order(OrderEventAny::Submitted(_))),
-        "OrderSubmitted event",
-    )
-    .await;
-    let event = drain_until(
-        &mut tc.rx,
-        |event| matches!(event, ExecutionEvent::Order(OrderEventAny::Rejected(_))),
-        "OrderRejected event",
-    )
-    .await;
+    let event = drain_denied_without_submitted(&mut tc.rx, &order.client_order_id()).await;
 
-    if let ExecutionEvent::Order(OrderEventAny::Rejected(rejected)) = event {
-        assert_eq!(rejected.client_order_id, order.client_order_id());
-        assert!(!rejected.due_post_only);
+    if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
+        assert_eq!(denied.client_order_id, order.client_order_id());
         assert!(
-            rejected.reason.as_str().contains("order encoding failed")
-                && rejected.reason.as_str().contains(reason_fragment),
-            "unexpected reject reason: {}",
-            rejected.reason,
+            denied.reason.as_str().contains(reason_fragment),
+            "unexpected deny reason: {}",
+            denied.reason,
         );
     } else {
         unreachable!();
@@ -1928,6 +2058,104 @@ async fn test_submit_order_rejects_unsupported_time_in_force_before_posting(
     assert!(
         ws_state.submitted_orders.lock().await.is_empty(),
         "invalid TIF must not post to the venue",
+    );
+
+    tc.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn test_submit_order_denies_unsupported_order_type_before_posting() {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let mut tc = build_client(rest_state, ws_state.clone()).await;
+    tc.client.connect().await.expect("connect succeeds");
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let client_order_id = ClientOrderId::from("STRAT-BAD-TYPE");
+    let order = OrderTestBuilder::new(OrderType::MarketToLimit)
+        .trader_id(TraderId::from("TRADER-001"))
+        .strategy_id(StrategyId::from("S-1"))
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(OrderSide::Buy)
+        .quantity(Quantity::from("1.000"))
+        .price(Price::from("3500.00"))
+        .build();
+    tc.cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .expect("cache insert");
+
+    tc.client
+        .submit_order(submit_cmd(&order))
+        .expect("submit Ok");
+
+    let event = drain_denied_without_submitted(&mut tc.rx, &order.client_order_id()).await;
+
+    if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
+        assert_eq!(denied.client_order_id, order.client_order_id());
+        assert!(
+            denied.reason.as_str().contains("unsupported order type"),
+            "unexpected deny reason: {}",
+            denied.reason,
+        );
+    } else {
+        unreachable!();
+    }
+    assert!(
+        ws_state.submitted_orders.lock().await.is_empty(),
+        "unsupported order type must not post to the venue",
+    );
+
+    tc.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn test_submit_order_denies_unsupported_trigger_price_type_before_posting() {
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let mut tc = build_client(rest_state, ws_state.clone()).await;
+    tc.client.connect().await.expect("connect succeeds");
+
+    let instrument_id = InstrumentId::from("ETH-PERP.DERIVE");
+    let client_order_id = ClientOrderId::from("STRAT-BAD-TRIGGER-TYPE");
+    let order = OrderTestBuilder::new(OrderType::StopMarket)
+        .trader_id(TraderId::from("TRADER-001"))
+        .strategy_id(StrategyId::from("S-1"))
+        .instrument_id(instrument_id)
+        .client_order_id(client_order_id)
+        .side(OrderSide::Sell)
+        .quantity(Quantity::from("1.000"))
+        .trigger_price(Price::from("3400.00"))
+        .trigger_type(TriggerType::IndexPrice)
+        .build();
+    tc.cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .expect("cache insert");
+
+    tc.client
+        .submit_order(submit_cmd(&order))
+        .expect("submit Ok");
+
+    let event = drain_denied_without_submitted(&mut tc.rx, &order.client_order_id()).await;
+
+    if let ExecutionEvent::Order(OrderEventAny::Denied(denied)) = event {
+        assert_eq!(denied.client_order_id, order.client_order_id());
+        assert!(
+            denied
+                .reason
+                .as_str()
+                .contains("unsupported trigger price type"),
+            "unexpected deny reason: {}",
+            denied.reason,
+        );
+    } else {
+        unreachable!();
+    }
+    assert!(
+        ws_state.submitted_orders.lock().await.is_empty(),
+        "unsupported trigger price type must not post to the venue",
     );
 
     tc.client.disconnect().await.expect("disconnect");
@@ -4375,11 +4603,18 @@ async fn test_query_account_emits_account_state_event() {
     .await;
 
     if let ExecutionEvent::Account(state) = event {
-        // sample subaccount carries 1000 USDC total / 100 USDC initial margin.
+        // sample subaccount carries 1000 USDC with no requirements; the
+        // 100/50 net health values travel in `info`, not as margins
         assert_eq!(state.balances.len(), 1);
         assert_eq!(state.balances[0].total.as_decimal(), dec!(1000));
+        assert_eq!(state.balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(state.balances[0].free.as_decimal(), dec!(1000));
         assert_eq!(state.margins.len(), 1);
-        assert_eq!(state.margins[0].initial.as_decimal(), dec!(100));
+        assert_eq!(state.margins[0].initial.as_decimal(), dec!(0));
+        assert_eq!(state.margins[0].maintenance.as_decimal(), dec!(0));
+        let info = state.info.expect("account state carries risk info");
+        assert_eq!(info.get("net_initial_margin"), Some(&json!("100")));
+        assert_eq!(info.get("net_maintenance_margin"), Some(&json!("50")));
     } else {
         unreachable!();
     }
@@ -4432,6 +4667,8 @@ async fn test_balance_subscription_refreshes_authoritative_account_state() {
     if let ExecutionEvent::Account(state) = event {
         assert_eq!(state.balances.len(), 1);
         assert_eq!(state.balances[0].total.as_decimal(), dec!(1250));
+        assert_eq!(state.balances[0].locked.as_decimal(), dec!(0));
+        assert_eq!(state.balances[0].free.as_decimal(), dec!(1250));
     } else {
         unreachable!();
     }
@@ -5701,6 +5938,116 @@ async fn test_generate_fill_reports_does_not_mark_unconsumed_trades_emitted() {
     assert_eq!(retry.len(), 1);
     assert_eq!(first[0].trade_id.as_str(), "trade-retry-1");
     assert_eq!(retry[0].trade_id.as_str(), "trade-retry-1");
+
+    tc.client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trades_failed_commission_conversion_does_not_record_dedup() {
+    // The failed construction must not poison dedup for the same trade_id
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let mut tc = build_client(rest_state, ws_state.clone()).await;
+    tc.client.connect().await.expect("connect succeeds");
+
+    wait_until(
+        || {
+            let state = ws_state.clone();
+            async move { !state.subscribe_frames.lock().await.is_empty() }
+        },
+        "subscribe acknowledged",
+    )
+    .await;
+    let _ = drain_until(
+        &mut tc.rx,
+        |e| matches!(e, ExecutionEvent::Account(_)),
+        "initial AccountState",
+    )
+    .await;
+
+    let channel = format!("{TEST_SUBACCOUNT}.trades");
+    let mut bad_fee = sample_trade_json("trade-fee-ws-1", "ord-fee-ws-1", "ETH-PERP");
+    bad_fee["trade_fee"] = json!("79228162514264337593543950335");
+    ws_state.push_notification(make_subscription_frame(&channel, &json!([bad_fee])));
+    ws_state.push_notification(make_subscription_frame(
+        &channel,
+        &json!([sample_trade_json(
+            "trade-fee-ws-1",
+            "ord-fee-ws-1",
+            "ETH-PERP"
+        )]),
+    ));
+
+    let event = drain_until(
+        &mut tc.rx,
+        |e| matches!(e, ExecutionEvent::Report(ExecutionReport::Fill(_))),
+        "FillReport after failed commission conversion",
+    )
+    .await;
+
+    if let ExecutionEvent::Report(ExecutionReport::Fill(report)) = event {
+        assert_eq!(report.trade_id.as_str(), "trade-fee-ws-1");
+        assert_eq!(report.commission.as_decimal(), dec!(0.5));
+    } else {
+        unreachable!();
+    }
+
+    tc.client.disconnect().await.expect("disconnect");
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_skips_unrepresentable_commission_and_retries() {
+    // The failed row is skipped, not marked processed, so a later poll
+    // re-fetches it
+    let rest_state = RestState::default();
+    let ws_state = WsState::default();
+    let mut bad_fee = sample_trade_json("trade-fee-rest-1", "ord-1", "ETH-PERP");
+    bad_fee["trade_fee"] = json!("79228162514264337593543950335");
+    *rest_state.trade_history_response.lock().await = json!({
+        "trades": [
+            bad_fee,
+            sample_trade_json("trade-fee-rest-2", "ord-2", "ETH-PERP"),
+        ],
+        "pagination": {"count": 2, "num_pages": 1},
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let mut tc = build_client(rest_state.clone(), ws_state).await;
+    tc.client.connect().await.expect("connect succeeds");
+
+    let generate = || {
+        GenerateFillReports::new(
+            UUID4::new(),
+            UnixNanos::default(),
+            Some(InstrumentId::from("ETH-PERP.DERIVE")),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+    let reports = tc
+        .client
+        .generate_fill_reports(generate())
+        .await
+        .expect("fill generation survives the unrepresentable fee row");
+    assert_eq!(reports.len(), 1, "failed row must be skipped");
+    assert_eq!(reports[0].trade_id.as_str(), "trade-fee-rest-2");
+
+    *rest_state.trade_history_response.lock().await = json!({
+        "trades": [sample_trade_json("trade-fee-rest-1", "ord-1", "ETH-PERP")],
+        "pagination": {"count": 1, "num_pages": 1},
+        "subaccount_id": TEST_SUBACCOUNT,
+    });
+    let retried = tc
+        .client
+        .generate_fill_reports(generate())
+        .await
+        .expect("retry fill generation succeeds");
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0].trade_id.as_str(), "trade-fee-rest-1");
 
     tc.client.disconnect().await.expect("disconnect");
 }

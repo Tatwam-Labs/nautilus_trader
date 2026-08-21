@@ -100,7 +100,8 @@ use crate::{
             DeriveGetOrderParams, DeriveGetPositionsParams, DeriveGetSubaccountParams,
             DeriveGetTradeHistoryParams, DeriveGetTriggerOrdersParams,
             order_replace_to_derive_payload, order_to_derive_payload,
-            trigger_order_to_derive_payload,
+            trigger_order_to_derive_payload, validate_order_support,
+            validate_trigger_order_support,
         },
     },
     signing::{
@@ -199,6 +200,7 @@ impl DeriveExecutionClient {
             config.proxy_url.clone(),
             ws_credentials,
             config.max_matching_requests_per_second,
+            config.max_per_instrument_matching_requests_per_second,
         );
 
         if let Some(secs) = config.ws_timeout_secs {
@@ -788,6 +790,22 @@ impl ExecutionClient for DeriveExecutionClient {
             return Ok(());
         }
 
+        // Deny before emit_order_submitted so unsupported fields never
+        // surface as venue rejections.
+        let is_trigger_order = is_derive_trigger_order_type(order.order_type());
+        let support = if is_trigger_order {
+            validate_trigger_order_support(&order)
+        } else {
+            validate_order_support(&order)
+        };
+
+        if let Err(e) = support {
+            let reason = e.to_string();
+            log::warn!("Cannot submit order {}: {reason}", order.client_order_id());
+            self.emitter.emit_order_denied(&order, &reason);
+            return Ok(());
+        }
+
         // Spot has no position to reduce; the venue rejects reduce-only
         // unconditionally (11025), so deny locally. Perp/option reduce-only is
         // position-conditional and must still reach the venue.
@@ -807,7 +825,6 @@ impl ExecutionClient for DeriveExecutionClient {
         }
 
         // Keep the existing OrderDenied path here, then refresh before signing
-        let is_trigger_order = is_derive_trigger_order_type(order.order_type());
         let market_quote = if order.order_type() == OrderType::Market {
             match self.core.cache().quote(&cmd.instrument_id) {
                 Some(_) => Some(()),
@@ -983,11 +1000,14 @@ impl ExecutionClient for DeriveExecutionClient {
             };
 
             let matching_reservation = match ws_exec
-                .reserve_matching_request(if is_trigger_order {
-                    "private/trigger_order"
-                } else {
-                    "private/order"
-                })
+                .reserve_matching_request(
+                    if is_trigger_order {
+                        "private/trigger_order"
+                    } else {
+                        "private/order"
+                    },
+                    &instrument.instrument_name,
+                )
                 .await
             {
                 Ok(reservation) => reservation,
@@ -1630,7 +1650,7 @@ impl ExecutionClient for DeriveExecutionClient {
             };
 
             let matching_reservation = match ws_exec
-                .reserve_matching_request("private/replace")
+                .reserve_matching_request("private/replace", &instrument.instrument_name)
                 .await
             {
                 Ok(reservation) => reservation,
@@ -1837,9 +1857,9 @@ impl ExecutionClient for DeriveExecutionClient {
             let subaccount = http_client
                 .get_subaccount(&DeriveGetSubaccountParams::new(subaccount_id))
                 .await?;
-            let (balances, margins) = parse_derive_subaccount_to_balances(&subaccount)?;
+            let (balances, margins, info) = parse_derive_subaccount_to_balances(&subaccount)?;
             let ts_event = clock.get_time_ns();
-            emitter.emit_account_state(balances, margins, true, ts_event, None);
+            emitter.emit_account_state(balances, margins, true, ts_event, Some(info));
             Ok(())
         });
         Ok(())
@@ -1920,11 +1940,11 @@ impl DeriveReconciliationContext {
             .get_subaccount(&DeriveGetSubaccountParams::new(self.subaccount_id))
             .await
             .context("failed to fetch Derive subaccount snapshot")?;
-        let (balances, margins) = parse_derive_subaccount_to_balances(&value)
+        let (balances, margins, info) = parse_derive_subaccount_to_balances(&value)
             .context("failed to parse Derive subaccount balances")?;
         let ts_event = self.clock.get_time_ns();
         self.emitter
-            .emit_account_state(balances, margins, true, ts_event, None);
+            .emit_account_state(balances, margins, true, ts_event, Some(info));
         Ok(())
     }
 

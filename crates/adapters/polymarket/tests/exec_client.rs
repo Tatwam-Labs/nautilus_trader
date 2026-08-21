@@ -41,7 +41,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 use nautilus_common::{
-    cache::{Cache, INSTRUMENT_NOT_FOUND, InstrumentLookupError},
+    cache::Cache,
     clients::ExecutionClient,
     enums::LogLevel,
     live::runner::{replace_system_event_sender, set_exec_event_sender},
@@ -64,7 +64,7 @@ use nautilus_model::{
         AccountType, AssetClass, OmsType, OrderSide, OrderStatus, OrderType, TimeInForce,
         TriggerType,
     },
-    events::{AccountState, OrderEventAny, OrderPendingCancel},
+    events::{AccountState, OrderDeniedReason, OrderEventAny, OrderPendingCancel},
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, Symbol, TraderId,
         VenueOrderId,
@@ -82,7 +82,7 @@ use nautilus_polymarket::{
         consts::{POLYMARKET_CLIENT_ID, POLYMARKET_VENUE},
         enums::SignatureType,
     },
-    config::PolymarketExecClientConfig,
+    config::{PolymarketExecClientConfig, PolymarketInstrumentProviderConfig},
     execution::PolymarketExecutionClient,
     http::models::PolymarketOrder,
     signing::eip712::order_hash,
@@ -180,9 +180,14 @@ struct TestServerState {
     last_path: Arc<tokio::sync::Mutex<String>>,
     last_query: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
     gamma_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    version_response: Arc<tokio::sync::Mutex<Value>>,
+    version_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    startup_request_paths: Arc<tokio::sync::Mutex<Vec<String>>>,
     balance_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    balance_response: Arc<tokio::sync::Mutex<Value>>,
     order_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     order_response_status: Arc<tokio::sync::Mutex<StatusCode>>,
+    order_response_headers: Arc<tokio::sync::Mutex<HeaderMap>>,
     order_post_count: Arc<tokio::sync::Mutex<usize>>,
     /// When > 0, `handle_post_order` returns 500 on this many calls before
     /// reverting to the configured `order_response_status`. Used by retry tests.
@@ -233,9 +238,18 @@ impl Default for TestServerState {
             last_path: Arc::new(tokio::sync::Mutex::new(String::new())),
             last_query: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             gamma_response: Arc::new(tokio::sync::Mutex::new(None)),
+            version_response: Arc::new(tokio::sync::Mutex::new(load_json(
+                "http_version_response.json",
+            ))),
+            version_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            startup_request_paths: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             balance_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            balance_response: Arc::new(tokio::sync::Mutex::new(load_json(
+                "http_balance_allowance_collateral.json",
+            ))),
             order_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_response_status: Arc::new(tokio::sync::Mutex::new(StatusCode::OK)),
+            order_response_headers: Arc::new(tokio::sync::Mutex::new(HeaderMap::new())),
             order_post_count: Arc::new(tokio::sync::Mutex::new(0)),
             order_post_500_remaining: Arc::new(tokio::sync::Mutex::new(0)),
             order_response_uses_request_hash: Arc::new(AtomicBool::new(false)),
@@ -464,16 +478,30 @@ async fn handle_get_balance(
     headers: HeaderMap,
 ) -> Response {
     *state.last_path.lock().await = uri.path().to_string();
+    state
+        .startup_request_paths
+        .lock()
+        .await
+        .push(uri.path().to_string());
     *state.last_headers.lock().await = headers
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
     let status = *state.balance_response_status.lock().await;
-    (
-        status,
-        Json(load_json("http_balance_allowance_collateral.json")),
-    )
-        .into_response()
+    let response = state.balance_response.lock().await.clone();
+    (status, Json(response)).into_response()
+}
+
+async fn handle_get_version(State(state): State<TestServerState>, uri: Uri) -> Response {
+    *state.last_path.lock().await = uri.path().to_string();
+    state
+        .startup_request_paths
+        .lock()
+        .await
+        .push(uri.path().to_string());
+    let status = *state.version_response_status.lock().await;
+    let response = state.version_response.lock().await.clone();
+    (status, Json(response)).into_response()
 }
 
 async fn handle_post_order(
@@ -533,7 +561,11 @@ async fn handle_post_order(
     }
 
     record_open_order_ids(&state, std::slice::from_ref(&body)).await;
-    (status, Json(body)).into_response()
+    let mut response = (status, Json(body)).into_response();
+    response
+        .headers_mut()
+        .extend(state.order_response_headers.lock().await.clone());
+    response
 }
 
 async fn handle_post_orders(
@@ -695,7 +727,15 @@ async fn record_canceled_order_ids(state: &TestServerState, response: &Value) {
     }
 }
 
-async fn handle_user_upgrade(ws: WebSocketUpgrade) -> Response {
+async fn handle_user_upgrade(
+    State(state): State<TestServerState>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    state
+        .startup_request_paths
+        .lock()
+        .await
+        .push("/ws".to_string());
     ws.on_upgrade(handle_user_socket)
 }
 
@@ -817,6 +857,7 @@ fn create_test_router(state: TestServerState) -> Router {
         .route("/data/orders", get(handle_get_orders))
         .route("/data/order/{id}", get(handle_get_order))
         .route("/data/trades", get(handle_get_trades))
+        .route("/version", get(handle_get_version))
         .route("/balance-allowance", get(handle_get_balance))
         .route(
             "/order",
@@ -998,6 +1039,92 @@ async fn test_connect_emits_user_socket_state_change() {
         .expect("disconnect execution client");
 
     assert!(system_rx.try_recv().is_err());
+}
+
+#[rstest]
+#[case::malformed_spender(json!({
+    "balance": "37506152",
+    "allowances": {"exchange": "1000"},
+}))]
+#[case::missing_allowance_metadata(json!({"balance": "37506152"}))]
+#[case::legacy_singular_allowance(json!({
+    "balance": "37506152",
+    "allowance": "1000",
+}))]
+#[tokio::test]
+async fn test_connect_checks_v2_before_websocket_and_uses_balance_projection(
+    #[case] balance_response: Value,
+) {
+    let state = TestServerState::default();
+    *state.balance_response.lock().await = balance_response;
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
+    client.start().unwrap();
+
+    client.connect().await.unwrap();
+
+    assert!(client.is_connected());
+    assert_eq!(
+        state.startup_request_paths.lock().await.as_slice(),
+        ["/version", "/ws", "/balance-allowance"]
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_connect_rejects_unexpected_clob_version_before_startup() {
+    let state = TestServerState::default();
+    *state.version_response.lock().await = json!({"version": 1});
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, _cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let error = client.connect().await.unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "Polymarket CLOB protocol version 1 is unsupported; adapter supports V2 only"
+    );
+    assert!(!client.is_connected());
+    assert_eq!(
+        state.startup_request_paths.lock().await.as_slice(),
+        ["/version"]
+    );
+}
+
+#[rstest]
+#[case::invalid_shape(StatusCode::OK, json!({"version": "2"}), "invalid type")]
+#[case::http_error(
+    StatusCode::SERVICE_UNAVAILABLE,
+    json!({"error": "version unavailable"}),
+    "HTTP error 503: version unavailable"
+)]
+#[tokio::test]
+async fn test_connect_fails_closed_on_invalid_version_response(
+    #[case] status: StatusCode,
+    #[case] response: Value,
+    #[case] expected_error: &str,
+) {
+    let state = TestServerState::default();
+    *state.version_response_status.lock().await = status;
+    *state.version_response.lock().await = response;
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, _cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let error = client.connect().await.unwrap_err();
+    let error = format!("{error:#}");
+
+    assert!(error.contains("failed to query Polymarket CLOB protocol version"));
+    assert!(error.contains(expected_error), "unexpected error: {error}");
+    assert!(!client.is_connected());
+    assert_eq!(
+        state.startup_request_paths.lock().await.as_slice(),
+        ["/version"]
+    );
 }
 
 #[rstest]
@@ -1343,37 +1470,6 @@ async fn test_heartbeat_request_deadline_marks_execution_unhealthy() {
     client.disconnect().await.unwrap();
 }
 
-#[rstest]
-#[tokio::test]
-#[ignore = "live network call against clob.polymarket.com; run with --include-ignored"]
-async fn test_live_heartbeat_runs_through_execution_client() {
-    let signature_type = match std::env::var("POLYMARKET_SIGNATURE_TYPE").as_deref() {
-        Ok("0") => SignatureType::Eoa,
-        Ok("1") => SignatureType::PolyProxy,
-        Ok("2") => SignatureType::PolyGnosisSafe,
-        Ok("3") => SignatureType::Poly1271,
-        _ => {
-            panic!("live execution heartbeat test requires POLYMARKET_SIGNATURE_TYPE=0, 1, 2, or 3")
-        }
-    };
-    let config = PolymarketExecClientConfig {
-        signature_type,
-        heartbeat_enabled: true,
-        ..PolymarketExecClientConfig::default()
-    };
-    let (mut client, _rx, cache) = create_test_execution_client_from_config(config);
-    add_test_account_to_cache(&cache, AccountId::from("POLYMARKET-001"));
-    client.start().unwrap();
-
-    client.connect().await.unwrap();
-    await_execution_healthy(&client, Duration::from_secs(10)).await;
-    tokio::time::sleep(Duration::from_secs(11)).await;
-
-    assert!(client.is_connected());
-
-    client.disconnect().await.unwrap();
-}
-
 async fn await_heartbeat_posts(state: &TestServerState, expected: usize, timeout: Duration) {
     wait_until_async(
         || {
@@ -1417,7 +1513,7 @@ async fn test_exec_client_get_account_after_cache_add() {
 
 #[rstest]
 #[tokio::test]
-async fn test_generate_order_status_reports_empty_without_instruments() {
+async fn test_generate_order_status_reports_errors_on_in_scope_unmapped_order() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
     let (client, _rx, _cache) = create_test_execution_client(addr);
@@ -1435,10 +1531,12 @@ async fn test_generate_order_status_reports_empty_without_instruments() {
         causation_id: None,
     };
 
-    let reports = client.generate_order_status_reports(&cmd).await.unwrap();
+    let error = client
+        .generate_order_status_reports(&cmd)
+        .await
+        .expect_err("in-scope open-order miss must fail");
 
-    // Without loaded instruments, orders cannot be resolved to instrument IDs
-    assert!(reports.is_empty());
+    assert!(error.to_string().contains("unmapped in-scope open order"));
 }
 
 #[rstest]
@@ -1506,6 +1604,170 @@ async fn test_generate_order_status_reports_recovers_confirmed_rest_fill() {
 
 #[rstest]
 #[tokio::test]
+async fn test_generate_mass_status_lookback_sets_report_window() {
+    let state = TestServerState::default();
+    let order = load_json("http_open_orders_page.json")["data"][0].clone();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("mass status")
+        .expect("mass status available");
+
+    assert!(mass_status.lookback_start().is_some());
+    assert!(mass_status.reports_complete());
+    assert_eq!(mass_status.order_reports().len(), 1);
+    let query = state.last_query.lock().await;
+    assert!(query.contains_key("after"));
+    assert!(query.contains_key("before"));
+    let after: u64 = query["after"].parse().expect("after unix seconds");
+    let before: u64 = query["before"].parse().expect("before unix seconds");
+    assert!(before > after);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_lookback_keeps_open_order_filled_qty() {
+    let state = TestServerState::default();
+    let mut order = load_json("http_open_orders_page.json")["data"][0].clone();
+    order["size_matched"] = json!("4.0000");
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [order],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache_with_size_precision(&cache, instrument_id, 4);
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("mass status")
+        .expect("mass status available");
+    let reports = mass_status.order_reports();
+    let report = reports.values().next().expect("open order report");
+
+    assert_eq!(report.filled_qty, Quantity::from("4.0000"));
+    assert!(mass_status.lookback_start().is_some());
+    assert!(mass_status.reports_complete());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_lookback_marks_unparsable_trade_time_incomplete() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let mut trade = load_json("http_trades_page.json")["data"][0].clone();
+    trade["match_time"] = json!("not-a-timestamp");
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [trade],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("mass status")
+        .expect("mass status available");
+
+    assert!(mass_status.lookback_start().is_some());
+    assert!(!mass_status.reports_complete());
+    assert!(mass_status.fill_reports().is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_lookback_marks_in_scope_historical_incomplete() {
+    let state = TestServerState::default();
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    let mut trade = load_json("http_trades_page.json")["data"][0].clone();
+    trade["match_time"] = json!(now_secs.to_string());
+    *state.trades_response_override.lock().await = Some(json!({
+        "data": [trade],
+        "next_cursor": "LTE=",
+    }));
+    let addr = start_mock_server(state).await;
+    let (client, _rx, _cache) = create_test_execution_client(addr);
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .expect("mass status")
+        .expect("mass status available");
+
+    assert!(mass_status.lookback_start().is_some());
+    assert!(!mass_status.reports_complete());
+    assert!(mass_status.fill_reports().is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_drops_out_of_scope_unmapped_history() {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+    let mut config = create_test_exec_config(addr);
+    config.instrument_config = Some(PolymarketInstrumentProviderConfig {
+        load_ids: Some(vec![InstrumentId::from("OTHER.POLYMARKET")]),
+        ..Default::default()
+    });
+    let (client, _rx, _cache) = create_test_execution_client_from_config(config);
+
+    let reports = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: None,
+            venue_order_id: None,
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect("out-of-scope historical misses must not fail");
+
+    assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
 async fn test_generate_fill_reports_empty_without_instruments() {
     let state = TestServerState::default();
     let addr = start_mock_server(state).await;
@@ -1527,6 +1789,92 @@ async fn test_generate_fill_reports_empty_without_instruments() {
     let reports = client.generate_fill_reports(cmd).await.unwrap();
 
     assert!(reports.is_empty());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_commission_failure_errors_direct_mass_and_targeted_rest_requests() {
+    let venue_order_id =
+        VenueOrderId::from("0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef12");
+    let state = TestServerState::default();
+    *state.single_order_response.lock().await = Some(Value::Null);
+    *state.orders_response_override.lock().await = Some(json!({
+        "data": [],
+        "next_cursor": "LTE=",
+    }));
+    *state.trades_response_override.lock().await = Some(recovery_trades_response(
+        venue_order_id.as_str(),
+        "10.0000",
+        "0.5000",
+    ));
+    let addr = start_mock_server(state).await;
+    let (mut client, _rx, cache) = create_test_execution_client(addr);
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let out_of_range_fee =
+        Decimal::from_i128_with_scale(100_000_000_000_000_000_000_000_000i128, 0);
+    add_instrument_to_cache_with_tick_and_taker_fee(
+        &cache,
+        instrument_id,
+        "0.0001",
+        4,
+        out_of_range_fee,
+    );
+    let instrument = cache.borrow().instrument(&instrument_id).unwrap().clone();
+    client.on_instrument(instrument);
+
+    let client_order_id = ClientOrderId::from("O-COMMISSION-FAILURE");
+    let mut order = make_limit_order(
+        client_order_id.as_str(),
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, venue_order_id.as_str());
+
+    let fill_error = client
+        .generate_fill_reports(GenerateFillReports {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            venue_order_id: Some(venue_order_id),
+            start: None,
+            end: None,
+            params: None,
+            log_receipt_level: LogLevel::Info,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect_err("direct fill request must fail as a unit");
+    let mass_error = client
+        .generate_mass_status(None)
+        .await
+        .expect_err("mass status must not omit the failed fill");
+    let targeted_error = client
+        .generate_order_status_report(&GenerateOrderStatusReport {
+            command_id: UUID4::new(),
+            ts_init: UnixNanos::default(),
+            instrument_id: Some(instrument_id),
+            client_order_id: Some(client_order_id),
+            venue_order_id: Some(venue_order_id),
+            params: None,
+            correlation_id: None,
+            causation_id: None,
+        })
+        .await
+        .expect_err("targeted recovery must not omit the failed fill");
+
+    for error in [fill_error, mass_error, targeted_error] {
+        assert!(format!("{error:#}").contains("failed to represent commission"));
+    }
 }
 
 #[rstest]
@@ -1572,9 +1920,12 @@ async fn test_generate_order_status_report_single_requires_venue_order_id() {
         causation_id: None,
     };
 
-    let result = client.generate_order_status_report(&cmd).await.unwrap();
+    let error = client
+        .generate_order_status_report(&cmd)
+        .await
+        .expect_err("missing venue_order_id is not venue absence");
 
-    assert!(result.is_none());
+    assert!(error.to_string().contains("requires venue_order_id"));
 }
 
 #[rstest]
@@ -1595,9 +1946,12 @@ async fn test_generate_order_status_report_single_requires_instrument_id() {
         causation_id: None,
     };
 
-    let result = client.generate_order_status_report(&cmd).await.unwrap();
+    let error = client
+        .generate_order_status_report(&cmd)
+        .await
+        .expect_err("missing instrument_id is not venue absence");
 
-    assert!(result.is_none());
+    assert!(error.to_string().contains("requires instrument_id"));
 }
 
 #[rstest]
@@ -2537,8 +2891,12 @@ async fn test_submit_market_order_posts_order_type_from_time_in_force(
 
 #[rstest]
 #[tokio::test]
-async fn test_submit_market_order_buy_accepted() {
+async fn test_submit_market_order_buy_uses_balance_projection() {
     let state = TestServerState::default();
+    *state.balance_response.lock().await = json!({
+        "balance": "37506152",
+        "allowances": {"exchange": "1000"},
+    });
     *state.order_response.lock().await = Some(constructed_order_response("live"));
     let addr = start_mock_server(state.clone()).await;
     let (mut client, mut rx, cache) = create_test_execution_client(addr);
@@ -2818,7 +3176,13 @@ async fn test_submit_market_order_denies_invalid_derived_price_before_post(
         .unwrap();
 
     let denied = assert_order_event(recv_execution_event(&mut rx).await, "Denied");
-    assert_eq!(order_event_reason(&denied), expected_reason);
+    assert_eq!(
+        order_event_reason(&denied),
+        OrderDeniedReason::ValidationFailed {
+            detail: expected_reason.to_string(),
+        }
+        .to_string()
+    );
     assert_eq!(*state.order_post_count.lock().await, 0);
     assert_no_execution_event(&mut rx).await;
 }
@@ -3211,6 +3575,46 @@ async fn test_submit_post_only_order_http_rejection_is_clean_and_classified() {
 
     assert_eq!(rejected.reason.as_str(), reason);
     assert!(rejected.due_post_only);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_version_mismatch_emits_actionable_rejection() {
+    let state = TestServerState::default();
+    *state.order_response_status.lock().await = StatusCode::BAD_REQUEST;
+    *state.order_response.lock().await = Some(json!({"error": "order_version_mismatch"}));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-VERSION-MISMATCH",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    let rejected = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
+
+    assert_eq!(
+        order_event_reason(&rejected),
+        "Polymarket CLOB order version mismatch; adapter supports V2 only"
+    );
+    assert_no_execution_event(&mut rx).await;
 }
 
 fn assert_order_status_report(event: ExecutionEvent, expected_status: OrderStatus) {
@@ -3881,7 +4285,10 @@ async fn test_submit_gtd_order_denied_below_expiry_buffer_before_post() {
     let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
     assert_eq!(
         order_event_reason(&denied),
-        "Polymarket GTD expiry must be at least 180 seconds in the future",
+        OrderDeniedReason::ValidationFailed {
+            detail: "Polymarket GTD expiry must be at least 180 seconds in the future".to_string(),
+        }
+        .to_string(),
     );
     assert_eq!(*state.order_post_count.lock().await, 0);
     assert_eq!(*state.batch_order_post_count.lock().await, 0);
@@ -3931,7 +4338,11 @@ async fn test_submit_gtd_order_list_denies_invalid_legs_before_batch_post() {
         let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
         assert_eq!(
             order_event_reason(&denied),
-            "Polymarket GTD expiry must be at least 180 seconds in the future",
+            OrderDeniedReason::ValidationFailed {
+                detail: "Polymarket GTD expiry must be at least 180 seconds in the future"
+                    .to_string(),
+            }
+            .to_string(),
         );
     }
     assert_eq!(*state.order_post_count.lock().await, 0);
@@ -3991,7 +4402,10 @@ async fn test_submit_gtd_order_list_preserves_valid_legs() {
     let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
     assert_eq!(
         order_event_reason(&denied),
-        "Polymarket GTD expiry must be at least 180 seconds in the future",
+        OrderDeniedReason::ValidationFailed {
+            detail: "Polymarket GTD expiry must be at least 180 seconds in the future".to_string(),
+        }
+        .to_string(),
     );
     assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
     assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
@@ -4128,7 +4542,10 @@ async fn test_submit_order_denied_for_price_out_of_range(#[case] price: &str) {
     let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
     assert_eq!(
         order_event_reason(&denied),
-        format!("Limit order price {price} outside Polymarket range [0.0001, 0.9999]")
+        OrderDeniedReason::ValidationFailed {
+            detail: format!("Limit order price {price} outside Polymarket range [0.0001, 0.9999]"),
+        }
+        .to_string()
     );
     assert_eq!(*state.order_post_count.lock().await, 0);
 }
@@ -4170,7 +4587,12 @@ async fn test_submit_order_denied_for_price_misaligned(
     let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
     assert_eq!(
         order_event_reason(&denied),
-        format!("Limit order price {price} does not conform to Polymarket tick size {tick_size}")
+        OrderDeniedReason::ValidationFailed {
+            detail: format!(
+                "Limit order price {price} does not conform to Polymarket tick size {tick_size}"
+            ),
+        }
+        .to_string()
     );
     assert_eq!(*state.order_post_count.lock().await, 0);
 }
@@ -4249,9 +4671,12 @@ async fn test_submit_immediate_limit_buy_denies_fractional_cent_maker_amount(
     let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
     assert_eq!(
         order_event_reason(&denied),
-        format!(
-            "Polymarket {order_type} BUY maker amount 4.805 pUSD exceeds 2 decimal places for price 0.961 and quantity 5"
-        ),
+        OrderDeniedReason::ValidationFailed {
+            detail: format!(
+                "Polymarket {order_type} BUY maker amount 4.805 pUSD exceeds 2 decimal places for price 0.961 and quantity 5"
+            ),
+        }
+        .to_string(),
     );
     assert_eq!(*state.order_post_count.lock().await, 0);
 }
@@ -4471,9 +4896,8 @@ async fn test_submit_order_denied_for_missing_cached_instrument() {
 
     assert_eq!(
         reason,
-        InstrumentLookupError::not_found(instrument_id).to_string()
+        OrderDeniedReason::InstrumentNotFound { instrument_id }.to_string()
     );
-    assert_eq!(reason, format!("{INSTRUMENT_NOT_FOUND}: {instrument_id}"));
 }
 
 #[rstest]
@@ -4726,7 +5150,7 @@ async fn test_submit_order_malformed_success_response_remains_unknown() {
 
 #[rstest]
 #[tokio::test]
-async fn test_submit_order_too_early_retries_then_rejects_definitively() {
+async fn test_submit_order_too_early_retries_then_remains_unknown() {
     let state = TestServerState::default();
     *state.order_response_status.lock().await = StatusCode::TOO_EARLY;
     *state.order_response.lock().await =
@@ -4757,11 +5181,107 @@ async fn test_submit_order_too_early_retries_then_rejects_definitively() {
         .unwrap();
 
     assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
-    let rejected = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
-    assert_eq!(
-        order_event_reason(&rejected),
-        "the market is not yet ready to process new orders"
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await == 2 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_bare_429_retries_then_remains_unknown() {
+    let state = TestServerState::default();
+    *state.order_response_status.lock().await = StatusCode::TOO_MANY_REQUESTS;
+    *state.order_response.lock().await = Some(json!({"error": "Rate limit exceeded"}));
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(HeaderName::from_static("retry-after"), "0".parse().unwrap());
+    *state.order_response_headers.lock().await = response_headers;
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 1);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-BARE-429",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
     );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move { *state.order_post_count.lock().await == 2 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_signer_429_retries_then_rejects() {
+    let state = TestServerState::default();
+    *state.order_response_status.lock().await = StatusCode::TOO_MANY_REQUESTS;
+    *state.order_response.lock().await = Some(json!({"error": "Rate limit exceeded"}));
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(
+        HeaderName::from_static("poly-ratelimit-remaining"),
+        "0".parse().unwrap(),
+    );
+    response_headers.insert(
+        HeaderName::from_static("poly-ratelimit-tier"),
+        "Standard".parse().unwrap(),
+    );
+    *state.order_response_headers.lock().await = response_headers;
+
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client_with_retries(addr, 1);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order = make_limit_order(
+        "O-SIGNER-429",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order(make_submit_cmd(&order, instrument_id))
+        .unwrap();
+
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    let rejected = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
+    assert_eq!(order_event_reason(&rejected), "Rate limit exceeded");
     assert_eq!(*state.order_post_count.lock().await, 2);
 }
 
@@ -5195,9 +5715,12 @@ async fn test_submit_order_list_denies_unrepresentable_immediate_buys_before_pos
         let denied = assert_order_event(rx.try_recv().unwrap(), "Denied");
         assert_eq!(
             order_event_reason(&denied),
-            format!(
-                "Polymarket {order_type} BUY maker amount 4.805 pUSD exceeds 2 decimal places for price 0.961 and quantity 5"
-            ),
+            OrderDeniedReason::ValidationFailed {
+                detail: format!(
+                    "Polymarket {order_type} BUY maker amount 4.805 pUSD exceeds 2 decimal places for price 0.961 and quantity 5"
+                ),
+            }
+            .to_string(),
         );
     }
     assert_eq!(*state.order_post_count.lock().await, 0);
@@ -6006,6 +6529,122 @@ async fn test_submit_order_list_preserves_rejected_reason_from_batch_response() 
 }
 
 #[rstest]
+#[tokio::test]
+async fn test_submit_order_list_version_mismatch_response_is_actionable() {
+    let state = TestServerState::default();
+    *state.batch_order_response.lock().await = Some(json!([
+        {"success": false, "orderID": null, "errorMsg": "order_version_mismatch"},
+        {"success": true, "orderID": "0xversion-match-2", "errorMsg": ""}
+    ]));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order1 = make_limit_order(
+        "O-LIST-VERSION-MISMATCH-1",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    let order2 = make_limit_order(
+        "O-LIST-VERSION-MISMATCH-2",
+        instrument_id,
+        OrderSide::Sell,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order1.clone(), None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_order(order2.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order_list(make_submit_order_list_cmd(instrument_id, &[order1, order2]))
+        .unwrap();
+
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    let rejected = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
+    assert_order_event(recv_execution_event(&mut rx).await, "Accepted");
+
+    assert_eq!(
+        order_event_reason(&rejected),
+        "Polymarket CLOB order version mismatch; adapter supports V2 only"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_order_list_http_version_mismatch_rejects_every_order() {
+    let state = TestServerState::default();
+    *state.batch_order_response_status.lock().await = StatusCode::BAD_REQUEST;
+    *state.batch_order_response.lock().await = Some(json!({"error": "order_version_mismatch"}));
+    let addr = start_mock_server(state.clone()).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    add_instrument_to_cache(&cache, instrument_id);
+    let order1 = make_limit_order(
+        "O-LIST-HTTP-VERSION-MISMATCH-1",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    let order2 = make_limit_order(
+        "O-LIST-HTTP-VERSION-MISMATCH-2",
+        instrument_id,
+        OrderSide::Sell,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+    cache
+        .borrow_mut()
+        .add_order(order1.clone(), None, None, false)
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_order(order2.clone(), None, None, false)
+        .unwrap();
+
+    client
+        .submit_order_list(make_submit_order_list_cmd(instrument_id, &[order1, order2]))
+        .unwrap();
+
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    assert_order_event(recv_execution_event(&mut rx).await, "Submitted");
+    let rejected1 = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
+    let rejected2 = assert_order_event(recv_execution_event(&mut rx).await, "Rejected");
+
+    assert_eq!(
+        order_event_reason(&rejected1),
+        "Polymarket CLOB order version mismatch; adapter supports V2 only"
+    );
+    assert_eq!(
+        order_event_reason(&rejected2),
+        "Polymarket CLOB order version mismatch; adapter supports V2 only"
+    );
+    assert_eq!(*state.batch_order_post_count.lock().await, 1);
+    assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
 #[case::unknown_client_id("unknown")]
 #[case::closed_order("closed")]
 #[case::unsupported_order_type("unsupported")]
@@ -6112,11 +6751,14 @@ async fn test_submit_order_list_filters_out_ineligible_entries(#[case] kind: &st
 
         match kind {
             "unsupported" => assert!(
-                reason.contains("Unsupported order type"),
+                reason.contains("UNSUPPORTED_ORDER_TYPE"),
                 "reason was {reason}"
             ),
             "missing_instrument" => {
-                assert!(reason.contains(INSTRUMENT_NOT_FOUND), "reason was {reason}");
+                assert!(
+                    reason.contains("INSTRUMENT_NOT_FOUND"),
+                    "reason was {reason}"
+                );
             }
             _ => unreachable!(),
         }
@@ -6362,6 +7004,44 @@ async fn test_cancel_order_ambiguous_http_failure_does_not_emit_cancel_rejected(
     )
     .await;
     assert_no_execution_event(&mut rx).await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_cancel_order_http_400_emits_cancel_rejected() {
+    let state = TestServerState::default();
+    *state.cancel_response_status.lock().await = StatusCode::BAD_REQUEST;
+    *state.cancel_response.lock().await = Some(json!({"error": "order does not exist"}));
+    let addr = start_mock_server(state).await;
+    let (mut client, mut rx, cache) = create_test_execution_client(addr);
+    client.start().unwrap();
+
+    let instrument_id = InstrumentId::from("TEST-TOKEN.POLYMARKET");
+    let mut order = make_limit_order(
+        "O-CANCEL-400",
+        instrument_id,
+        OrderSide::Buy,
+        false,
+        false,
+        false,
+        TimeInForce::Gtc,
+    );
+
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    submit_and_accept_order(&cache, &mut order, "0xvenue-cancel-400");
+
+    let cmd = make_cancel_cmd("O-CANCEL-400", instrument_id);
+    client.cancel_order(cmd).unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let rejected = assert_order_event(event, "CancelRejected");
+    assert_eq!(order_event_reason(&rejected), "order does not exist");
 }
 
 #[rstest]

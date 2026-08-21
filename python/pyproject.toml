@@ -4,7 +4,6 @@ version = "2.0.0rc3"
 description = "Production-grade Rust-native trading engine with deterministic event-driven architecture"
 authors = [{ name = "Nautech Systems", email = "info@nautechsystems.io" }]
 classifiers = [
-  "License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)",
   "Operating System :: OS Independent",
   "Development Status :: 4 - Beta",
   "Programming Language :: Python :: 3",
@@ -20,7 +19,8 @@ classifiers = [
   "Intended Audience :: Financial and Insurance Industry",
   "Intended Audience :: Science/Research",
 ]
-license = { text = "LGPL-3.0-or-later" }
+license = "LGPL-3.0-only"
+license-files = ["LICENSE"]
 readme = "../README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = []
@@ -66,8 +66,6 @@ include = ["**/*.pyi"]
 [tool.uv]
 required-version = ">=0.12,<0.13"
 exclude-newer = "7 days"
-# Allow Ruff 0.16.2 while retaining the cooldown cutoff for later releases.
-exclude-newer-package = { ruff = "2026-08-08T00:00:00Z" }
 # Block sdist builds for every third-party package in python/uv.lock so
 # unexpected loss of wheel publishing fails `uv lock` instead of silently
 # building from source. Kept in sync with python/uv.lock by
@@ -82,11 +80,13 @@ no-build-package = [
   "certifi",
   "charset-normalizer",
   "choreographer",
+  "click",
   "colorama",
   "coverage",
   "docutils",
   "execnet",
   "furo",
+  "h11",
   "idna",
   "imagesize",
   "iniconfig",
@@ -140,6 +140,8 @@ no-build-package = [
   "tzdata",
   "uc-micro-py",
   "urllib3",
+  "uvicorn",
+  "uvloop",
 ]
 
 [dependency-groups]
@@ -149,6 +151,8 @@ test = [
   "pytest-asyncio>=1.4.0",
   "pytest-cov>=7.1.0",
   "pytest-xdist[psutil]>=3.8.0",
+  "uvicorn>=0.52.1",
+  "uvloop>=0.22.1; sys_platform != 'win32'",
 ]
 docs = [
   "furo==2025.12.19",

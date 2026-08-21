@@ -2,14 +2,16 @@
 
 ## Introduction
 
-Use this guide to build or extend a Rust‑native adapter for NautilusTrader v2. Adapters connect the
+Use this guide to build or extend a Rust‑native adapter for NautilusTrader. Adapters connect the
 platform to venues and data providers, preserve venue semantics, produce valid Nautilus domain
 events, and make uncertain outcomes explicit. They implement the platform data and execution
 client traits in Rust, then expose configs, factories, and selected low‑level APIs to Python
 through PyO3.
 
 :::note
-Python v2 will eventually provide a custom‑adapter API that matches Python v1.
+The public Python API does not yet define an interface for implementing an out‑of‑tree
+adapter entirely in Python. An out‑of‑tree Python adapter surface is planned. This guide
+covers in‑tree Rust adapters.
 :::
 
 Use reference adapters selectively. Their layouts reflect different venue protocols, product
@@ -30,6 +32,101 @@ This guide distinguishes four kinds of guidance:
 - **Common patterns** appear in several adapters but allow other designs.
 - **Examples** show one sound implementation without making it mandatory.
 - **Exceptions** are valid when venue semantics or protocol boundaries require them.
+
+## Conformance
+
+An adapter conforms when it satisfies each rule below that applies to it, or documents an exception.
+Name the venue behavior that forces the exception, keep it inside the adapter, and cover it with a
+test that fails if the venue stops requiring it. [Phase 7](#phase-7-prove-conformance) sequences the
+work that proves conformance.
+
+### Adapter foundations
+
+| Rule                                                                                       | Applies to         |
+| ------------------------------------------------------------------------------------------ | ------------------ |
+| [Repository and Python wiring](#repository-and-python-wiring)                              | New adapter crates |
+| [Credentials and secret handling](#credentials-and-secret-handling)                        | Every adapter      |
+| [Configurations](#configurations-configrs)                                                 | Every adapter      |
+| [Symbols and instrument identity](#symbols-and-instrument-identity)                        | Every adapter      |
+| [Venue payload modeling and precision](#modeling-venue-payloads)                           | Every adapter      |
+| [Client traits and factories](#client-traits-and-factories-datars-executionrs-factoriesrs) | Every adapter      |
+
+### Runtime and client lifecycle
+
+| Rule                                                  | Applies to                 |
+| ----------------------------------------------------- | -------------------------- |
+| [Connection lifecycle](#connection-lifecycle-connect) | Data and execution clients |
+| [Data events and request freshness](#data-client)     | Data clients               |
+| [Backpressure](#backpressure)                         | Every adapter              |
+| [Task management](#task-management)                   | Every adapter              |
+
+### Execution and reconciliation
+
+| Rule                                                                                          | Applies to        |
+| --------------------------------------------------------------------------------------------- | ----------------- |
+| [Execution client boundaries](#execution-client)                                              | Execution clients |
+| [Reconciliation reports](#reconciliation-reports)                                             | Execution clients |
+| [Commission failure handling](#commission-failure-handling)                                   | Execution clients |
+| [Bounded mass‑status reports](#bounded-mass-status-reports)                                   | Execution clients |
+| [Instrument resolution during reconciliation](#instrument-resolution-during-reconciliation)   | Execution clients |
+| [Tracked and external execution updates](#tracked-and-external-execution-updates)             | Execution clients |
+| [Event ordering and deduplication](#event-ordering-and-deduplication)                         | Execution clients |
+| [Order command outcome policy](#order-command-outcome-policy)                                 | Execution clients |
+| [Naming the evidence classes](#naming-the-evidence-classes)                                   | Execution clients |
+| [Diagnostics and strategy‑facing reasons](#separate-diagnostics-from-strategy-facing-reasons) | Execution clients |
+
+### Transport and streaming
+
+| Rule                                                                            | Applies to                       |
+| ------------------------------------------------------------------------------- | -------------------------------- |
+| [Request flow](#request-flow)                                                   | HTTP clients                     |
+| [Request signing and authentication](#request-signing-and-authentication)       | HTTP and WebSocket request paths |
+| [Error handling and retry logic](#error-handling-and-retry-logic)               | HTTP and WebSocket request paths |
+| [Rate limiting](#rate-limiting)                                                 | HTTP and WebSocket clients       |
+| [Handler initialization handshake](#handler-initialization-handshake-setclient) | WebSocket clients                |
+| [Authentication](#authentication)                                               | WebSocket clients                |
+| [Subscription management](#subscription-management)                             | WebSocket clients                |
+| [Message routing](#message-routing)                                             | WebSocket clients                |
+| [Reconnection and shutdown](#reconnection-and-shutdown)                         | WebSocket clients                |
+
+The [data testing specification](spec_data_testing.md) and
+[execution testing specification](spec_exec_testing.md) hold the scenarios that prove these
+contracts against a venue.
+
+### Shared baseline
+
+Leverage the shared implementation of each piece below, then use any state structure that satisfies
+the contract it implements. The shared type carries that contract with it and keeps behavior
+comparable across venues, so a local structure has to prove the same contract on its own terms.
+
+Two execution clients implement the same trait without trading through a venue API, so the baseline
+does not apply to them: [sandbox](../../crates/adapters/sandbox/src/execution.rs) simulates fills
+locally, and [blockchain](../../crates/adapters/blockchain/src/execution/client.rs) executes
+on‑chain behind the `defi` feature. Deterministic simulation eligibility also sits outside the
+baseline, as an optional capability proven per adapter rather than a requirement.
+
+| Target                     | Shared piece                                                                     | Contract                                                                      |
+| -------------------------- | -------------------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Command outcome evidence   | [`CommandFailure`](../../crates/live/src/execution/failure.rs)                   | [Naming the evidence classes](#naming-the-evidence-classes)                   |
+| Order identity and context | [`OrderIdentity` and `OrderContext`](../../crates/live/src/execution/context.rs) | [Tracked and external updates](#tracked-and-external-execution-updates)       |
+| Replay deduplication       | [`FifoCache` and `FifoCacheMap`](../../crates/common/src/cache/fifo.rs)          | [Event ordering and deduplication](#event-ordering-and-deduplication)         |
+| Order denial reasons       | [`OrderDeniedReason`](../../crates/model/src/events/order/denied_reason.rs)      | [Diagnostics and reasons](#separate-diagnostics-from-strategy-facing-reasons) |
+| Task lifecycle             | [`TaskHandles`](../../crates/common/src/live/task.rs)                            | [Task management](#task-management)                                           |
+| Ingestion precision        | [Domain numeric types](rust.md#domain-numeric-types)                             | [Venue payload modeling](#modeling-venue-payloads)                            |
+| HTTP transport             | [`HttpClient`](../../crates/network/src/http/client.rs)                          | [Request flow](#request-flow)                                                 |
+| Authentication state       | [`AuthTracker`](../../crates/network/src/websocket/auth.rs)                      | [Authentication](#authentication)                                             |
+| Subscription identity      | [`SubscriptionState`](../../crates/network/src/websocket/subscription.rs)        | [Subscription management](#subscription-management)                           |
+| Reconnect requests         | [`request_reconnect`](../../crates/network/src/websocket/client.rs)              | [Reconnection and shutdown](#reconnection-and-shutdown)                       |
+| Retry machinery            | [`RetryManager`](../../crates/network/src/retry.rs)                              | [Error handling and retry logic](#error-handling-and-retry-logic)             |
+| Inferred fill commission   | [`ExecutionClient`](../../crates/common/src/clients/execution.rs)                | [Commission failure handling](#commission-failure-handling)                   |
+
+Where a venue transmits a discrete value as an IEEE‑754 field rather than a decimal string or JSON
+number, contain that at the parsing boundary as a documented exception instead of letting `f64`
+spread inward from it.
+
+Retry classification is the exception to this table: it stays adapter‑owned because venue status
+codes and rate‑limit semantics differ. The shared machinery around it is not. See
+[error handling and retry logic](#error-handling-and-retry-logic) for both halves.
 
 ## Structure of an adapter
 
@@ -379,6 +476,42 @@ Model the wire format, not an imagined stable subset:
 Avoid permissive fallbacks that silently turn a new venue value into an existing semantic value.
 Stable error handling is part of the parser contract.
 
+#### Venue enum fallbacks
+
+Venues extend wire enums without notice: new order states, order types, and category codes appear
+in production before clients update. Give each extensible venue enum a forward‑compatible fallback
+variant (`Unknown` for venue states, `Other` for open value sets such as types and categories) with
+`#[serde(other)]`, so one new value cannot fail deserialization of the message carrying it. Closed
+sets the adapter defines stay strict.
+
+The fallback changes where strictness lives, not whether it exists:
+
+- Never panic on an unknown wire variant; the fallback keeps the connection and the sibling records
+  in the same payload alive.
+- Never map an unknown variant onto an existing domain value. Make the domain mapping fallible
+  (`TryFrom`) so the fallback variant is rejected explicitly at the mapping boundary.
+- Preserve safety‑critical payload data even when a sibling classification is unmapped. A fill
+  must still be parsed and emitted when its order state or order type is unknown, because fill
+  fields carry their own prices, quantities, and fees.
+- Skip only the unmappable classification and log a warning with the venue identifiers (order ID,
+  instrument) needed to investigate. When the message carries no data worth preserving, fail the
+  record explicitly instead of inventing a status. Reconciliation heals the gap once the order
+  reaches a mapped state; an unmapped value fails the same way on the reconciliation path, so
+  treat the warning as the signal to add the mapping.
+
+#### Separate authority from projections
+
+Use separate response models when one endpoint returns both evidence that establishes permission or
+authorizes state mutation and data needed for a narrower read.
+
+| Boundary                   | Purpose                                                            | Validation                                                                                          | Meaning of success                                                           |
+| -------------------------- | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| **Authoritative response** | Establish permission or authorize state mutation.                  | Requires all authoritative fields; rejects legacy conflicts and semantic duplicates before mapping. | The response can support the authority decision it models.                   |
+| **Narrow projection**      | Read a balance, health value, or metadata without using authority. | Decodes returned fields only; its type cannot expose, grant, or infer omitted authority.            | Only the projected value; omitted permission or account evidence is unknown. |
+
+Use the projection when malformed authority fields must not block the narrower read. Keep the
+authoritative model strict.
+
 ### Client traits and factories (`data.rs`, `execution.rs`, `factories.rs`)
 
 The shared [`DataClient`](../../crates/common/src/clients/data.rs),
@@ -521,6 +654,191 @@ reports for reconciliation. They must support these boundaries consistently:
 Do not infer support from a venue API alone. Implement and test the Nautilus command and event
 semantics, then advertise the capability.
 
+#### Reconciliation reports
+
+Reconciliation reads venue state through five
+[`ExecutionClient`](../../crates/common/src/clients/execution.rs) report methods. They return
+reports rather than emitting order events, leaving the execution engine to decide what a difference
+between cached state and venue state means.
+
+| Method                             | Produces                                                                             | Driven by                                                            |
+| ---------------------------------- | ------------------------------------------------------------------------------------ | -------------------------------------------------------------------- |
+| `generate_order_status_report`     | One optional [`OrderStatusReport`](../../crates/model/src/reports/order.rs).         | A targeted probe for one order the open‑order check left unresolved. |
+| `generate_order_status_reports`    | [`OrderStatusReport`](../../crates/model/src/reports/order.rs) values.               | Mass status and the periodic open‑order check.                       |
+| `generate_fill_reports`            | [`FillReport`](../../crates/model/src/reports/fill.rs) values.                       | Mass status.                                                         |
+| `generate_position_status_reports` | [`PositionStatusReport`](../../crates/model/src/reports/position.rs) values.         | Mass status and the periodic position check.                         |
+| `generate_mass_status`             | One optional [`ExecutionMassStatus`](../../crates/model/src/reports/mass_status.rs). | Startup reconciliation, once per execution client.                   |
+
+`generate_mass_status` runs once per execution client before trading starts. Its default
+implementation composes the three bulk methods concurrently from one `ts_init`, derives each
+command's `start` from `lookback_mins`, and requests full order history with `open_only=false`.
+Implementing the bulk methods is therefore enough for startup. Override the composition when the
+client declares a history bound, as described in
+[bounded mass‑status reports](#bounded-mass-status-reports), or when it does not use the realtime
+clock. Returning `Ok(None)` logs a warning and leaves that client unreconciled, while an error
+fails startup.
+
+The bulk methods take a filter command carrying `instrument_id`, `start`, and `end`, plus
+`open_only` for order reports and `venue_order_id` for fill reports. Apply every filter the venue
+endpoint supports and complete the rest locally. `open_only` separates the currently open orders a
+periodic check needs from the history a mass status needs. Log report counts at the command's
+`log_receipt_level` so periodic checks stay at debug while mass status logs at info.
+
+When a periodic check request fails, the engine marks that client failed for the cycle and stops
+inferring absence for the orders and positions it covers. Returning an error is therefore safer
+than returning an empty set.
+
+`generate_order_status_report` resolves a single order. The engine issues it after the open‑order
+check retries without confirming a cached order, which requires that check to run in full‑history
+mode (`open_check_open_only=false`). The command carries the queried `instrument_id` and
+`client_order_id`, plus `venue_order_id` when the order has one, so support a lookup that has no
+venue identifier yet. The engine discards a report whose identity does not match the query.
+
+Distinguish absence from failure in that probe, because the engine acts on the difference:
+
+- `Ok(None)` states that the venue answered and has no such order. The engine treats that as proof
+  and resolves an accepted, submitted, or partially filled order to a terminal state, while pending
+  cancel and update states stay unresolved.
+- An error states that the lookup did not answer, so the engine defers the missing‑order resolution
+  to a later cycle.
+
+A failed lookup returned as `Ok(None)` can therefore reject or cancel an order that is live at the
+venue. The trait default returns `Ok(None)` after logging that the handler is not implemented, so
+implement this method before an open‑order check runs in full‑history mode.
+
+[Execution reconciliation](../concepts/reconciliation.md) documents what the engine does with these
+reports, including the startup procedure, the runtime checks that drive the periodic and targeted
+requests, and their retry and throttling rules. Cases TC-E84 to TC-E87 and TC-E101 in the
+[execution testing specification](spec_exec_testing.md) exercise startup reconciliation against a
+venue. Cases TC-E88 and TC-E89 use deterministic fixtures to exercise REST and private‑stream
+commission failure.
+
+#### Commission failure handling
+
+Commission is part of a fill's economic record. Calculate it with exact decimal arithmetic, then
+construct the venue currency's [`Money`](../../crates/model/src/types/money.rs) value. The shared
+`ExecutionClient::calculate_commission` hook distinguishes these outcomes:
+
+| Result                 | Meaning                                                                                  |
+| ---------------------- | ---------------------------------------------------------------------------------------- |
+| `Ok(Some(commission))` | The venue formula applies and produces a representable commission. Use that exact value. |
+| `Ok(None)`             | The adapter has no venue override. The caller may use the generic commission formula.    |
+| `Err(error)`           | The venue formula applies but cannot produce a representable value. Fail closed.         |
+
+Never replace `Err(error)` with zero commission or the generic formula. That substitution records a
+confirmed trade with economics the venue did not report.
+
+##### REST report construction
+
+Commission construction belongs to the REST report request. If it fails for any required fill,
+return an error from the direct fill report request, targeted recovery, or complete mass status.
+Never drop the fill, return a partial mass status, or mark a bounded report set incomplete for this
+failure. Otherwise, an order or position report can cause the engine to infer the same quantity
+without its venue commission.
+
+During startup, the error prevents the node from starting and leaves that client's mass status
+unapplied. Periodic and targeted reconciliation defer the affected work until a later cycle.
+
+##### Inferred fills
+
+Call the hook for every adapter‑backed inferred fill: external and cached orders, continuous
+reconciliation, and targeted order recovery. If commission calculation fails, the engine may apply
+valid explicit fills, but it leaves the residual inferred quantity and dependent terminal
+transition pending.
+
+For an external order, calculate commission before a cache or event transition could prevent a
+retry. If the responsible execution client is unavailable, defer the inferred fill instead of
+treating the missing client as an `Ok(None)` response.
+
+Pass the same quantity, price, and liquidity side as the inferred‑fill event. For a cached order with
+prior fills, calculate commission from the back‑solved price of the unbooked incremental quantity,
+not the venue report's cumulative average price.
+
+A position‑only synthetic correction has no underlying trade evidence and may leave commission
+unspecified. Do not present an aggregate or generic value as the exact commission for that unknown
+fill; this case is distinct from a failed venue calculation.
+
+##### WebSocket trade processing
+
+Process each WebSocket trade atomically. Construct every owned maker and taker fill report before
+emitting any report, mutating fill trackers, or consuming the trade's deduplication key. Consume the
+key only after all reports route successfully.
+
+On failure, log the error and leave the trade unprocessed. Do not confirm or terminalize the
+affected orders or mark them permanently unreconcilable. A duplicate or reconnect replay can retry
+the trade. Scheduled REST reconciliation remains the authoritative recovery path; the WebSocket
+handler does not start an immediate REST request.
+
+#### Bounded mass-status reports
+
+When an execution client applies a lower time bound to historical reconciliation reports, record
+the contract with `ExecutionMassStatus::set_report_window(Some(lookback_start),
+reports_complete)`. Capture one cutoff for the mass‑status request and use it for every historical
+order and fill query. A moving cutoff can omit records at different boundaries and produce a report
+set that never existed at the venue.
+
+Set `reports_complete=true` only when every source needed to interpret the bounded history
+completed and all required records were parsed, mapped, and linked to their orders. A failed
+required source, required row that cannot be parsed or mapped, or historical fill without its
+required order report makes the set incomplete. Preserve successful legs and authoritative active
+orders, but do not represent a failed historical query as a successful empty result.
+
+Commission construction is an exception to partial bounded history. Follow
+[commission failure handling](#commission-failure-handling) and fail the report request instead of
+returning a set that omits the affected fill.
+
+When positions come from a cached stream, absence proves flat only when a complete snapshot from
+the current connection epoch positively covers that instrument. Invalidate snapshot coverage on
+reconnect, and keep a row uncovered when it could not be parsed or mapped. Emit an explicit flat
+report for an absent touched instrument only after that coverage is established.
+
+Preserve stable venue order and trade identities across live dispatch and mass status. Include
+client order linkage and `venue_position_id` where the venue supplies them so the execution engine
+can distinguish a coherent lifecycle from ambiguous history. See
+[Bounded history safety](../concepts/reconciliation.md#bounded-history-safety) for the engine's
+economic application rules.
+
+#### Instrument resolution during reconciliation
+
+Report generation resolves each record's instrument to parse venue payloads at the correct price and
+size precision. Resolve it from the instruments the adapter loaded during connect, and classify a
+miss by whether the record was in scope.
+
+Do not request an instrument from the venue while generating reports:
+
+- Per‑record requests multiply the bulk queries that startup reconciliation already issues against
+  the venue's rate limits.
+- Hidden requests make reconciliation timing and results irreproducible.
+- A failed request cannot be distinguished from an instrument the venue does not have.
+
+Load what the adapter needs during connect instead.
+
+An in‑scope record whose instrument is missing is never dropped silently. A discarded open order
+report is indistinguishable from an order the venue never had, which leads the engine to resolve a
+live order as missing at the venue. Scope decides whether a miss is expected, so evaluate it before
+classifying the record:
+
+| Record                                         | Outcome                                 | Report set                         |
+| ---------------------------------------------- | --------------------------------------- | ---------------------------------- |
+| Out of scope for `load_ids`                    | Log at debug and drop                   | Unaffected                         |
+| In scope, open order or position status report | Return an error from the report request | Not returned                       |
+| In scope, closed or historical record          | Log a warning naming the instrument     | Incomplete when history is bounded |
+
+`InstrumentProviderConfig.load_ids` defines that scope. When it names an explicit set, records for
+instruments outside it are expected absences rather than errors, so a node scoped to one instrument
+neither fails nor warns because the venue returned records for the rest.
+
+Historical queries reach past the loaded instrument set routinely, because expiries retire
+instruments that earlier fills still reference. Failing a bounded‑history query for one expired
+instrument would withhold every other record it returned, so record the incompleteness through
+`set_report_window` and let the engine apply its bounded‑history rules. The engine acts on that
+incompleteness only for a mass status that declares `lookback_start`; an adapter that declares no
+bound follows the compatibility fill‑adjustment path instead.
+
+`reconciliation_instrument_ids` filters reports after the execution engine receives them, so it
+cannot prevent a resolution failure inside an adapter. Keep the adapter's scope in its instrument
+provider configuration.
+
 #### Tracked and external execution updates
 
 Route execution updates according to order ownership, independent of the dispatch module layout:
@@ -541,6 +859,10 @@ type. Order context combines that identity with the submitted order shape needed
 events without accessing the engine cache, such as quantity, price and trigger details, time in
 force, and execution flags. Keep venue order bindings, request correlation, cumulative fills, and
 replace state in adapter‑owned context around that common surface.
+
+[`OrderIdentity` and `OrderContext`](../../crates/live/src/execution/context.rs) provide that
+surface. Start from them, and keep an adapter‑local structure only where it proves the same routing
+decision.
 
 Register the order context before sending or spawning work that can produce an inbound update.
 Restore context for active local orders before processing their live updates, and retain it while
@@ -689,6 +1011,19 @@ strategy‑facing reason only at the execution event boundary, after the outcome
 | ---------------------- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Diagnostic error       | Classification, retry control, logs, and operators | Typed source plus available status, venue code, endpoint, backoff, transport, and decode context.        |
 | Strategy‑facing reason | Rejection events consumed by strategies            | Bounded venue meaning without HTTP prefixes, response envelopes, markup, control characters, or secrets. |
+
+Format standardized local denial messages from
+[`OrderDeniedReason`](../../crates/model/src/events/order/denied_reason.rs) with the minimum suffix
+needed to identify the diagnostic context:
+
+- Emit `CODE` when the denial needs no diagnostic suffix.
+- Use `CODE: value` for one typed value or a free‑text diagnostic. The code already identifies a
+  single value, so do not repeat its name.
+- Use `CODE: key=value, key=value` only when multiple typed values need disambiguation.
+- Use `CODE: value; free text` when one typed value precedes a free‑text diagnostic.
+
+Only the leading code is canonical. Do not parse the diagnostic suffix to recover classification,
+retryability, or command outcome.
 
 Apply these rules at the boundary:
 
@@ -1056,13 +1391,20 @@ Reconnection must restore protocol state, not only the socket:
 Support both WebSocket control frames and venue text heartbeats when applicable. Let the shared
 client handle protocol control frames; keep application heartbeat messages in the venue handler.
 
+A handler‑mode client requests a reconnect through the shared client rather than a private
+reconnect loop. Its `request_reconnect` returns `true` only when the call moves an active client
+into reconnecting. Take the reconnect handle's `request_reconnect` when the adapter must
+distinguish the `ReconnectRequestOutcome` variants, since an already reconnecting, disconnecting,
+closed, or unsupported transport each warrant a different response. Stream‑mode clients own their
+reconnect loop, and their handles report `Unsupported`.
+
 Shutdown signals tasks, asks the transport to close, and then joins or aborts owned work according
 to a bounded policy. Make repeated shutdown safe. Do not assume a handler `JoinHandle` has one
 owner when client objects can be cloned.
 
 ### Backpressure
 
-Shared WebSocket transport and adapter event paths use unbounded Tokio channels so receive
+Shared WebSocket transport and adapter event paths use **unbounded** Tokio channels so receive
 loops do not wait for queue capacity. Preserve that convention for live event paths. Introducing a
 bounded channel, coalescing, dropping, or disconnect‑on‑full policy changes platform semantics and
 needs an explicit shared design, not an adapter‑local change.
@@ -1224,6 +1566,11 @@ Execution tests cover each advertised command and report, plus:
 - Partial and per‑order batch results.
 - Duplicate or out‑of‑order stream updates.
 - Account state, open orders, fills, positions, and startup reconciliation.
+- One fixed cutoff across bounded order and fill queries, including records on the boundary.
+- Complete and incomplete mass statuses for each independently failing report source.
+- Position snapshot coverage after reconnect, skipped rows, explicit flats, and absent instruments.
+- Exact order recovery without position or portfolio effects when bounded history is incomplete or
+  ambiguous.
 - Idempotent stop, reset, and disposal.
 
 Keep adapter tests focused on adapter behavior. The
@@ -1253,10 +1600,11 @@ Provide the applicable tester entry points:
 - Python: `examples/live/<adapter>/data_tester.py` and `exec_tester.py`, using `LiveNode` and
   the Rust config and factory classes.
 
-Python tester scripts build without connecting by default and require `--run` to connect.
-Execution testers require the separate `--live-orders` opt‑in before order submission. Preserve
-that safety boundary. Rust tester controls vary; inspect them before running, and make any new or
-revised execution tester default to `ExecTester` dry‑run behavior.
+Python tester scripts run out of the box: settings live in module‑level constants at the top of
+the file, and running the script connects and starts immediately without CLI flags. Execution
+testers place real orders by default, so state this plainly in a warning at the top of the module
+and set `dry_run=False` explicitly in the `ExecTesterConfig` to advertise the dry‑run option. Rust
+tester controls vary; inspect them before running.
 
 ### Python boundary testing
 
@@ -1303,7 +1651,9 @@ clarifies operational capacity.
 
 Add venue‑specific suites for confirmed hot paths such as signing, hashing, binary codecs, or
 authentication. Lighter has focused cryptographic suites, and Derive has a signing suite. Do not
-require a category that the adapter does not use.
+require a category that the adapter does not use. Recorded Lighter signing numbers and the official
+Go comparison live in the
+[Lighter adapter benchmarks](../../crates/adapters/lighter/benches/BENCHMARKS.md).
 
 Follow the repository [benchmarking guide](../../BENCHMARKING.md) for tool choice, baselines, noise
 control, and result reporting. Use the

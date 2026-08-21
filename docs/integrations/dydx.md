@@ -274,7 +274,7 @@ The tiers are governance-adjustable. Query the live values from a node's
 `/dydxprotocol/clob/equity_tier` endpoint, or see
 [equity tier limits](https://docs.dydx.xyz/concepts/trading/limits/equity-tier-limits).
 
-### MIT and LIT round‑tripping
+### MIT and LIT round-tripping
 
 dYdX's protocol uses a single `TAKE_PROFIT` order type with a price (`subticks`) and trigger
 price; whether it behaves as market‑on‑trigger or limit‑on‑trigger is implicit in the price. The
@@ -606,7 +606,7 @@ The adapter supports the following data subscriptions:
 dYdX supports multiple subaccounts per wallet address, allowing segregation of trading strategies
 and risk management within a single wallet.
 
-### Key concepts
+### Concepts
 
 - Each wallet address can have multiple numbered subaccounts (0, 1, 2, ..., 127). Numbers 128 and
   above are the venue's isolated-margin child subaccounts, which this adapter does not support.

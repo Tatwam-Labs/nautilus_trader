@@ -84,6 +84,7 @@ impl Indicator for AverageTrueRange {
     }
 
     fn reset(&mut self) {
+        self.ma.reset();
         self.previous_close = 0.0;
         self.value = 0.0;
         self.count = 0;
@@ -109,7 +110,7 @@ impl AverageTrueRange {
             value: 0.0,
             count: 0,
             previous_close: 0.0,
-            ma: MovingAverageFactory::create(MovingAverageType::Simple, period),
+            ma: MovingAverageFactory::create(ma_type.unwrap_or(MovingAverageType::Simple), period),
             has_inputs: false,
             initialized: false,
         }
@@ -177,6 +178,24 @@ mod tests {
     fn test_period() {
         let atr = AverageTrueRange::new(10, Some(MovingAverageType::Simple), None, None);
         assert_eq!(atr.period, 10);
+    }
+
+    #[rstest]
+    #[case(None, "SimpleMovingAverage")]
+    #[case(Some(MovingAverageType::Simple), "SimpleMovingAverage")]
+    #[case(Some(MovingAverageType::Exponential), "ExponentialMovingAverage")]
+    #[case(
+        Some(MovingAverageType::DoubleExponential),
+        "DoubleExponentialMovingAverage"
+    )]
+    #[case(Some(MovingAverageType::Wilder), "WilderMovingAverage")]
+    #[case(Some(MovingAverageType::Hull), "HullMovingAverage")]
+    fn test_ma_type_creates_expected_inner_ma(
+        #[case] ma_type: Option<MovingAverageType>,
+        #[case] expected: &str,
+    ) {
+        let atr = AverageTrueRange::new(10, ma_type, None, None);
+        assert_eq!(atr.ma.name(), expected);
     }
 
     #[rstest]
@@ -298,5 +317,13 @@ mod tests {
         atr.reset();
         assert!(!atr.initialized);
         assert_eq!(atr.value, 0.0);
+    }
+
+    #[rstest]
+    fn test_reset_resets_inner_ma() {
+        let mut atr = AverageTrueRange::new(10, Some(MovingAverageType::Simple), None, None);
+        atr.update_raw(1.00010, 1.0, 1.00005);
+        atr.reset();
+        assert_eq!(atr.ma.count(), 0);
     }
 }

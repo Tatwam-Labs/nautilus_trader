@@ -17,7 +17,7 @@ use std::{sync::Arc, time::Duration};
 
 use nautilus_common::live::{get_runtime, task::TaskHandles};
 use nautilus_core::{UUID4, time::AtomicTime};
-use nautilus_live::ExecutionEventEmitter;
+use nautilus_live::{ExecutionEventEmitter, execution::failure::CommandFailure};
 use nautilus_model::{
     enums::{OrderSide, OrderStatus, OrderType, TimeInForce},
     events::{OrderEventAny, OrderFilled, OrderUpdated},
@@ -39,10 +39,10 @@ use super::{
         OrderSubmitter, SubmitResponseOutcome, is_fok_unfilled, submit_response_outcome,
         submit_response_unknown_reason, submit_response_venue_order_id,
     },
-    types::BatchLimitOrderContext,
+    types::{BatchLimitOrderContext, classify_http_command_failure},
 };
 use crate::http::{
-    error::sanitize_error_text,
+    error::{sanitize_error_text, strategy_rejection_reason},
     query::{OrderResponse, OrderResponseStatus},
 };
 
@@ -197,7 +197,7 @@ pub(super) fn reject_submit_order(
     clock: &'static AtomicTime,
     pending_cancels: &PendingCancelTracker,
 ) {
-    let reason = sanitize_error_text(reason);
+    let reason = strategy_rejection_reason(reason);
 
     let ts_now = clock.get_time_ns();
 
@@ -321,43 +321,39 @@ pub(super) async fn handle_single_order_response(
                 .await;
             }
         }
-        Err(e) if e.is_submit_outcome_unknown() => {
-            if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
-                &batch_order.order,
-                expected_venue_order_id,
-                &e.to_string(),
-                None,
-                emitter,
-                clock,
-                fill_tracker,
-                order_identities,
-                pending_submits,
-                pending_cancels,
-                account_id,
-                batch_order.size_precision,
-                batch_order.price_precision,
-            ) {
-                execute_deferred_cancel(
-                    submitter,
+        Err(e) => match classify_http_command_failure(&e) {
+            CommandFailure::Ambiguous(reason) => {
+                if let Some((order_id_str, venue_order_id)) = handle_unknown_submit_result(
                     &batch_order.order,
-                    &order_id_str,
-                    venue_order_id,
+                    expected_venue_order_id,
+                    &reason,
+                    None,
                     emitter,
-                    pending_cancels,
                     clock,
-                )
-                .await;
+                    fill_tracker,
+                    order_identities,
+                    pending_submits,
+                    pending_cancels,
+                    account_id,
+                    batch_order.size_precision,
+                    batch_order.price_precision,
+                ) {
+                    execute_deferred_cancel(
+                        submitter,
+                        &batch_order.order,
+                        &order_id_str,
+                        venue_order_id,
+                        emitter,
+                        pending_cancels,
+                        clock,
+                    )
+                    .await;
+                }
             }
-        }
-        Err(e) => {
-            reject_submit_order(
-                &batch_order.order,
-                &e.strategy_reason(),
-                emitter,
-                clock,
-                pending_cancels,
-            );
-        }
+            CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                reject_submit_order(&batch_order.order, &reason, emitter, clock, pending_cancels);
+            }
+        },
     }
 }
 
@@ -623,13 +619,20 @@ pub(super) fn handle_order_response(
                 let reason = response
                     .error_msg
                     .unwrap_or_else(|| "unknown error".to_string());
-
                 reject_submit_order(order, &reason, emitter, clock, pending_cancels);
             }
         }
-        Err(e) => {
-            reject_submit_order(order, &e.strategy_reason(), emitter, clock, pending_cancels);
-        }
+        Err(e) => match classify_http_command_failure(&e) {
+            CommandFailure::Ambiguous(reason) => {
+                log::warn!(
+                    "Submit outcome unknown for {} without an expected venue order ID: {reason}",
+                    order.client_order_id()
+                );
+            }
+            CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason) => {
+                reject_submit_order(order, &reason, emitter, clock, pending_cancels);
+            }
+        },
     }
 
     None
@@ -1014,6 +1017,7 @@ mod tests {
         types::{Currency, Money},
     };
     use rstest::rstest;
+    use rust_decimal::Decimal;
     use ustr::Ustr;
 
     use super::*;
@@ -1498,7 +1502,9 @@ mod tests {
             &instruments,
             None,
             UnixNanos::from(1_000_000_000u64),
-        );
+            None,
+        )
+        .expect("non-confirmed trades do not build fill reports");
 
         assert!(reports.is_empty());
     }
@@ -1541,7 +1547,9 @@ mod tests {
             &instruments,
             None,
             UnixNanos::from(1_000_000_000u64),
-        );
+            None,
+        )
+        .expect("owned confirmed maker trade builds a fill report");
 
         assert_eq!(
             reports.len(),
@@ -1579,13 +1587,16 @@ mod tests {
             &instruments,
             None,
             UnixNanos::from(1_000_000_000u64),
-        );
+            None,
+        )
+        .expect("unmapped instruments are counted rather than parsed");
 
         assert_eq!(reports.len(), 0);
         assert_eq!(
             discards,
             crate::execution::reconciliation::FillBuildDiscards {
                 unmapped_instruments: 1,
+                in_scope_historical: 1,
                 unowned_maker_trades: 0,
             },
         );
@@ -1615,7 +1626,9 @@ mod tests {
             &instruments,
             None,
             UnixNanos::from(1_000_000_000u64),
-        );
+            None,
+        )
+        .expect("unowned maker trades are counted rather than parsed");
 
         assert!(reports.is_empty());
         assert_eq!(
@@ -1623,6 +1636,59 @@ mod tests {
             "a confirmed maker trade dropped whole must be counted, not silent",
         );
         assert_eq!(discards.unmapped_instruments, 0);
+    }
+
+    #[rstest]
+    fn test_fill_report_batch_fails_instead_of_returning_valid_prefix() {
+        let mut instrument = test_instrument();
+        let InstrumentAny::BinaryOption(binary_option) = &mut instrument else {
+            panic!("expected binary option test instrument");
+        };
+        binary_option.taker_fee =
+            Decimal::from_i128_with_scale(100_000_000_000_000_000_000_000_000i128, 0);
+
+        let mut taker: crate::http::models::PolymarketTradeReport = load("http_trade_report.json");
+        taker.id = "trade-unrepresentable-taker".to_string();
+        let mut maker = taker.clone();
+        maker.id = "trade-valid-maker".to_string();
+        maker.trader_side = PolymarketLiquiditySide::Maker;
+        let configured_address = maker.maker_orders[0].maker_address.clone();
+
+        let instruments = AtomicMap::new();
+        instruments.insert(taker.asset_id, instrument);
+        let ctx = crate::execution::reconciliation::FillContext {
+            account_id: AccountId::from("POLY-001"),
+            user_address: &configured_address,
+            api_key: "ffffffff-ffff-ffff-ffff-ffffffffffff",
+            pusd: Currency::pUSD(),
+            clock: nautilus_core::time::get_atomic_clock_realtime(),
+        };
+
+        let (maker_reports, _) = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[maker.clone()],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+            None,
+        )
+        .expect("maker commission is zero and representable");
+        let result = crate::execution::reconciliation::build_fill_reports_from_trades(
+            &[maker, taker],
+            &ctx,
+            &instruments,
+            None,
+            UnixNanos::from(1_000_000_000u64),
+            None,
+        );
+
+        assert_eq!(maker_reports.len(), 1);
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("trade-unrepresentable-taker")
+        );
     }
 
     #[rstest]

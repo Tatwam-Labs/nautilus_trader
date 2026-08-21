@@ -30,7 +30,10 @@ use ahash::AHashMap;
 use dashmap::DashMap;
 use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
 use nautilus_core::{AtomicMap, MUTEX_POISONED, UUID4, UnixNanos, time::AtomicTime};
-use nautilus_live::{ExecutionEventEmitter, execution::context::OrderIdentity};
+use nautilus_live::{
+    ExecutionEventEmitter,
+    execution::{context::OrderIdentity, failure::CommandFailure},
+};
 use nautilus_model::{
     enums::OrderStatus,
     events::{OrderAccepted, OrderEventAny, OrderFilled, OrderRejected, OrderUpdated},
@@ -51,6 +54,7 @@ use crate::{
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUCCESS_CODE,
         },
         enums::{OKXOrderStatus, OKXOrderType},
+        failure::{classify_okx_venue_code, classify_okx_ws_failure},
         parse::{
             is_market_price, parse_client_order_id, parse_millisecond_timestamp, parse_price,
             parse_quantity,
@@ -219,6 +223,11 @@ impl WsDispatchState {
     /// Uses atomic insert to avoid TOCTOU races between concurrent streams.
     pub fn check_and_insert_trade(&self, trade_id: TradeId) -> bool {
         !self.emitted_trades.insert(trade_id)
+    }
+
+    #[must_use]
+    pub fn contains_trade(&self, trade_id: &TradeId) -> bool {
+        self.emitted_trades.contains(trade_id)
     }
 
     fn remove_accepted(&self, cid: &ClientOrderId) {
@@ -428,6 +437,24 @@ pub fn dispatch_ws_message(
                     .filter(|s| !s.is_empty())
                     .map(VenueOrderId::new);
 
+                match classify_okx_venue_code(s_code, reason.clone()) {
+                    CommandFailure::Ambiguous(reason) => {
+                        log::warn!(
+                            "Ambiguous order response for {client_order_id}, awaiting reconciliation: \
+                             op={op:?} s_code={s_code} {reason}"
+                        );
+                        continue;
+                    }
+                    CommandFailure::NotSent(_) => {
+                        log::warn!(
+                            "Unexpected NotSent classification for venue order response: \
+                             op={op:?} cl_ord_id={cl_ord_id} s_code={s_code}"
+                        );
+                        continue;
+                    }
+                    CommandFailure::VenueRejected(_) => {}
+                }
+
                 match op {
                     OKXWsOperation::Order | OKXWsOperation::BatchOrders => {
                         state.order_identities.remove(&client_order_id);
@@ -486,10 +513,11 @@ pub fn dispatch_ws_message(
             op,
             error,
         } => {
+            let failure = classify_okx_ws_failure(&error);
             log::warn!(
                 "WebSocket send failed without structured venue response: \
                  request_id={request_id}, client_order_id={client_order_id:?}, \
-                 op={op:?}, awaiting reconciliation: {error}"
+                 op={op:?}, {failure:?}"
             );
 
             if let Some(client_order_id) = client_order_id {
@@ -502,6 +530,7 @@ pub fn dispatch_ws_message(
                         | OKXWsOperation::OrderAlgo,
                     ) => {
                         state.pending_orders.remove(key);
+                        emit_send_failed_submit(failure, state, emitter, clock, client_order_id);
                     }
                     Some(
                         OKXWsOperation::CancelOrder
@@ -513,6 +542,7 @@ pub fn dispatch_ws_message(
                     }
                     Some(OKXWsOperation::AmendOrder | OKXWsOperation::BatchAmendOrders) => {
                         state.pending_amends.remove(key);
+                        emit_send_failed_modify(failure, state, emitter, clock, client_order_id);
                     }
                     _ => {}
                 }
@@ -520,6 +550,19 @@ pub fn dispatch_ws_message(
         }
         OKXWsMessage::ChannelData { channel, .. } => {
             log::debug!("Ignoring data channel message on execution client: {channel:?}");
+        }
+        OKXWsMessage::LiquidationWarnings(warnings) => {
+            for warning in warnings {
+                log::warn!(
+                    "Liquidation warning: inst_id={}, pos_side={:?}, pos={}, mgn_ratio={}, mark_px={}, mgn_mode={:?}",
+                    warning.inst_id,
+                    warning.pos_side,
+                    warning.pos,
+                    warning.mgn_ratio,
+                    warning.mark_px,
+                    warning.mgn_mode,
+                );
+            }
         }
         OKXWsMessage::BookData { .. }
         | OKXWsMessage::RpiBookData { .. }
@@ -661,14 +704,7 @@ fn dispatch_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
-                    update_order_caches(
-                        msg,
-                        instrument,
-                        client_order_id,
-                        fee_cache,
-                        filled_qty_cache,
-                        order_state_cache,
-                    );
+                    update_order_state_cache(msg, instrument, client_order_id, order_state_cache);
                     dispatch_parsed_order_event(
                         event,
                         client_order_id,
@@ -682,6 +718,7 @@ fn dispatch_order_messages(
                         order_state_cache,
                         ts_init,
                     );
+                    update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
                 }
                 Err(e) => log::error!("Failed to parse order event for {client_order_id}: {e}"),
             }
@@ -789,11 +826,10 @@ fn dispatch_spread_order_messages(
                 ts_init,
             ) {
                 Ok(event) => {
-                    update_spread_order_caches(
+                    update_spread_order_state_cache(
                         msg,
                         instrument,
                         client_order_id,
-                        filled_qty_cache,
                         order_state_cache,
                     );
                     dispatch_parsed_order_event(
@@ -809,6 +845,7 @@ fn dispatch_spread_order_messages(
                         order_state_cache,
                         ts_init,
                     );
+                    update_spread_fill_cache(msg, instrument, filled_qty_cache);
                 }
                 Err(e) => {
                     log::error!("Failed to parse spread order event for {client_order_id}: {e}");
@@ -957,10 +994,9 @@ fn dispatch_parsed_order_event(
             emitter.send_order_event(OrderEventAny::Updated(e));
         }
         ParsedOrderEvent::Fill(fill_report) => {
-            let is_duplicate = state.check_and_insert_trade(fill_report.trade_id);
             is_terminal = venue_status == OKXOrderStatus::Filled;
 
-            if is_duplicate {
+            if state.check_and_insert_trade(fill_report.trade_id) {
                 log::debug!(
                     "Skipping duplicate fill for {client_order_id}: trade_id={}",
                     fill_report.trade_id
@@ -1146,10 +1182,11 @@ fn dispatch_order_msg_as_report(
         ts_init,
     ) {
         Ok(report) => {
+            dispatch_execution_reports(vec![report], emitter, state);
+
             if let Some(instrument) = instruments.get(&msg.inst_id) {
                 update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
             }
-            dispatch_execution_reports(vec![report], emitter, state);
         }
         Err(e) => log::error!("Failed to parse order message as report: {e}"),
     }
@@ -1166,26 +1203,23 @@ fn dispatch_spread_order_msg_as_report(
 ) {
     match parse_spread_order_msg(msg, account_id, instruments, filled_qty_cache, ts_init) {
         Ok(report) => {
+            dispatch_execution_reports(vec![report], emitter, state);
+
             if let Some(instrument) = instruments.get(&msg.sprd_id) {
                 update_spread_fill_cache(msg, instrument, filled_qty_cache);
             }
-            dispatch_execution_reports(vec![report], emitter, state);
         }
         Err(e) => log::error!("Failed to parse spread order message as report: {e}"),
     }
 }
 
 /// Updates fee, fill, and order state caches from a raw OKX order message.
-fn update_order_caches(
+fn update_order_state_cache(
     msg: &OKXOrderMsg,
     instrument: &InstrumentAny,
     client_order_id: ClientOrderId,
-    fee_cache: &mut AHashMap<Ustr, Money>,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
 ) {
-    update_fee_fill_caches(msg, instrument, fee_cache, filled_qty_cache);
-
     let venue_order_id = VenueOrderId::new(msg.ord_id);
     let quantity = parse_quantity(&msg.sz, instrument.size_precision()).unwrap_or_default();
     let price = if is_market_price(&msg.px) {
@@ -1204,15 +1238,12 @@ fn update_order_caches(
     );
 }
 
-fn update_spread_order_caches(
+fn update_spread_order_state_cache(
     msg: &OKXSpreadOrder,
     instrument: &InstrumentAny,
     client_order_id: ClientOrderId,
-    filled_qty_cache: &mut AHashMap<Ustr, Quantity>,
     order_state_cache: &mut AHashMap<ClientOrderId, OrderStateSnapshot>,
 ) {
-    update_spread_fill_cache(msg, instrument, filled_qty_cache);
-
     let venue_order_id = VenueOrderId::new(msg.ord_id.as_str());
     let quantity = parse_quantity(&msg.sz, instrument.size_precision()).unwrap_or_default();
     let price = if is_market_price(&msg.px) {
@@ -1323,6 +1354,63 @@ pub fn dispatch_execution_reports(
     }
 }
 
+fn emit_send_failed_submit(
+    failure: CommandFailure,
+    state: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    clock: &AtomicTime,
+    client_order_id: ClientOrderId,
+) {
+    let (CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason)) = failure else {
+        return;
+    };
+    let Some(ident) = state
+        .order_identities
+        .get(&client_order_id)
+        .map(|entry| *entry)
+    else {
+        return;
+    };
+
+    state.order_identities.remove(&client_order_id);
+    emitter.emit_order_rejected_event(
+        ident.strategy_id,
+        ident.instrument_id,
+        client_order_id,
+        &reason,
+        clock.get_time_ns(),
+        false,
+    );
+}
+
+fn emit_send_failed_modify(
+    failure: CommandFailure,
+    state: &WsDispatchState,
+    emitter: &ExecutionEventEmitter,
+    clock: &AtomicTime,
+    client_order_id: ClientOrderId,
+) {
+    let (CommandFailure::NotSent(reason) | CommandFailure::VenueRejected(reason)) = failure else {
+        return;
+    };
+    let Some(ident) = state
+        .order_identities
+        .get(&client_order_id)
+        .map(|entry| *entry)
+    else {
+        return;
+    };
+
+    emitter.emit_order_modify_rejected_event(
+        ident.strategy_id,
+        ident.instrument_id,
+        client_order_id,
+        None,
+        &reason,
+        clock.get_time_ns(),
+    );
+}
+
 fn format_order_response_reason(s_code: &str, s_msg: &str, sub_code: &str) -> String {
     match (s_msg.is_empty(), sub_code.is_empty(), s_code.is_empty()) {
         (false, true, _) => s_msg.to_string(),
@@ -1357,6 +1445,27 @@ pub fn emit_algo_cancel_rejections(
         }
 
         let msg = item.s_msg.as_deref().unwrap_or("");
+
+        if matches!(
+            classify_okx_venue_code(code, msg),
+            CommandFailure::Ambiguous(_) | CommandFailure::NotSent(_)
+        ) {
+            if let Some(ctx) = contexts.get(i) {
+                log::warn!(
+                    "Ambiguous algo cancel response for {}, awaiting reconciliation: \
+                     algo_id={} sCode={code} sMsg={msg}",
+                    ctx.client_order_id,
+                    item.algo_id
+                );
+            } else {
+                log::warn!(
+                    "Ambiguous algo cancel response without context at index {i}: \
+                     algo_id={} sCode={code} sMsg={msg}",
+                    item.algo_id
+                );
+            }
+            continue;
+        }
 
         if let Some(ctx) = contexts.get(i) {
             let ts = clock.get_time_ns();

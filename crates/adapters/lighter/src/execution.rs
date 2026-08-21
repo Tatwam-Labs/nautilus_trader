@@ -41,7 +41,11 @@ use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
     enums::LogColor,
-    live::{runner::get_exec_event_sender, runtime::get_runtime, task::TaskHandles},
+    live::{
+        runner::{get_exec_event_sender, try_get_system_event_sender},
+        runtime::get_runtime,
+        task::TaskHandles,
+    },
     log_debug,
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
@@ -51,6 +55,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     MUTEX_POISONED, UUID4, UnixNanos,
+    datetime::unix_nanos_to_iso8601,
     params::Params,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -84,6 +89,7 @@ use crate::{
             LighterTxType,
         },
         rate_limit::{LighterTxRateLimiter, await_tx_quota, build_tx_rate_limiter, resolve_quota},
+        socket::{USER_STREAMS_ENDPOINT, socket_state_sink},
         symbol::{MarketRegistry, product_type_from_instrument_id},
         urls::lighter_chain_id,
     },
@@ -253,6 +259,14 @@ impl LighterExecutionClient {
             config.ws_timeout_secs,
             config.proxy_url.clone(),
         );
+        let ws_client = match try_get_system_event_sender() {
+            Some(sender) => ws_client.with_state_sink(socket_state_sink(
+                core.client_id,
+                USER_STREAMS_ENDPOINT,
+                sender,
+            )),
+            None => ws_client,
+        };
 
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
@@ -791,6 +805,7 @@ impl LighterExecutionClient {
                                 } else {
                                     dispatch.replace_positions_except(&reports, &retained_positions)
                                 };
+                                dispatch.record_position_snapshot(&skipped_market_ids);
                                 log::debug!(
                                     "Lighter position snapshot: positions={position_count}, skipped_markets={}, removed={}",
                                     skipped_market_ids.len(),
@@ -852,6 +867,7 @@ impl LighterExecutionClient {
                                 emitter.send_account_state(*state);
                             }
                             Some(NautilusWsMessage::Reconnected { connection_epoch }) => {
+                                dispatch.invalidate_position_snapshot();
                                 nonce_ready_connection_epoch.store(
                                     NONCE_CONNECTION_EPOCH_UNAVAILABLE,
                                     Ordering::Release,
@@ -2041,7 +2057,7 @@ where
                 return AuthTokenRefreshOutcome::Rotated;
             }
             Err(e) => {
-                log::error!("Lighter auth-token rotation attempt {attempt} failed: {e:#}");
+                log::warn!("Lighter auth-token rotation attempt {attempt} failed: {e:#}");
             }
         }
 
@@ -2094,7 +2110,7 @@ where
 
     for channel in channels {
         if let Err(e) = subscribe(channel.clone(), token.clone()).await {
-            log::error!("Lighter auth-token rotation: re-subscribe failed for {channel:?}: {e}",);
+            log::debug!("Lighter auth-token rotation: re-subscribe failed for {channel:?}: {e}",);
             first_error.get_or_insert_with(|| format!("{channel:?}: {e}"));
         }
     }
@@ -4210,29 +4226,48 @@ impl ExecutionClient for LighterExecutionClient {
             {
                 Ok(response) => response,
                 Err(e) => {
-                    log::warn!(
-                        "Lighter active orders fetch failed for market_index={market_index}: {}",
-                        scrub_auth(&format!("{e:#}")),
-                    );
-                    continue;
+                    if cmd.open_only {
+                        log::warn!(
+                            "Lighter active orders fetch failed for market_index={market_index}: {}",
+                            scrub_auth(&format!("{e:#}")),
+                        );
+                        continue;
+                    }
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "failed to fetch Lighter active orders for market_index={market_index}"
+                    )));
                 }
             };
 
             for order in &active.orders {
                 self.dispatch.note_active_market(order.market_index);
 
-                if let Some(report) =
-                    parse_http_order_to_report(order, &self.registry, self.core.account_id, ts_init)
-                {
-                    restore_reconciled_order(
-                        &self.core,
-                        &self.dispatch,
-                        order,
-                        report.order_status.is_closed(),
+                let Some(report) = parse_http_order_to_report(
+                    order,
+                    &self.registry,
+                    self.core.account_id,
+                    ts_init,
+                ) else {
+                    if cmd.open_only {
+                        log::warn!(
+                            "Failed to parse Lighter active order {} for market_index={market_index}",
+                            order.order_id,
+                        );
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "failed to parse Lighter active order {} for market_index={market_index}",
+                        order.order_id,
                     );
-                    let report = self.dispatch.translate_order_cloid(report);
-                    reports.push(self.dispatch.preserve_pending_order_status(report));
-                }
+                };
+                restore_reconciled_order(
+                    &self.core,
+                    &self.dispatch,
+                    order,
+                    report.order_status.is_closed(),
+                );
+                let report = self.dispatch.translate_order_cloid(report);
+                reports.push(self.dispatch.preserve_pending_order_status(report));
             }
         }
 
@@ -4289,7 +4324,10 @@ impl ExecutionClient for LighterExecutionClient {
                                     self.core.account_id,
                                     ts_init,
                                 ) else {
-                                    continue;
+                                    anyhow::bail!(
+                                        "failed to parse Lighter inactive order {} for market_index={market_id}",
+                                        order.order_id,
+                                    );
                                 };
 
                                 if cmd.start.is_some_and(|start| report.ts_last < start)
@@ -4321,11 +4359,9 @@ impl ExecutionClient for LighterExecutionClient {
                             }
                         }
                         Err(e) => {
-                            log::warn!(
-                                "Lighter inactive orders fetch failed for market_index={market_id}: {}",
-                                scrub_auth(&format!("{e:#}")),
-                            );
-                            break;
+                            return Err(anyhow::Error::new(e).context(format!(
+                                "failed to fetch Lighter inactive orders for market_index={market_id}"
+                            )));
                         }
                     }
                 }
@@ -4344,146 +4380,7 @@ impl ExecutionClient for LighterExecutionClient {
         &self,
         cmd: GenerateFillReports,
     ) -> anyhow::Result<Vec<FillReport>> {
-        let Some(credential) = &self.credential else {
-            log::warn!("Lighter generate_fill_reports: no credentials");
-            return Ok(Vec::new());
-        };
-
-        let market_id = cmd
-            .instrument_id
-            .and_then(|id| self.registry.market_index(&id));
-
-        let auth = build_auth_token_for(credential)
-            .context("failed to mint Lighter auth token for fill fetch")?;
-
-        let ts_init = self.clock.get_time_ns();
-        let mut reports = Vec::new();
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = AHashSet::new();
-        let mut seen_in_call = AHashSet::new();
-        let mut pages = 0_usize;
-
-        loop {
-            pages += 1;
-            anyhow::ensure!(
-                pages <= MAX_RECONCILIATION_PAGES,
-                "Lighter fill reconciliation exceeded {MAX_RECONCILIATION_PAGES} pages",
-            );
-            let query = LighterTradesQuery {
-                authorization: None,
-                auth: Some(auth.clone()),
-                market_id,
-                account_index: Some(credential.account_index()),
-                order_index: None,
-                sort_by: LighterTradeSortBy::Timestamp,
-                sort_dir: Some(LighterSortDirection::Desc),
-                cursor: cursor.clone(),
-                // The venue's `from` parameter is not a timestamp lower bound
-                // and can omit the newest trades when given an epoch value.
-                from_timestamp: None,
-                ask_filter: None,
-                role: None,
-                trade_type: None,
-                limit: LIGHTER_REST_PAGE_SIZE,
-                aggregate: None,
-            };
-
-            let response = match self.http_client.get_trades(&query).await {
-                Ok(response) => response,
-                Err(e) => {
-                    // `{e:#}` preserves the venue's status/body across the
-                    // outer context wrap; `scrub_auth` masks any `auth=`
-                    // query value the HTTP layer's error included.
-                    log::warn!(
-                        "Lighter get_trades failed (market_id={:?}, account_index={}, cursor={:?}): {}",
-                        query.market_id,
-                        credential.account_index(),
-                        cursor,
-                        scrub_auth(&format!("{e:#}")),
-                    );
-                    return Err(anyhow::Error::new(e).context("failed to fetch Lighter fills"));
-                }
-            };
-
-            for trade in &response.trades {
-                let Some(instrument_id) = self.registry.instrument_id(trade.market_id) else {
-                    continue;
-                };
-                let Some(instrument) = self.core.cache().instrument(&instrument_id).cloned() else {
-                    continue;
-                };
-
-                match parse_ws_fill_report(
-                    trade,
-                    credential.account_index(),
-                    &instrument,
-                    self.core.account_id,
-                    ts_init,
-                ) {
-                    Ok(Some(report)) => {
-                        if cmd.start.is_some_and(|start| report.ts_event < start)
-                            || cmd.end.is_some_and(|end| report.ts_event > end)
-                        {
-                            continue;
-                        }
-
-                        // Mass-status reconciliation must surface the original
-                        // Nautilus cloid, not the venue's numeric echo.
-                        let report = self.dispatch.translate_fill_cloid(report);
-
-                        if !seen_in_call.insert(report.trade_id) {
-                            log::debug!(
-                                "Lighter duplicate trade {} ignored within HTTP fill pagination",
-                                report.trade_id,
-                            );
-                            continue;
-                        }
-
-                        if matches!(
-                            self.dispatch.mark_trade_reconciled(report.trade_id),
-                            Some(TradeDedupSource::Live),
-                        ) {
-                            log::debug!(
-                                "Lighter trade {} ignored in HTTP fill reports after live delivery",
-                                report.trade_id,
-                            );
-                            continue;
-                        }
-
-                        self.dispatch.note_active_market(trade.market_id);
-                        reports.push(report);
-                    }
-                    Ok(None) => {}
-                    Err(e) => log::warn!("Lighter fill parse failed: {e}"),
-                }
-            }
-
-            let reached_start_boundary = cmd.start.is_some_and(|start| {
-                response.trades.iter().any(|trade| {
-                    u64::try_from(trade.timestamp).is_ok_and(|timestamp_ms| {
-                        timestamp_ms.saturating_mul(1_000_000) < start.as_u64()
-                    })
-                })
-            });
-
-            if reached_start_boundary {
-                break;
-            }
-
-            match response.next_cursor {
-                Some(next) if !next.is_empty() => {
-                    anyhow::ensure!(
-                        seen_cursors.insert(next.clone()),
-                        "Lighter fill reconciliation repeated cursor `{next}`",
-                    );
-                    cursor = Some(next);
-                }
-                _ => break,
-            }
-        }
-
-        log::debug!("Generated {} Lighter fill reports", reports.len());
-        Ok(reports)
+        Ok(self.paginate_fill_reports(&cmd).await?.reports)
     }
 
     async fn generate_position_status_reports(
@@ -4542,15 +4439,36 @@ impl ExecutionClient for LighterExecutionClient {
         let position_cmd =
             GeneratePositionStatusReports::new(UUID4::new(), ts_init, None, None, None, None, None);
 
-        // Each sub-call degrades independently; see `unwrap_reports_or_warn`.
-        let mut order_reports = unwrap_reports_or_warn(
-            "order",
-            self.generate_order_status_reports(&order_cmd).await,
-        );
+        // Preserve active orders if the combined active and historical request fails after its
+        // active leg. The bounded historical contract remains incomplete in that case.
+        let order_result = self.generate_order_status_reports(&order_cmd).await;
+        let (mut order_reports, mut reports_complete) = match order_result {
+            Ok(reports) => (reports, true),
+            Err(e) => {
+                log::warn!(
+                    "Lighter order report generation failed: {}",
+                    scrub_auth(&format!("{e:#}")),
+                );
+                let active_cmd = GenerateOrderStatusReports::new(
+                    UUID4::new(),
+                    ts_init,
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                );
+                let active_result = self.generate_order_status_reports(&active_cmd).await;
+                (unwrap_reports_or_warn("active order", active_result), false)
+            }
+        };
+        let fill_result = self.paginate_fill_reports(&fill_cmd).await;
+        reports_complete &= fill_result.as_ref().is_ok_and(|sweep| sweep.covers_window);
         let mut fill_reports =
-            unwrap_reports_or_warn("fill", self.generate_fill_reports(fill_cmd).await);
+            unwrap_reports_or_warn("fill", fill_result.map(|sweep| sweep.reports));
 
-        let reported_orders: AHashSet<VenueOrderId> = order_reports
+        let mut reported_orders: AHashSet<VenueOrderId> = order_reports
             .iter()
             .map(|report| report.venue_order_id)
             .collect();
@@ -4565,6 +4483,7 @@ impl ExecutionClient for LighterExecutionClient {
 
         for market_index in fill_markets {
             let Some(instrument_id) = self.registry.instrument_id(market_index) else {
+                reports_complete = false;
                 continue;
             };
             let order_cmd = GenerateOrderStatusReports::new(
@@ -4577,10 +4496,18 @@ impl ExecutionClient for LighterExecutionClient {
                 None,
                 None,
             );
-            order_reports.extend(unwrap_reports_or_warn(
-                "order",
-                self.generate_order_status_reports(&order_cmd).await,
-            ));
+            let order_result = self.generate_order_status_reports(&order_cmd).await;
+            reports_complete &= order_result.is_ok();
+            let reports = unwrap_reports_or_warn("order", order_result);
+            reported_orders.extend(reports.iter().map(|report| report.venue_order_id));
+            order_reports.extend(reports);
+        }
+
+        if fill_reports
+            .iter()
+            .any(|report| !reported_orders.contains(&report.venue_order_id))
+        {
+            reports_complete = false;
         }
 
         for fill_report in &mut fill_reports {
@@ -4593,10 +4520,61 @@ impl ExecutionClient for LighterExecutionClient {
             }
         }
 
-        let position_reports = unwrap_reports_or_warn(
-            "position",
-            self.generate_position_status_reports(&position_cmd).await,
-        );
+        let position_result = self.generate_position_status_reports(&position_cmd).await;
+        reports_complete &= position_result.is_ok();
+        let mut position_reports = unwrap_reports_or_warn("position", position_result);
+
+        if lookback_start.is_some() {
+            let touched_instruments: AHashSet<InstrumentId> = order_reports
+                .iter()
+                .map(|report| report.instrument_id)
+                .chain(fill_reports.iter().map(|report| report.instrument_id))
+                .collect();
+            let position_instruments: AHashSet<InstrumentId> = position_reports
+                .iter()
+                .map(|report| report.instrument_id)
+                .collect();
+            let cache = self.core.cache();
+            let mut touched_instruments: Vec<InstrumentId> =
+                touched_instruments.into_iter().collect();
+            touched_instruments.sort_unstable();
+
+            for instrument_id in touched_instruments {
+                let Some(instrument) = cache.instrument(&instrument_id) else {
+                    reports_complete = false;
+                    continue;
+                };
+
+                if !matches!(instrument, InstrumentAny::CryptoPerpetual(_)) {
+                    continue;
+                }
+                let Some(market_id) = self.registry.market_index(&instrument_id) else {
+                    reports_complete = false;
+                    continue;
+                };
+
+                if !self.dispatch.position_snapshot_covers(market_id) {
+                    reports_complete = false;
+                    continue;
+                }
+
+                if position_instruments.contains(&instrument_id) {
+                    continue;
+                }
+
+                position_reports.push(PositionStatusReport::new(
+                    self.core.account_id,
+                    instrument_id,
+                    PositionSideSpecified::Flat,
+                    Quantity::zero(instrument.size_precision()),
+                    ts_init,
+                    ts_init,
+                    Some(UUID4::new()),
+                    None,
+                    None,
+                ));
+            }
+        }
 
         let mut mass_status = ExecutionMassStatus::new(
             self.core.client_id,
@@ -4605,6 +4583,7 @@ impl ExecutionClient for LighterExecutionClient {
             ts_init,
             None,
         );
+        mass_status.set_report_window(lookback_start, reports_complete);
         mass_status.add_order_reports(order_reports);
         mass_status.add_fill_reports(fill_reports);
         mass_status.add_position_reports(position_reports);
@@ -4617,6 +4596,195 @@ impl ExecutionClient for LighterExecutionClient {
         );
 
         Ok(Some(mass_status))
+    }
+}
+
+// `covers_window` is only meaningful for an account-wide sweep. Retention is per
+// account, so a market-scoped sweep can serve nothing while older trades for that
+// market have already been evicted by newer trades in other markets.
+struct FillSweep {
+    reports: Vec<FillReport>,
+    covers_window: bool,
+}
+
+impl LighterExecutionClient {
+    async fn paginate_fill_reports(&self, cmd: &GenerateFillReports) -> anyhow::Result<FillSweep> {
+        let Some(credential) = &self.credential else {
+            log::warn!("Lighter generate_fill_reports: no credentials");
+            return Ok(FillSweep {
+                reports: Vec::new(),
+                covers_window: true,
+            });
+        };
+
+        let market_id = cmd
+            .instrument_id
+            .and_then(|id| self.registry.market_index(&id));
+
+        let auth = build_auth_token_for(credential)
+            .context("failed to mint Lighter auth token for fill fetch")?;
+
+        let ts_init = self.clock.get_time_ns();
+        let mut reports = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = AHashSet::new();
+        let mut seen_in_call = AHashSet::new();
+        let mut pages = 0_usize;
+        let mut oldest_served: Option<UnixNanos> = None;
+        let mut covers_window = true;
+
+        loop {
+            pages += 1;
+            anyhow::ensure!(
+                pages <= MAX_RECONCILIATION_PAGES,
+                "Lighter fill reconciliation exceeded {MAX_RECONCILIATION_PAGES} pages",
+            );
+            let query = LighterTradesQuery {
+                authorization: None,
+                auth: Some(auth.clone()),
+                market_id,
+                account_index: Some(credential.account_index()),
+                order_index: None,
+                sort_by: LighterTradeSortBy::Timestamp,
+                sort_dir: Some(LighterSortDirection::Desc),
+                cursor: cursor.clone(),
+                // The venue's `from` parameter is not a timestamp lower bound
+                // and can omit the newest trades when given an epoch value.
+                from_timestamp: None,
+                ask_filter: None,
+                role: None,
+                trade_type: None,
+                limit: LIGHTER_REST_PAGE_SIZE,
+                aggregate: None,
+            };
+
+            let response = match self.http_client.get_trades(&query).await {
+                Ok(response) => response,
+                Err(e) => {
+                    // `{e:#}` preserves the venue's status/body across the
+                    // outer context wrap; `scrub_auth` masks any `auth=`
+                    // query value the HTTP layer's error included.
+                    log::warn!(
+                        "Lighter get_trades failed (market_id={:?}, account_index={}, cursor={:?}): {}",
+                        query.market_id,
+                        credential.account_index(),
+                        cursor,
+                        scrub_auth(&format!("{e:#}")),
+                    );
+                    return Err(anyhow::Error::new(e).context("failed to fetch Lighter fills"));
+                }
+            };
+
+            for trade in &response.trades {
+                let Some(instrument_id) = self.registry.instrument_id(trade.market_id) else {
+                    anyhow::bail!(
+                        "no Lighter instrument registered for fill market_index={}",
+                        trade.market_id,
+                    );
+                };
+                let Some(instrument) = self.core.cache().instrument(&instrument_id).cloned() else {
+                    anyhow::bail!("Lighter fill instrument {instrument_id} missing from cache");
+                };
+
+                match parse_ws_fill_report(
+                    trade,
+                    credential.account_index(),
+                    &instrument,
+                    self.core.account_id,
+                    ts_init,
+                ) {
+                    Ok(Some(report)) => {
+                        if cmd.start.is_some_and(|start| report.ts_event < start)
+                            || cmd.end.is_some_and(|end| report.ts_event > end)
+                        {
+                            continue;
+                        }
+
+                        // Mass-status reconciliation must surface the original
+                        // Nautilus cloid, not the venue's numeric echo.
+                        let report = self.dispatch.translate_fill_cloid(report);
+
+                        if !seen_in_call.insert(report.trade_id) {
+                            log::debug!(
+                                "Lighter duplicate trade {} ignored within HTTP fill pagination",
+                                report.trade_id,
+                            );
+                            continue;
+                        }
+
+                        if matches!(
+                            self.dispatch.mark_trade_reconciled(report.trade_id),
+                            Some(TradeDedupSource::Live),
+                        ) {
+                            log::debug!(
+                                "Lighter trade {} ignored in HTTP fill reports after live delivery",
+                                report.trade_id,
+                            );
+                            continue;
+                        }
+
+                        self.dispatch.note_active_market(trade.market_id);
+                        reports.push(report);
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(e).context("failed to parse Lighter fill report"),
+                }
+            }
+
+            let page_oldest = response
+                .trades
+                .iter()
+                .filter_map(|trade| u64::try_from(trade.timestamp).ok())
+                .map(|timestamp_ms| UnixNanos::from(timestamp_ms.saturating_mul(1_000_000)))
+                .min();
+
+            if let Some(page_oldest) = page_oldest {
+                oldest_served = Some(oldest_served.map_or(page_oldest, |ts| ts.min(page_oldest)));
+            }
+
+            let reached_start_boundary = cmd
+                .start
+                .is_some_and(|start| page_oldest.is_some_and(|oldest| oldest < start));
+
+            if reached_start_boundary {
+                break;
+            }
+
+            match response.next_cursor {
+                Some(next) if !next.is_empty() => {
+                    anyhow::ensure!(
+                        seen_cursors.insert(next.clone()),
+                        "Lighter fill reconciliation repeated cursor `{next}`",
+                    );
+                    cursor = Some(next);
+                }
+                _ => {
+                    // The venue retains a bounded number of recent trades per account,
+                    // so an exhausted cursor ends the retained history rather than the
+                    // account's. Only a trade older than `start` proves the requested
+                    // window was served in full; an account-wide sweep that served
+                    // nothing has no history to retain.
+                    if let (Some(start), Some(oldest)) = (cmd.start, oldest_served) {
+                        covers_window = false;
+
+                        log::warn!(
+                            "Lighter fill reports do not cover {} to {}: trade pagination exhausted before the requested start; the venue `export` endpoint serves full history",
+                            unix_nanos_to_iso8601(start),
+                            unix_nanos_to_iso8601(oldest),
+                        );
+                    }
+
+                    break;
+                }
+            }
+        }
+
+        log::debug!("Generated {} Lighter fill reports", reports.len());
+
+        Ok(FillSweep {
+            reports,
+            covers_window,
+        })
     }
 }
 

@@ -20,6 +20,7 @@ FLAMEGRAPH_VERSION := $(shell bash scripts/cargo-tool-version.sh flamegraph)
 LYCHEE_VERSION := $(shell bash scripts/cargo-tool-version.sh lychee)
 # Tool versions from tools.toml
 PREK_VERSION := $(shell bash scripts/tool-version.sh prek)
+NIGHTLY_TOOLCHAIN := $(shell bash scripts/tool-version.sh miri) # Pinned nightly, shared with Miri
 UV_VERSION := $(shell bash scripts/uv-version.sh)
 UV_REQUIRED_SPEC := $(shell awk -F'"' '\
 	/^\[tool\.uv\]/ { in_section=1; next } \
@@ -47,8 +48,6 @@ endif
 UV_SYNC_FLAGS ?= --inexact
 UV_PROJECT_ENVIRONMENT ?= $(CURDIR)/.venv
 export UV_PROJECT_ENVIRONMENT
-
-PIP_AUDIT_IGNORE_FLAGS :=
 
 # TARGET_DIR controls where Cargo places build artifacts
 TARGET_DIR ?= $(CURDIR)/target
@@ -202,7 +201,17 @@ CORE_SELECTED_FEATURES := $(subst $(space),$(comma),$(strip $(CORE_SELECTED_FEAT
 STANDARD_PRECISION_ARGS := --workspace --exclude nautilus-blockchain --no-default-features --lib --tests --features "ffi,python"
 SIM_PACKAGES := -p nautilus-common -p nautilus-core -p nautilus-network \
 	-p nautilus-execution -p nautilus-live
-SIM_RUSTFLAGS := --cfg madsim -Aclippy::drop_non_drop
+SIM_FILTERSET := package(nautilus-common) + package(nautilus-network) + \
+	package(nautilus-execution) + \
+	(package(nautilus-live) & test(test_startup_reconciliation_times_out_waiting_for_mass_status)) + \
+	(package(nautilus-core) & test(~virtual_time))
+SIM_HIGH_PRECISION_PACKAGES := -p nautilus-common -p nautilus-execution
+
+# Pass the simulation cfg through `--config` rather than RUSTFLAGS, because the env var replaces
+# the .cargo/config.toml rustflags while this joins with them, keeping -Dwarnings and the Linux
+# link flags. It must sit on each subcommand's own command line, since cargo does not inherit a
+# global `--config` into external subcommands such as clippy and nextest.
+SIM_CARGO_CONFIG := --config 'target."cfg(all())".rustflags=["--cfg","madsim"]'
 
 CARGO_BUILD_JOB_TARGETS := install install-debug build build-debug build-wheel py-stubs check-code \
 	check-code-sim check-code-standard-precision \
@@ -428,10 +437,9 @@ check-code-standard-precision:  #-- Run clippy on lib/test targets with standard
 	@printf "$(GREEN)Standard-precision checks passed$(RESET)\n"
 
 .PHONY: check-code-sim
-check-code-sim: export RUSTFLAGS=$(SIM_RUSTFLAGS)
 check-code-sim:  #-- Run clippy on DST simulation lib/test targets
 	$(info $(M) Running DST simulation code quality checks...)
-	@cargo clippy $(SIM_PACKAGES) --lib --tests --features simulation --profile nextest -- -D warnings
+	@cargo clippy $(SIM_CARGO_CONFIG) $(SIM_PACKAGES) --lib --tests --features simulation --profile nextest -- -D warnings
 	@printf "$(GREEN)DST simulation checks passed$(RESET)\n"
 
 .PHONY: check-all-targets
@@ -469,7 +477,9 @@ pre-flight:  #-- Run pre-flight checks (format, tests, build, generated drift, a
 		&& $(MAKE) --no-print-directory format \
 		&& $(MAKE) --no-print-directory test-scripts-quiet \
 		&& $(MAKE) --no-print-directory check-code EXTRA_FEATURES="capnp,hypersync" \
+		&& $(MAKE) --no-print-directory check-code-sim \
 		&& $(MAKE) --no-print-directory cargo-test-doc EXTRA_FEATURES="capnp,hypersync" \
+		&& $(MAKE) --no-print-directory cargo-test-sim \
 		&& $(MAKE) --no-print-directory cargo-test-extras \
 		&& $(MAKE) --no-print-directory cargo-test-postgres-changed \
 		&& $(MAKE) --no-print-directory build-debug \
@@ -492,8 +502,8 @@ clippy-fix:  #-- Run clippy linter with automatic fixes (workspace lints)
 	cargo clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
 
 .PHONY: clippy-fix-nightly
-clippy-fix-nightly:  #-- Run clippy linter with nightly toolchain and automatic fixes (workspace lints + additional strictness)
-	cargo +nightly clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
+clippy-fix-nightly:  #-- Run clippy linter with the pinned nightly toolchain and automatic fixes (workspace lints + additional strictness)
+	cargo +$(NIGHTLY_TOOLCHAIN) clippy --fix --all-targets --all-features --allow-dirty --allow-staged -- -D warnings
 
 .PHONY: clippy-pedantic-crate-%
 clippy-pedantic-crate-%:  #-- Run clippy linter for a specific Rust crate (usage: make clippy-crate-<crate_name>)
@@ -555,12 +565,13 @@ install-tools: check-binstall-installed update-uv  #-- Install required developm
 
 #== Security
 
-# Run an audit step: capture stdout+stderr, only display on failure.
-# Args: $(1) display name, $(2) command to run.
+# Run an audit step: capture stdout+stderr, display on failure, or when $(3) is report.
+# Args: $(1) display name, $(2) command to run, $(3) optional output mode.
 define audit_step
 	printf "$(CYAN)Running $(1)...$(RESET) "; \
 	if _out=$$($(2) 2>&1); then \
 		printf "$(GREEN)ok$(RESET)\n"; \
+		if [ "$(3)" = "report" ] && [ -n "$$_out" ]; then printf "%s\n" "$$_out"; fi; \
 	else \
 		rc=$$?; printf "$(RED)failed$(RESET)\n%s\n" "$$_out"; exit $$rc; \
 	fi
@@ -575,8 +586,8 @@ security-audit: check-audit-installed check-deny-installed check-vet-installed c
 	@$(call audit_step,cargo deny lighter fuzz,cargo deny --manifest-path crates/adapters/lighter/fuzz/pornin/Cargo.toml --config .cargo/deny-fuzz.toml --locked --all-features check advisories licenses sources bans)
 	@$(call audit_step,cargo vet,cargo vet --locked)
 	@$(call audit_step,cargo vet lighter fuzz,cargo vet --locked --manifest-path crates/adapters/lighter/fuzz/pornin/Cargo.toml --store-path .supply-chain)
-	@$(call audit_step,pip-audit,uv export --project python --frozen | sed '/^-e /d' | uv run --no-project --with pip-audit -- pip-audit --disable-pip --require-hashes -r /dev/stdin $(PIP_AUDIT_IGNORE_FLAGS))
-	@$(call audit_step,osv-scanner,osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=crates/adapters/lighter/fuzz/pornin/Cargo.lock --lockfile=python/uv.lock)
+	@$(call audit_step,pip-audit,uv export --project python --all-groups --all-extras --frozen | sed '/^-e /d' | uv run --no-project --with pip-audit -- pip-audit --disable-pip --require-hashes -r /dev/stdin)
+	@$(call audit_step,osv-scanner,osv-scanner --config=osv-scanner.toml --lockfile=Cargo.lock --lockfile=crates/adapters/lighter/fuzz/pornin/Cargo.lock --lockfile=python/uv.lock,report)
 
 .PHONY: cargo-deny
 cargo-deny: check-deny-installed  #-- Run cargo-deny checks (advisories, sources, bans, licenses)
@@ -831,6 +842,7 @@ test-scripts:  #-- Run repository script tests
 	$Q bash .pre-commit-hooks/test_check_logging_conventions.sh
 	$Q bash .pre-commit-hooks/test_check_pyo3_conventions.sh
 	$Q bash .pre-commit-hooks/test_check_unicode_typography.sh
+	$Q bash .pre-commit-hooks/test_check_ustr_conventions.sh
 	$Q bash scripts/ci/test-build-artifact-reuse.bash
 	$Q bash scripts/ci/test-check-docker-toolchain-pins.bash
 	$Q bash scripts/ci/test-check-miri-toolchain.bash
@@ -845,6 +857,7 @@ test-scripts:  #-- Run repository script tests
 	$Q bash scripts/ci/test-release-verification-retry.bash
 	$Q bash scripts/ci/test-rust-toolchain.bash
 	$Q bash scripts/ci/test-verify-published-registries-crates.bash
+	$Q bash scripts/test-check-cargo-cooldown.bash
 	$Q python3 -B scripts/ci/test_check_commit_message.py
 	@printf "$(GREEN)Script tests passed$(RESET)\n"
 
@@ -972,8 +985,10 @@ else
 	cargo nextest run --workspace --lib --tests --features "$(CARGO_FEATURES)" -E '$(ADAPTER_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 endif
 
-# DST simulation smoke test. Compiles the in-scope crates under cfg(madsim)
-# and runs every test that is sim-compatible today: all of nautilus-common,
+# DST simulation smoke test. Nextest compiles every selected lib/test target
+# before applying its filter, so the standard-precision run is also the compile
+# gate without a separate build. Two feature-coherent runs execute every test
+# that is sim-compatible today: all of nautilus-common,
 # nautilus-network, and nautilus-execution (transport-bound tests are gated
 # out at the source), the LiveNode startup reconciliation timeout regression,
 # plus the cross-crate seam pinning tests in nautilus-core.
@@ -984,25 +999,12 @@ endif
 # DST scope.
 .PHONY: cargo-test-sim
 cargo-test-sim: export RUST_BACKTRACE=1
-cargo-test-sim: export RUSTFLAGS=$(SIM_RUSTFLAGS)
 cargo-test-sim: check-nextest-installed
 cargo-test-sim:  #-- Run DST simulation smoke tests (cfg madsim + simulation feature)
-	$(info $(M) Building in-scope crates under simulation (compile gate)...)
-	cargo build $(SIM_PACKAGES) --tests --lib --features simulation
-	$(info $(M) Running nautilus-common tests under simulation...)
-	cargo nextest run -p nautilus-common --features simulation $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
-	$(info $(M) Running nautilus-common tests under simulation + high-precision...)
-	cargo nextest run -p nautilus-common --features "simulation,high-precision" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
-	$(info $(M) Running nautilus-live startup reconciliation test under simulation...)
-	cargo nextest run -p nautilus-live --features simulation --test node -E 'test(test_startup_reconciliation_times_out_waiting_for_mass_status)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
-	$(info $(M) Running nautilus-network tests under simulation...)
-	cargo nextest run -p nautilus-network --features simulation $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
-	$(info $(M) Running nautilus-execution tests under simulation...)
-	cargo nextest run -p nautilus-execution --features simulation $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
-	$(info $(M) Running nautilus-execution tests under simulation + high-precision...)
-	cargo nextest run -p nautilus-execution --features "simulation,high-precision" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
-	$(info $(M) Running nautilus-core DST seam pinning tests under simulation...)
-	cargo nextest run -p nautilus-core --features simulation -E 'test(~virtual_time)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	$(info $(M) Running in-scope DST tests under simulation...)
+	cargo nextest run $(SIM_CARGO_CONFIG) $(SIM_PACKAGES) --lib --tests --features simulation -E '$(SIM_FILTERSET)' $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
+	$(info $(M) Running precision-sensitive DST tests under simulation + high-precision...)
+	cargo nextest run $(SIM_CARGO_CONFIG) $(SIM_HIGH_PRECISION_PACKAGES) --lib --tests --features "simulation,high-precision" $(FAIL_FAST_FLAG) --profile $(NEXTEST_PROFILE) --cargo-profile $(CARGO_CI_PROFILE) $(NEXTEST_OUTPUT_ARGS)
 
 .PHONY: cargo-test-core-debug
 cargo-test-core-debug: export RUST_BACKTRACE=1

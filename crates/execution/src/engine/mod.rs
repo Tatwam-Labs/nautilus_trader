@@ -63,7 +63,7 @@ use nautilus_common::{
 };
 use nautilus_core::{
     UUID4, UnixNanos, WeakCell,
-    datetime::{mins_to_nanos, mins_to_secs, secs_to_nanos},
+    datetime::{checked_mins_to_nanos, mins_to_secs, secs_to_nanos},
 };
 use nautilus_model::{
     accounts::Account,
@@ -481,10 +481,14 @@ impl ExecutionEngine {
         ts_init: UnixNanos,
     ) {
         let venue = instrument_id.venue;
+        // Prefer the cached origin over venue routing so tracking lands on the
+        // client whose stream materialized the order.
         let client_id = self
-            .routing_map
-            .get(&venue)
+            .cache
+            .borrow()
+            .client_id(&client_order_id)
             .copied()
+            .or_else(|| self.routing_map.get(&venue).copied())
             .or(self.default_client_id);
 
         if let Some(client_id) = client_id
@@ -804,10 +808,6 @@ impl ExecutionEngine {
     }
 
     /// Starts the purge timers if configured.
-    #[expect(
-        clippy::missing_panics_doc,
-        reason = "timer registration is not expected to fail"
-    )]
     pub fn start_purge_timers(&mut self) {
         if let Some(interval_mins) = self
             .config
@@ -819,22 +819,29 @@ impl ExecutionEngine {
                 .timer_names()
                 .contains(&TIMER_PURGE_CLOSED_ORDERS)
         {
-            let interval_ns = mins_to_nanos(u64::from(interval_mins));
-            let buffer_mins = self.config.purge_closed_orders_buffer_mins.unwrap_or(0);
-            let buffer_secs = mins_to_secs(u64::from(buffer_mins));
-            let cache = self.cache.clone();
-            let clock = self.clock.clone();
+            'purge_closed_orders: {
+                let Some(interval_ns) = checked_mins_to_nanos(u64::from(interval_mins)) else {
+                    log::error!(
+                        "Invalid purge_closed_orders_interval_mins {interval_mins}: minutes to nanoseconds conversion overflow"
+                    );
+                    break 'purge_closed_orders;
+                };
+                let buffer_mins = self.config.purge_closed_orders_buffer_mins.unwrap_or(0);
+                let buffer_secs = mins_to_secs(u64::from(buffer_mins));
+                let cache = self.cache.clone();
+                let clock = self.clock.clone();
 
-            let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
-                let ts_now = clock.borrow().timestamp_ns();
-                cache.borrow_mut().purge_closed_orders(ts_now, buffer_secs);
-            });
-            let callback = TimeEventCallback::from(callback_fn);
+                let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
+                    let ts_now = clock.borrow().timestamp_ns();
+                    cache.borrow_mut().purge_closed_orders(ts_now, buffer_secs);
+                });
+                let callback = TimeEventCallback::from(callback_fn);
 
-            log::info!("Starting purge closed orders timer at {interval_mins} minute intervals");
-            self.clock
-                .borrow_mut()
-                .set_timer_ns(
+                log::info!(
+                    "Starting purge closed orders timer at {interval_mins} minute intervals"
+                );
+
+                if let Err(e) = self.clock.borrow_mut().set_timer_ns(
                     TIMER_PURGE_CLOSED_ORDERS,
                     interval_ns,
                     None,
@@ -842,8 +849,10 @@ impl ExecutionEngine {
                     Some(callback),
                     None,
                     None,
-                )
-                .expect("Failed to set purge closed orders timer");
+                ) {
+                    log::error!("Failed to set {TIMER_PURGE_CLOSED_ORDERS} timer: {e}");
+                }
+            }
         }
 
         if let Some(interval_mins) = self
@@ -856,24 +865,31 @@ impl ExecutionEngine {
                 .timer_names()
                 .contains(&TIMER_PURGE_CLOSED_POSITIONS)
         {
-            let interval_ns = mins_to_nanos(u64::from(interval_mins));
-            let buffer_mins = self.config.purge_closed_positions_buffer_mins.unwrap_or(0);
-            let buffer_secs = mins_to_secs(u64::from(buffer_mins));
-            let cache = self.cache.clone();
-            let clock = self.clock.clone();
+            'purge_closed_positions: {
+                let Some(interval_ns) = checked_mins_to_nanos(u64::from(interval_mins)) else {
+                    log::error!(
+                        "Invalid purge_closed_positions_interval_mins {interval_mins}: minutes to nanoseconds conversion overflow"
+                    );
+                    break 'purge_closed_positions;
+                };
+                let buffer_mins = self.config.purge_closed_positions_buffer_mins.unwrap_or(0);
+                let buffer_secs = mins_to_secs(u64::from(buffer_mins));
+                let cache = self.cache.clone();
+                let clock = self.clock.clone();
 
-            let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
-                let ts_now = clock.borrow().timestamp_ns();
-                cache
-                    .borrow_mut()
-                    .purge_closed_positions(ts_now, buffer_secs);
-            });
-            let callback = TimeEventCallback::from(callback_fn);
+                let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
+                    let ts_now = clock.borrow().timestamp_ns();
+                    cache
+                        .borrow_mut()
+                        .purge_closed_positions(ts_now, buffer_secs);
+                });
+                let callback = TimeEventCallback::from(callback_fn);
 
-            log::info!("Starting purge closed positions timer at {interval_mins} minute intervals");
-            self.clock
-                .borrow_mut()
-                .set_timer_ns(
+                log::info!(
+                    "Starting purge closed positions timer at {interval_mins} minute intervals"
+                );
+
+                if let Err(e) = self.clock.borrow_mut().set_timer_ns(
                     TIMER_PURGE_CLOSED_POSITIONS,
                     interval_ns,
                     None,
@@ -881,8 +897,10 @@ impl ExecutionEngine {
                     Some(callback),
                     None,
                     None,
-                )
-                .expect("Failed to set purge closed positions timer");
+                ) {
+                    log::error!("Failed to set {TIMER_PURGE_CLOSED_POSITIONS} timer: {e}");
+                }
+            }
         }
 
         if let Some(interval_mins) = self
@@ -895,24 +913,31 @@ impl ExecutionEngine {
                 .timer_names()
                 .contains(&TIMER_PURGE_ACCOUNT_EVENTS)
         {
-            let interval_ns = mins_to_nanos(u64::from(interval_mins));
-            let lookback_mins = self.config.purge_account_events_lookback_mins.unwrap_or(0);
-            let lookback_secs = mins_to_secs(u64::from(lookback_mins));
-            let cache = self.cache.clone();
-            let clock = self.clock.clone();
+            'purge_account_events: {
+                let Some(interval_ns) = checked_mins_to_nanos(u64::from(interval_mins)) else {
+                    log::error!(
+                        "Invalid purge_account_events_interval_mins {interval_mins}: minutes to nanoseconds conversion overflow"
+                    );
+                    break 'purge_account_events;
+                };
+                let lookback_mins = self.config.purge_account_events_lookback_mins.unwrap_or(0);
+                let lookback_secs = mins_to_secs(u64::from(lookback_mins));
+                let cache = self.cache.clone();
+                let clock = self.clock.clone();
 
-            let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
-                let ts_now = clock.borrow().timestamp_ns();
-                cache
-                    .borrow_mut()
-                    .purge_account_events(ts_now, lookback_secs);
-            });
-            let callback = TimeEventCallback::from(callback_fn);
+                let callback_fn: Rc<dyn Fn(TimeEvent)> = Rc::new(move |_event| {
+                    let ts_now = clock.borrow().timestamp_ns();
+                    cache
+                        .borrow_mut()
+                        .purge_account_events(ts_now, lookback_secs);
+                });
+                let callback = TimeEventCallback::from(callback_fn);
 
-            log::info!("Starting purge account events timer at {interval_mins} minute intervals");
-            self.clock
-                .borrow_mut()
-                .set_timer_ns(
+                log::info!(
+                    "Starting purge account events timer at {interval_mins} minute intervals"
+                );
+
+                if let Err(e) = self.clock.borrow_mut().set_timer_ns(
                     TIMER_PURGE_ACCOUNT_EVENTS,
                     interval_ns,
                     None,
@@ -920,8 +945,10 @@ impl ExecutionEngine {
                     Some(callback),
                     None,
                     None,
-                )
-                .expect("Failed to set purge account events timer");
+                ) {
+                    log::error!("Failed to set {TIMER_PURGE_ACCOUNT_EVENTS} timer: {e}");
+                }
+            }
         }
     }
 
@@ -1241,6 +1268,7 @@ impl ExecutionEngine {
             strategy_id,
             ts_now,
             Some(report.order_status),
+            self.source_client_id_for_account(report.account_id, &report.instrument_id),
         )
     }
 
@@ -1331,6 +1359,7 @@ impl ExecutionEngine {
             strategy_id,
             ts_now,
             None,
+            self.source_client_id_for_account(report.account_id, &report.instrument_id),
         )
     }
 
@@ -1360,6 +1389,7 @@ impl ExecutionEngine {
         strategy_id: StrategyId,
         ts_now: UnixNanos,
         order_status: Option<OrderStatus>,
+        source_client_id: Option<ClientId>,
     ) -> Option<OrderAny> {
         let initialized = OrderEventAny::Initialized(initialized);
         let order = match OrderAny::from_events(vec![initialized.clone()]) {
@@ -1377,7 +1407,7 @@ impl ExecutionEngine {
                 return None;
             }
 
-            if let Err(e) = cache.add_order(order.clone(), None, None, false) {
+            if let Err(e) = cache.add_order(order.clone(), None, source_client_id, false) {
                 log::error!("Failed to add external order to cache: {e}");
                 return None;
             }
@@ -1403,6 +1433,28 @@ impl ExecutionEngine {
         );
 
         Some(order)
+    }
+
+    /// Resolves the execution client origin for a live-stream report by matching
+    /// the report account against registered clients. A unique match stamps the
+    /// materialized order's client origin; no match or an ambiguous match keeps
+    /// the order origin-free.
+    fn source_client_id_for_account(
+        &self,
+        account_id: AccountId,
+        instrument_id: &InstrumentId,
+    ) -> Option<ClientId> {
+        let mut matches = self
+            .clients
+            .values()
+            .filter(|adapter| {
+                adapter.account_id == account_id && adapter.handles_order_venue(instrument_id.venue)
+            })
+            .map(|adapter| adapter.client_id);
+
+        let first = matches.next()?;
+
+        matches.next().is_none().then_some(first)
     }
 
     /// Reconciles a fill report received at runtime.
@@ -2078,8 +2130,7 @@ impl ExecutionEngine {
         let (order, added_to_cache) = match cached_order {
             Some(order) => (order, false),
             None => {
-                let Some(order) =
-                    self.add_order_from_init(&cmd.order_init, cmd.position_id, cmd.client_id, &cmd)
+                let Some(order) = self.add_order_from_init(&cmd.order_init, cmd.position_id, &cmd)
                 else {
                     return;
                 };
@@ -2132,6 +2183,25 @@ impl ExecutionEngine {
             }
         }
 
+        let client_id = client.client_id();
+        let claim_result = self
+            .cache
+            .borrow_mut()
+            .claim_order_clients(&[(client_order_id, client_id)]);
+
+        if let Err(e) = claim_result {
+            self.deny_order(
+                &order,
+                &OrderDeniedReason::ValidationFailed {
+                    detail: format!(
+                        "Failed to claim execution client {client_id} for {client_order_id}: {e}"
+                    ),
+                }
+                .to_string(),
+            );
+            return;
+        }
+
         if self.config.manage_own_order_books && should_handle_own_book_order(&order) {
             let mut own_book = self.get_or_init_own_order_book(&order.instrument_id());
             own_book.add(order.to_own_book_order());
@@ -2173,9 +2243,7 @@ impl ExecutionEngine {
                 continue;
             };
 
-            let Some(order) =
-                self.add_order_from_init(order_init, cmd.position_id, cmd.client_id, &cmd)
-            else {
+            let Some(order) = self.add_order_from_init(order_init, cmd.position_id, &cmd) else {
                 continue;
             };
 
@@ -2272,6 +2340,27 @@ impl ExecutionEngine {
             }
         }
 
+        let client_id = client.client_id();
+        let claims = orders
+            .iter()
+            .map(|order| (order.client_order_id(), client_id))
+            .collect::<Vec<_>>();
+        let claim_result = self.cache.borrow_mut().claim_order_clients(&claims);
+        if let Err(e) = claim_result {
+            let reason = OrderDeniedReason::ValidationFailed {
+                detail: format!(
+                    "Failed to claim execution client {client_id} for order list {}: {e}",
+                    cmd.order_list.id,
+                ),
+            }
+            .to_string();
+
+            for order in &orders {
+                self.deny_order(order, &reason);
+            }
+            return;
+        }
+
         if self.config.manage_own_order_books {
             for order in &orders {
                 if should_handle_own_book_order(order) {
@@ -2300,7 +2389,6 @@ impl ExecutionEngine {
         &self,
         order_init: &OrderInitialized,
         position_id: Option<PositionId>,
-        client_id: Option<ClientId>,
         context: &dyn Display,
     ) -> Option<OrderAny> {
         let client_order_id = order_init.client_order_id;
@@ -2316,10 +2404,10 @@ impl ExecutionEngine {
             }
         };
 
-        if let Err(e) =
-            self.cache
-                .borrow_mut()
-                .add_order(order.clone(), position_id, client_id, true)
+        if let Err(e) = self
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), position_id, None, true)
         {
             log::error!(
                 "Cannot add reconstructed order to cache for {client_order_id}: {e}, {context}"
@@ -4253,6 +4341,7 @@ mod tests {
             instrument.id(),
             order.strategy_id(),
             UnixNanos::default(),
+            None,
             None,
         );
 

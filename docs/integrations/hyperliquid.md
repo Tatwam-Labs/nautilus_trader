@@ -329,6 +329,21 @@ instruments = await client.load_instrument_definitions(
 )
 ```
 
+### Open-order and position reconciliation
+
+Open‑order and position reconciliation covers standard perpetuals and every HIP‑3 dex represented by
+the execution client's cached perpetual instruments, without separate reconciliation configuration.
+A `LiveNode` initializes this cache from the instrument universe when the execution client connects.
+Direct `HyperliquidHttpClient` callers get the same coverage for the instruments they add with
+`cache_instrument()`.
+
+An unfiltered request queries the default perp dex and each cached builder dex, then combines their
+reports; position reconciliation also includes spot holdings. For perpetual filters, a request
+filtered to a HIP‑3 instrument derives the builder dex from the symbol's dex prefix and queries only
+that dex. A standard perpetual filter queries only the default dex. Spot and outcome position filters
+keep their existing spot‑only routing. If any required request fails, reconciliation returns an error
+rather than a partial snapshot.
+
 ### Differences from standard perpetuals
 
 HIP-3 markets trade on the same HyperCore matching engine and use the same order API.
@@ -1016,6 +1031,10 @@ def round_to_sig_figs(price: Decimal, sig_figs: int = 5) -> Decimal:
 | `FOK`         | -          | -    | *Not supported*.     |
 | `GTD`         | -          | -    | *Not supported*.     |
 
+Venue `orderStatus` and `historicalOrders` payloads can report `FrontendMarket`
+or `LiquidationMarket` instead of `IOC`. The adapter maps both to `IOC` and does
+not submit those labels.
+
 :::note
 When an IOC order cannot match any resting liquidity, Hyperliquid reports
 `iocCancelRejected` with `Order could not immediately match against any resting orders`.
@@ -1180,7 +1199,8 @@ Standard perps default to cross margin; HIP-3 perps default to isolated. On
 connect, the execution client reconciles orders, fills, and positions against
 Hyperliquid's clearinghouse state. Spot positions are reconstructed from held
 balances (long-only); HIP-4 side tokens reconcile against their matching
-`BinaryOption` instruments.
+`BinaryOption` instruments. See [HIP‑3 reconciliation](#open-order-and-position-reconciliation) for
+per‑dex open‑order and position fan‑out.
 
 :::note
 Leverage is managed directly through the Hyperliquid web UI or API, not through the adapter.
@@ -1222,10 +1242,16 @@ Upstream references:
 
 The adapter automatically reconnects on WebSocket disconnection using exponential backoff
 (starting at 250ms, up to 5s). On reconnect, all active subscriptions are resubscribed
-automatically, and order book snapshots are rebuilt. No manual intervention is required.
+automatically, order book snapshots are rebuilt, and a `Reconnected` event is forwarded after
+those resubscription commands are queued. No manual intervention is required.
 
 A heartbeat ping is sent every 30 seconds to keep the connection alive (Hyperliquid closes
-idle connections after 60 seconds).
+idle connections after 60 seconds). The shared transport treats 90 seconds without any inbound
+frame as a dead peer and starts the same reconnect path.
+
+Live data and execution clients publish `SocketStateChanged` on `hyperliquid-data-streams` and
+`hyperliquid-user-streams`. Both endpoints register a reconnect handle, so `reconnect_socket` can
+target them without cycling the containing client.
 
 ### Stream health and recovery
 
@@ -1387,7 +1413,7 @@ effect yet. See [Instrument loading](#instrument-loading) for how to refresh the
 | `base_url_exchange`            | `None`    | Override for the exchange API base URL.                                                                                                          |
 | `max_retries`                  | `3`       | Maximum retry attempts for submit, cancel, or modify order requests.                                                                             |
 | `retry_delay_initial_ms`       | `100`     | Initial delay (milliseconds) between retries.                                                                                                    |
-| `retry_delay_max_ms`           | `5000`    | Maximum delay (milliseconds) between retries.                                                                                                    |
+| `retry_delay_max_ms`           | `5,000`   | Maximum delay (milliseconds) between retries.                                                                                                    |
 | `http_timeout_secs`            | `60`      | Timeout (seconds) applied to REST calls.                                                                                                         |
 | `ws_post_timeout_secs`         | `10`      | Timeout (seconds) applied to WebSocket post trading requests.                                                                                    |
 | `normalize_prices`             | `True`    | Normalize order prices to 5 significant figures before submission.                                                                               |

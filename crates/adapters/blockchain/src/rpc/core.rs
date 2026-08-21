@@ -67,7 +67,7 @@ pub struct CoreBlockchainRpcClient {
     wss_consumer_rx: Option<tokio::sync::mpsc::UnboundedReceiver<Message>>,
     /// Tracks desired subscriptions that need to be re-established on reconnection.
     subscriptions: Arc<tokio::sync::RwLock<HashMap<RpcEventType, RpcSubscription>>>,
-    /// WebSocket transport backend (defaults to `Tungstenite`).
+    /// WebSocket transport backend (defaults to `Sockudo`).
     transport_backend: TransportBackend,
     /// Optional proxy URL for the WebSocket connection.
     proxy_url: Option<String>,
@@ -182,14 +182,15 @@ impl CoreBlockchainRpcClient {
         let config = WebSocketConfig {
             url: self.wss_rpc_url.clone(),
             headers: vec![(USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string())],
-            heartbeat: Some(heartbeat_interval),
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(10_000),
+            heartbeat_interval_secs: Some(heartbeat_interval),
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(10_000),
             reconnect_delay_initial_ms: Some(1_000),
             reconnect_delay_max_ms: Some(30_000),
             reconnect_backoff_factor: Some(2.0),
             reconnect_jitter_ms: Some(1_000),
             reconnect_max_attempts: None,
+            heartbeat_timeout_secs: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),

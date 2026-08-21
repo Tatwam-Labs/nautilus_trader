@@ -51,7 +51,7 @@ DEX), traditional markets (FX, equities, futures, options), and betting exchange
 
 ## Features
 
-- **Fast**: Rust core with the [mimalloc](https://github.com/microsoft/mimalloc)\* allocator and asynchronous networking using [tokio](https://crates.io/crates/tokio).
+- **Fast**: Rust core with the [mimalloc](https://github.com/microsoft/mimalloc) allocator and asynchronous networking using [tokio](https://crates.io/crates/tokio).
 - **Reliable**: Type- and thread-safety backed by Rust, with optional Redis-backed state persistence.
 - **Portable**: Runs on Linux, macOS, and Windows. Deploy using Docker.
 - **Flexible**: Modular adapters integrate any REST API or WebSocket feed.
@@ -61,8 +61,6 @@ DEX), traditional markets (FX, equities, futures, options), and betting exchange
 - **Live**: Identical strategy implementations between research and live deployment.
 - **Multi-venue**: Run market-making and cross-venue strategies across multiple venues simultaneously.
 - **AI Training**: Engine fast enough to train AI trading agents (RL/ES).
-
-*\* Python wheels use mimalloc on Linux and Windows. macOS wheels use the system allocator for PyArrow compatibility.*
 
 ![nautilus](https://github.com/nautechsystems/nautilus_trader/raw/develop/assets/nautilus-art.png "nautilus")
 
@@ -163,8 +161,9 @@ practices:
   and Rust dependencies are sourced only from crates.io.
 - **Dependency intake**: lock files pin every dependency with cryptographic checksums, third-party
   Python packages install from wheels only, new dependency and tooling versions observe a
-  publication cooldown before adoption, cargo-vet audits Rust provenance, and license checks enforce
-  LGPL-3.0-or-later compatibility.
+  publication cooldown before adoption, cargo-vet audits Rust provenance, and cargo-deny checks Rust
+  dependencies against an allow list of licenses compatible with NautilusTrader's `LGPL-3.0-only`
+  license.
 - **Scanning and fuzzing**: Gitleaks secret screening and Zizmor Actions auditing run pre-commit;
   CodeQL runs on PRs to `master` and pushes to `nightly`; cargo-audit, cargo-deny, cargo-vet,
   OSV Scanner, and pip-audit run on audit-relevant PRs and daily schedules; cargo-fuzz targets cover
@@ -531,9 +530,7 @@ A `Makefile` is provided to automate most installation and build tasks for devel
 Indicators and strategies can be developed in Python or Rust. For performance and
 latency-sensitive applications, we recommend Rust. Below are some examples:
 
-- [indicator](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/backtest/example_07_using_indicators/strategy.py) example written in Python.
 - [indicator](https://github.com/nautechsystems/nautilus_trader/tree/develop/python/nautilus_trader/indicators/) implementations exposed through PyO3.
-- [strategy](https://github.com/nautechsystems/nautilus_trader/blob/develop/examples/backtest/example_01_load_bars_from_custom_csv/strategy.py) example written in Python.
 - [backtest](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/backtest/) examples using a `BacktestEngine` directly.
 - [EMA crossover backtest](https://github.com/nautechsystems/nautilus_trader/blob/develop/crates/backtest/examples/engine_ema_cross.rs) example written in Rust.
 

@@ -17,8 +17,9 @@ as standalone Python scripts or services.
 :::
 
 :::warning[One LiveNode per process]
-Running multiple `LiveNode` instances concurrently in the same process is not supported due to global singleton state.
-Add multiple strategies to a single node, or run additional nodes in separate processes for parallel execution.
+Running multiple `LiveNode` instances concurrently in the same process is not supported because
+runtime state is not isolated. `run_async()` also rejects a second hosted node on the same event
+loop. Add multiple strategies to a single node, or run additional nodes in separate processes.
 
 See [Processes and threads](../concepts/architecture.md#processes-and-threads) for details.
 :::
@@ -71,16 +72,25 @@ config = LiveNodeConfig(
 
 ### Core configuration parameters
 
-| Setting                       | Default      | Description                                 |
-| ----------------------------- | ------------ | ------------------------------------------- |
-| `trader_id`                   | "TRADER-001" | Unique trader identifier (name‑tag format). |
-| `instance_id`                 | `None`       | Optional unique instance identifier.        |
-| `timeout_connection_secs`     | 60.0         | Connection timeout in seconds.              |
-| `timeout_reconciliation_secs` | 30.0         | Reconciliation timeout in seconds.          |
-| `timeout_portfolio_secs`      | 10.0         | Portfolio initialization timeout.           |
-| `timeout_disconnection_secs`  | 10.0         | Disconnection timeout.                      |
-| `delay_post_stop_secs`        | 10.0         | Delay for residual events after stopping.   |
-| `timeout_shutdown_secs`       | 5.0          | Pending‑task shutdown timeout in seconds.   |
+| Setting                       | Default      | Description                                                                      |
+| ----------------------------- | ------------ | -------------------------------------------------------------------------------- |
+| `trader_id`                   | "TRADER-001" | Unique trader identifier (name‑tag format); the tag must be unique across nodes. |
+| `instance_id`                 | `None`       | Optional unique instance identifier.                                             |
+| `timeout_connection_secs`     | 60.0         | Connection timeout in seconds.                                                   |
+| `timeout_reconciliation_secs` | 30.0         | Reconciliation timeout in seconds.                                               |
+| `timeout_portfolio_secs`      | 10.0         | Portfolio initialization timeout.                                                |
+| `timeout_disconnection_secs`  | 10.0         | Disconnection timeout.                                                           |
+| `delay_post_stop_secs`        | 10.0         | Delay for residual events after stopping.                                        |
+| `timeout_shutdown_secs`       | 5.0          | Pending‑task shutdown timeout in seconds.                                        |
+
+:::warning[Trader ID tag uniqueness]
+The tag after the final hyphen is what reaches generated client order IDs, order list IDs, and
+position IDs; the name before it does not. Two nodes trading the same venue account must therefore
+use different tags, because `MY-TRADER-001` and `OTHER-TRADER-001` share the tag `001` and can
+produce identical IDs. Setting `use_uuid_client_order_ids` on the strategy removes the
+exposure for client order IDs only: order list IDs and position IDs keep the tag either way, so
+unique tags remain required.
+:::
 
 ### Cache database configuration
 
@@ -157,7 +167,8 @@ finally:
 
 Pass `PostgresCacheConfig` instead to back the cache with Postgres. Any other object raises
 `NotImplementedError` from `with_cache_database_factory`, and a failed database connection fails
-`run()`.
+`run()`. Database‑backed nodes must use `run()` because `run_async()` rejects cache database
+backings that would block the host event loop.
 
 `with_load_state` and `with_save_state` control actor and strategy state persistence, which requires
 a Redis backing. The Postgres adapter backs cache state only: with registered actors or strategies,
@@ -236,9 +247,9 @@ Existing code can continue passing `RedisMessageBusFactory(redis_config)` to
 
 `MessageBusConfig` alone does not install a backing. Pair it with a factory as shown above. The
 factory always installs external egress, and calling `run()` also consumes the configured external
-streams. Entries already in a stream before the node starts are not replayed. A host loop based on
-`start()` and `poll()` does not service external message‑bus ingress; use `run()` when
-`external_streams` is configured. See [message bus backing
+streams. Entries already in a stream before the node starts are not replayed. `run_async()` runs
+the same lifecycle as `run()`, so a node hosted on a caller's event loop services external
+message‑bus ingress too. See [message bus backing
 configuration](../concepts/message_bus.md#backing-config) for lifecycle and ingress details.
 External producers that write directly to Redis must supply the required `type` field. See
 [external egress and ingress](../concepts/message_bus.md#external-egress-and-ingress) for the wire
@@ -395,10 +406,10 @@ For a complete parameter list see the `StrategyConfig`
 
 ### Identification
 
-| Setting        | Default | Description                                       |
-| -------------- | ------- | ------------------------------------------------- |
-| `strategy_id`  | None    | Unique strategy identifier.                       |
-| `order_id_tag` | None    | Unique tag appended to this strategy's order IDs. |
+| Setting        | Default | Description                                                                |
+| -------------- | ------- | -------------------------------------------------------------------------- |
+| `strategy_id`  | None    | Unique strategy identifier.                                                |
+| `order_id_tag` | None    | Unique tag appended to this strategy's order IDs; cannot contain a hyphen. |
 
 ### Order management
 

@@ -90,7 +90,7 @@ pub struct BlockchainDataClientConfig {
     pub pool_filters: DexPoolFilters,
     /// Optional configuration for data client's Postgres cache database
     pub postgres_cache_database_config: Option<PostgresConnectOptions>,
-    /// WebSocket transport backend (defaults to `Tungstenite`).
+    /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     #[serde(default)]
     pub transport_backend: TransportBackend,
@@ -181,10 +181,24 @@ pub struct BlockchainExecutionClientConfig {
     pub gas_limit: u64,
     /// Buffer in basis points applied over the `eth_estimateGas` result.
     pub gas_buffer_bps: u32,
+    /// Allowed (input token, output token) address pairs for swaps.
+    pub allowed_token_pairs: Option<Vec<(String, String)>>,
+    /// Default slippage in basis points applied to derive the swap minimum output.
+    pub slippage_bps: Option<u32>,
+    /// Maximum slippage in basis points accepted from a per-order parameter override.
+    pub max_slippage_bps: Option<u32>,
+    /// Per-order ceiling for the input amount, in raw units of the order's base token.
+    pub max_order_amount: Option<u64>,
+    /// Swap deadline offset in seconds from the latest block timestamp.
+    pub deadline_seconds: Option<u64>,
+    /// Maximum age of the local pool state in blocks for a quote to be usable.
+    pub max_quote_age_blocks: Option<u64>,
+    /// Inclusion timeout in seconds before a broadcast transaction is treated as dropped.
+    pub receipt_timeout_secs: Option<u64>,
     /// Durable store for execution transaction records; the client refuses to submit any
     /// transaction without it.
     pub postgres_cache_database_config: Option<PostgresConnectOptions>,
-    /// WebSocket transport backend (defaults to `Tungstenite`).
+    /// WebSocket transport backend (defaults to `Sockudo`).
     #[builder(default)]
     #[serde(default)]
     pub transport_backend: TransportBackend,
@@ -208,6 +222,13 @@ impl Debug for BlockchainExecutionClientConfig {
             .field("base_fee_buffer_bps", &self.base_fee_buffer_bps)
             .field("gas_limit", &self.gas_limit)
             .field("gas_buffer_bps", &self.gas_buffer_bps)
+            .field("allowed_token_pairs", &self.allowed_token_pairs)
+            .field("slippage_bps", &self.slippage_bps)
+            .field("max_slippage_bps", &self.max_slippage_bps)
+            .field("max_order_amount", &self.max_order_amount)
+            .field("deadline_seconds", &self.deadline_seconds)
+            .field("max_quote_age_blocks", &self.max_quote_age_blocks)
+            .field("receipt_timeout_secs", &self.receipt_timeout_secs)
             .field(
                 "postgres_cache_database_config",
                 &self.postgres_cache_database_config,
@@ -226,12 +247,18 @@ impl ClientConfig for BlockchainExecutionClientConfig {
 #[cfg(feature = "python")]
 nautilus_core::impl_pyo3_config_getters!(BlockchainExecutionClientConfig {
     base_fee_buffer_bps: u32,
+    deadline_seconds: Option<u64>,
     gas_buffer_bps: u32,
     gas_limit: u64,
     http_rpc_url: String,
     max_fee_per_gas_wei: u64,
+    max_order_amount: Option<u64>,
+    max_quote_age_blocks: Option<u64>,
+    max_slippage_bps: Option<u32>,
+    receipt_timeout_secs: Option<u64>,
     router_addresses: Vec<String>,
     signer_private_key_env: String,
+    slippage_bps: Option<u32>,
     tokens: Option<Vec<String>>,
     transport_backend: TransportBackend,
     unlimited_approval: bool,
@@ -287,6 +314,13 @@ max_fee_per_gas_wei = 1000000000
 base_fee_buffer_bps = 2000
 gas_limit = 1000000
 gas_buffer_bps = 2000
+allowed_token_pairs = [["0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"]]
+slippage_bps = 50
+max_slippage_bps = 200
+max_order_amount = 1000000000000000000
+deadline_seconds = 300
+max_quote_age_blocks = 100
+receipt_timeout_secs = 60
 
 [chain]
 name = "Ethereum"
@@ -319,8 +353,55 @@ native_currency_decimals = 18
         assert_eq!(config.base_fee_buffer_bps, 2_000);
         assert_eq!(config.gas_limit, 1_000_000);
         assert_eq!(config.gas_buffer_bps, 2_000);
+        assert_eq!(
+            config.allowed_token_pairs,
+            Some(vec![(
+                "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".to_string(),
+                "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".to_string(),
+            )]),
+        );
+        assert_eq!(config.slippage_bps, Some(50));
+        assert_eq!(config.max_slippage_bps, Some(200));
+        assert_eq!(config.max_order_amount, Some(1_000_000_000_000_000_000));
+        assert_eq!(config.deadline_seconds, Some(300));
+        assert_eq!(config.max_quote_age_blocks, Some(100));
+        assert_eq!(config.receipt_timeout_secs, Some(60));
         assert!(config.postgres_cache_database_config.is_none());
         assert_eq!(config.transport_backend, TransportBackend::default());
+    }
+
+    #[rstest]
+    fn test_execution_config_toml_accepts_legacy_shape_without_transaction_limits() {
+        let config: BlockchainExecutionClientConfig = toml::from_str(
+            r#"
+trader_id = "TRADER-001"
+client_id = "BLOCKCHAIN-001"
+wallet_address = "0x0000000000000000000000000000000000000000"
+http_rpc_url = "https://eth-mainnet.example.com"
+signer_private_key_env = "BLOCKCHAIN_PRIVATE_KEY"
+router_addresses = ["0xE592427A0AEce92De3Edee1F18E0157C05861564"]
+weth_address = "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"
+max_fee_per_gas_wei = 1000000000
+base_fee_buffer_bps = 2000
+gas_limit = 1000000
+gas_buffer_bps = 2000
+
+[chain]
+name = "Ethereum"
+chain_id = 1
+hypersync_url = "https://1.hypersync.xyz"
+native_currency_decimals = 18
+"#,
+        )
+        .unwrap();
+
+        assert!(config.allowed_token_pairs.is_none());
+        assert!(config.slippage_bps.is_none());
+        assert!(config.max_slippage_bps.is_none());
+        assert!(config.max_order_amount.is_none());
+        assert!(config.deadline_seconds.is_none());
+        assert!(config.max_quote_age_blocks.is_none());
+        assert!(config.receipt_timeout_secs.is_none());
     }
 
     #[rstest]
@@ -338,6 +419,13 @@ max_fee_per_gas_wei = 1000000000
 base_fee_buffer_bps = 2000
 gas_limit = 1000000
 gas_buffer_bps = 2000
+allowed_token_pairs = [["0x82aF49447D8a07e3bd95BD0d56f35241523fBab1", "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"]]
+slippage_bps = 50
+max_slippage_bps = 200
+max_order_amount = 1000000000000000000
+deadline_seconds = 300
+max_quote_age_blocks = 100
+receipt_timeout_secs = 60
 unknown_field = 1
 
 [chain]
@@ -395,6 +483,16 @@ native_currency_decimals = 18
             .base_fee_buffer_bps(2_000)
             .gas_limit(1_000_000)
             .gas_buffer_bps(2_000)
+            .allowed_token_pairs(vec![(
+                "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".to_string(),
+                "0xaf88d065e77c8cC2239327C5EDb3A432268e5831".to_string(),
+            )])
+            .slippage_bps(50)
+            .max_slippage_bps(200)
+            .max_order_amount(1_000_000_000_000_000_000)
+            .deadline_seconds(300)
+            .max_quote_age_blocks(100)
+            .receipt_timeout_secs(60)
             .build();
 
         let debug = format!("{config:?}");

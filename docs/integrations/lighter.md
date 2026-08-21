@@ -8,6 +8,10 @@ The NautilusTrader Lighter adapter is implemented by the `nautilus-lighter` crat
 Rust data and execution clients, typed REST and WebSocket models, and an in-tree L2 transaction
 signer for the venue's Schnorr / ECgFp5 signing flow.
 
+Measured L2 signing cost, including a comparison with the official Go SDK, is recorded in
+[`crates/adapters/lighter/benches/BENCHMARKS.md`](../../crates/adapters/lighter/benches/BENCHMARKS.md).
+Absolute numbers vary by machine, so only same-machine deltas are meaningful.
+
 ## Overview
 
 The main components are:
@@ -29,27 +33,16 @@ consumed through the Rust trait surface.
 
 Python examples live in
 [`examples/live/lighter/`](https://github.com/nautechsystems/nautilus_trader/tree/develop/examples/live/lighter/)
-and default to a dry build. Pass `--run` to connect; the execution tester also requires
-`--live-orders` to disable `dry_run`.
+and run out of the box: settings live in module-level constants at the top of each file, and
+running a script connects and starts immediately. The default environment is testnet; edit the
+`LIGHTER_ENVIRONMENT` constant to use mainnet. The execution tester places real orders by default
+(`dry_run=False`), stated in a warning at the top of the module.
 
 From the repository root:
 
 ```bash
-.venv/bin/python examples/live/lighter/data_tester.py --lighter-environment testnet
-.venv/bin/python examples/live/lighter/exec_tester.py --lighter-environment testnet
-```
-
-From the repository root, connect to mainnet with explicit instruments:
-
-```bash
-.venv/bin/python examples/live/lighter/data_tester.py \
-    --lighter-environment mainnet \
-    --instrument BTC-PERP.LIGHTER \
-    --run
-.venv/bin/python examples/live/lighter/exec_tester.py \
-    --lighter-environment mainnet \
-    --instrument DOGE-PERP.LIGHTER \
-    --run
+.venv/bin/python examples/live/lighter/data_tester.py
+.venv/bin/python examples/live/lighter/exec_tester.py
 ```
 
 Rust examples live under `crates/adapters/lighter/examples/`. Both testers connect when run. The
@@ -317,7 +310,9 @@ expiry, then the child uses `ImmediateOrCancel`.
 Without an explicit GTD expiry, limit‑style `GTC`, `DAY`, and `GTD` orders default to the current
 time plus 28 days; conditional `GTC`, `DAY`, and limit‑style `IOC` use the same default. Lighter
 rejects `-1` and accepts expiries from 5 minutes to 30 days after submission. The adapter enforces
-that window with a one‑second signing and transport margin.
+that window with a one‑second signing and transport margin, so an expiry of exactly 5 minutes is
+denied locally before signing; tester configurations expressed in whole minutes should use at least
+6 minutes.
 
 ### Execution instructions
 
@@ -392,6 +387,25 @@ pages. Fill reconciliation remains repeatable across calls while suppressing fil
 from the live WebSocket stream. Historical order and fill reports bind a mapped client index only
 to its matching venue order ID so reused numeric indexes cannot merge unrelated lifecycles.
 
+Each bounded mass status captures one cutoff for its inactive orders and fills. The adapter marks
+the report set complete only when the required order, fill, and position sources succeed and every
+historical fill maps to its order. If a historical source fails, active orders remain available for
+reconciliation while historical fills follow the engine's
+[order‑only projection](../concepts/execution.md#order-only-fill-projection) rules.
+
+The `trades` endpoint retains only the most recent 3,000 trades per `account_index`, so a bounded
+lookback can request more fill history than the venue serves. Pagination walks back from the newest
+trade, and only a trade older than the lookback start proves the window was served:
+
+- Trade older than the start: the report set stays complete.
+- Cursor exhausted first: the adapter logs the uncovered span and marks the report set incomplete.
+- No retained trades: nothing can have been truncated, so the report set stays complete.
+
+An exhausted cursor cannot distinguish truncation from an account with no older trades, so a young
+account reports incomplete even though nothing is missing. Choose a lookback the venue can serve.
+The `export` endpoint serves full trade history for auditing fills the lookback cannot cover, and
+the adapter does not read it.
+
 A strategy that opens a position immediately on start can trigger a transient position-check
 discrepancy warning (`cached=0, venue=N`) when the venue's `account_all_positions` frame arrives a
 few milliseconds before the matching fill event is processed. The warning self-resolves once the
@@ -419,6 +433,11 @@ state. A `subscribed/account_all_positions` frame is an authoritative snapshot: 
 rows with a zero `position` value flatten cached positions, and an empty `positions` map flattens the
 entire cache. Cached positions for rows the adapter cannot map or parse are retained, so they do not
 cause false flat reports.
+
+For bounded reconciliation, the adapter also records which markets the current connection's
+snapshot covers. A reconnect invalidates that coverage. An absent touched market produces an
+explicit flat report only after a current snapshot covers it; an unmapped or malformed row leaves
+the mass status incomplete instead of proving flat.
 
 An `update/account_all_positions` frame is incremental. Non‑zero rows replace the cached position for
 their market, explicit zero rows flatten that market, and omitted markets remain cached. An empty
@@ -491,6 +510,16 @@ Higher [account tiers](#account-tiers) still require explicit client quotas:
 These options change local pacing only. Public data requests remain unauthenticated, so setting a
 higher local quota does not make those requests eligible for an account‑level venue limit.
 
+### L1-address transaction limit
+
+The venue also enforces a 40 req/min limit per L1 address on transaction traffic, below the
+default `sendtx_quota_per_min` of 60. A mainnet quoting session amending on every quote drift hit
+`code=23000` (`Too Many Requests`) after roughly 40 modify transactions in a minute; see
+[Volume quota and no-fill quoting](#volume-quota-and-no-fill-quoting) for the related quota that
+modify transactions also spend. Set `sendtx_quota_per_min` to 40 or lower for transaction‑heavy
+quoting workloads. The limiter is shared across all `sendTx` traffic, so a lower quota also paces
+creates and cancels.
+
 The REST limiter counts one token per call rather than venue endpoint weights. Set
 `rest_quota_per_min` for the effective endpoint mix: a 24,000 weighted req/min premium limit yields
 40 calls/minute to endpoints with weight 600, such as `/api/v1/trades` and
@@ -541,7 +570,7 @@ Common REST endpoint weights from the official docs:
 | WebSocket subscriptions / connection   | 500        | Venue limit.                                         |
 | WebSocket unique accounts / connection | 500        | Venue limit.                                         |
 | WebSocket connections / minute         | 255        | Venue limit.                                         |
-| WebSocket client messages / minute     | 200        | Adapter paces non‑tx control frames at this cap.     |
+| WebSocket client messages / minute     | 200        | Paces non‑tx frames; heartbeat pings bypass it.      |
 | WebSocket inflight messages            | 50         | Venue cap; subscriptions use a 35-frame closed loop. |
 | WebSocket `sendTxBatch` batch size     | 15 txs     | Venue limit; adapter fanout is also capped at 15.    |
 | WebSocket keepalive                    | 2 minutes  | Adapter sends heartbeats every 30 seconds.           |
@@ -569,7 +598,10 @@ or a bounded strategy that earns enough fills to replenish its quota.
 ## Connection management
 
 The WebSocket client sends heartbeats every 30 seconds and reconnects with exponential backoff from
-250 milliseconds to 30 seconds. Private subscriptions use auth tokens with an 8‑hour maximum TTL;
+250 milliseconds to 30 seconds. It treats a connection carrying no inbound frame for 90 seconds as
+dead and reconnects, which recovers a stalled socket that the venue never closes. The venue answers
+each heartbeat with a pong, so a healthy connection refreshes that window even when no market data
+flows. Private subscriptions use auth tokens with an 8‑hour maximum TTL;
 the adapter mints 7‑hour tokens, rotates them every 6 hours, and resubscribes. A transparent
 reconnect triggers a fresh token and account resubscription after tracked subscriptions start
 replaying.

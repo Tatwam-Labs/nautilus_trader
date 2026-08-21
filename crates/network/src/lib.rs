@@ -72,10 +72,6 @@
     reason = "match can be clearer than let-else for some patterns"
 )]
 #![allow(
-    clippy::redundant_closure_for_method_calls,
-    reason = "causes clippy ICE on Rust 1.94; matches the workaround in workspace Cargo.toml"
-)]
-#![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -85,6 +81,13 @@
     clippy::too_many_lines,
     reason = "network client functions with connection management are complex by nature"
 )]
+#![allow(
+    clippy::assert_is_empty,
+    reason = "`assert!(x.is_empty())` is clearer than comparing against an empty value"
+)]
+// pyo3's `from_py_object` generates `.clone()` on `Copy` fields that clippy flags from the
+// macro expansion; an item-level `allow` cannot reach the expansion
+#![allow(clippy::clone_on_copy)]
 
 pub mod backoff;
 pub mod dst;
@@ -96,6 +99,7 @@ pub mod socket;
 pub mod transport;
 pub mod websocket;
 
+mod heartbeat;
 mod logging;
 mod sink;
 mod tls;

@@ -592,13 +592,18 @@ strategy.submit_order(stop_order)
 
 The OKX adapter detects exchange-initiated risk management events:
 
+- **Liquidation warnings**: When `instrument_types` includes `MARGIN`, `SWAP`, `FUTURES`, or
+  `OPTION`, the execution client subscribes to the `liquidation-warning` channel with
+  `instType=ANY` and logs a warning when OKX reports a position nearing liquidation. This is an
+  early warning only: the position may already be liquidated by the time the message arrives, and
+  the adapter surfaces it as a log message rather than a strategy‑facing event.
 - **Liquidation orders**: When the exchange liquidates a position, the adapter detects
   the liquidation category and logs warnings with order details. These orders continue
   through the normal order and fill pipeline.
 - **Auto-deleveraging (ADL)**: When OKX closes your position to offset a counterparty's
   liquidation, the adapter detects and logs the ADL event with position details.
 
-Detection is driven by the `category` field on the order record. The
+Liquidation-order and ADL detection is driven by the `category` field on the order record. The
 recognized values are:
 
 | `category`              | Meaning                       |
@@ -609,14 +614,15 @@ recognized values are:
 | `delivery`              | Contract delivery at expiry.  |
 | `normal` / other values | Regular order flow.           |
 
-Detection runs on both paths:
+Category detection runs on both paths:
 
 - WebSocket `orders` channel (live order and fill updates).
 - HTTP `GET /api/v5/trade/orders-history` (used during reconciliation and cold-start mass status).
 
 :::info
 **Liquidation and ADL events are logged at WARNING level** with details including order
-ID, instrument, and state. Monitor these logs as part of your risk management process.
+ID, instrument, and state. Liquidation warnings instead log position side, size, margin ratio,
+mark price, and margin mode. Monitor these logs as part of your risk management process.
 
 The adapter forwards these exchange‑generated orders as `OrderStatusReport` and `FillReport`
 messages and sends position updates as `PositionStatusReport` messages. Because the orders are
@@ -626,6 +632,7 @@ untracked at dispatch time, this path does not emit strategy‑owned order event
 Upstream references:
 
 - [Order channel and `category` field](https://www.okx.com/docs-v5/en/#order-book-trading-trade-ws-order-channel)
+- [Liquidation warning channel](https://www.okx.com/docs-v5/en/#trading-account-websocket-liquidation-warning-channel)
 - [Auto-Deleveraging mechanism](https://www.okx.com/help/okx-contract-auto-deleveraging-adl)
 - [Liquidation mechanism](https://www.okx.com/help/introduction-to-liquidation)
 
@@ -760,9 +767,9 @@ Greeks.
 ### Configuration
 
 :::warning
-Option discovery requires at least one `instrument_families` value. Pass it to
-`OKXDataClientConfig` when loading options from Python. The public Python execution config
-constructor does not expose this field, so selecting `OKXInstrumentType.OPTION` only on
+Option discovery requires at least one `instrument_families` value, for example `BTC-USD`.
+Pass it to `OKXDataClientConfig` when loading options from Python. The public Python execution
+config constructor does not expose this field, so selecting `OKXInstrumentType.OPTION` only on
 `OKXExecClientConfig` skips option loading and logs a warning.
 :::
 
@@ -1039,30 +1046,30 @@ See the [OKX rate limit documentation](https://www.okx.com/docs-v5/en/#rest-api-
 
 The OKX data client provides the following Python configuration options.
 
-| Option                             | Default                    | Description                                                        |
-| ---------------------------------- | -------------------------- | ------------------------------------------------------------------ |
-| `instrument_types`                 | `[OKXInstrumentType.SPOT]` | OKX instrument types to load.                                      |
-| `instrument_families`              | `None`                     | Required for options; filters futures, swaps, and events when set. |
-| `load_spreads`                     | `False`                    | Loads live spread instruments.                                     |
-| `base_url_http`                    | `None`                     | Override for the OKX REST endpoint.                                |
-| `base_url_ws_public`               | `None`                     | Override for the public WebSocket URL.                             |
-| `base_url_ws_business`             | `None`                     | Override for the business WebSocket URL.                           |
-| `api_key`                          | `None`                     | Falls back to `OKX_API_KEY` when unset.                            |
-| `api_secret`                       | `None`                     | Falls back to `OKX_API_SECRET` when unset.                         |
-| `api_passphrase`                   | `None`                     | Falls back to `OKX_API_PASSPHRASE`.                                |
-| `environment`                      | `LIVE`                     | Environment enum (`LIVE` or `DEMO`).                               |
-| `region`                           | `GLOBAL`                   | Region enum (`GLOBAL`, `EEA`, or `US`).                            |
-| `http_timeout_secs`                | `60`                       | REST market data request timeout.                                  |
-| `max_retries`                      | `3`                        | Retry attempts for recoverable REST errors.                        |
-| `retry_delay_initial_ms`           | `1,000`                    | Initial delay before retrying.                                     |
-| `retry_delay_max_ms`               | `10,000`                   | Maximum exponential backoff delay.                                 |
-| `update_instruments_interval_mins` | `60`                       | Background instrument refresh interval.                            |
-| `book_stale_check_interval_secs`   | `5`                        | Stale book check interval.                                         |
-| `book_stale_threshold_secs`        | `30`                       | Idle time before a stale book warning.                             |
-| `book_snapshot_timeout_secs`       | `3`                        | Post‑reconnect snapshot wait.                                      |
-| `vip_level`                        | `None`                     | Enables higher‑depth books by VIP tier.                            |
-| `proxy_url`                        | `None`                     | Optional HTTP and WebSocket proxy URL.                             |
-| `transport_backend`                | `Sockudo`                  | WebSocket transport backend.                                       |
+| Option                             | Default                    | Description                                                                    |
+| ---------------------------------- | -------------------------- | ------------------------------------------------------------------------------ |
+| `instrument_types`                 | `[OKXInstrumentType.SPOT]` | OKX instrument types to load.                                                  |
+| `instrument_families`              | `None`                     | Required for options (`BTC-USD`); filters futures, swaps, and events when set. |
+| `load_spreads`                     | `False`                    | Loads live spread instruments.                                                 |
+| `base_url_http`                    | `None`                     | Override for the OKX REST endpoint.                                            |
+| `base_url_ws_public`               | `None`                     | Override for the public WebSocket URL.                                         |
+| `base_url_ws_business`             | `None`                     | Override for the business WebSocket URL.                                       |
+| `api_key`                          | `None`                     | Falls back to `OKX_API_KEY` when unset.                                        |
+| `api_secret`                       | `None`                     | Falls back to `OKX_API_SECRET` when unset.                                     |
+| `api_passphrase`                   | `None`                     | Falls back to `OKX_API_PASSPHRASE`.                                            |
+| `environment`                      | `LIVE`                     | Environment enum (`LIVE` or `DEMO`).                                           |
+| `region`                           | `GLOBAL`                   | Region enum (`GLOBAL`, `EEA`, or `US`).                                        |
+| `http_timeout_secs`                | `60`                       | REST market data request timeout.                                              |
+| `max_retries`                      | `3`                        | Retry attempts for recoverable REST errors.                                    |
+| `retry_delay_initial_ms`           | `1,000`                    | Initial delay before retrying.                                                 |
+| `retry_delay_max_ms`               | `10,000`                   | Maximum exponential backoff delay.                                             |
+| `update_instruments_interval_mins` | `60`                       | Background instrument refresh interval.                                        |
+| `book_stale_check_interval_secs`   | `5`                        | Stale book check interval.                                                     |
+| `book_stale_threshold_secs`        | `30`                       | Idle time before a stale book warning.                                         |
+| `book_snapshot_timeout_secs`       | `3`                        | Post‑reconnect snapshot wait.                                                  |
+| `vip_level`                        | `None`                     | Enables higher‑depth books by VIP tier.                                        |
+| `proxy_url`                        | `None`                     | Optional HTTP and WebSocket proxy URL.                                         |
+| `transport_backend`                | `Sockudo`                  | WebSocket transport backend.                                                   |
 
 Set `book_stale_check_interval_secs`, `book_stale_threshold_secs`, or
 `book_snapshot_timeout_secs` to `0` to disable that health monitor. Quiet markets can idle

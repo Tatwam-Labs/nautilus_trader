@@ -15,28 +15,61 @@
 
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::ffi::CStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nautilus_core::{UUID4, consts::NAUTILUS_VERSION_CORE};
-use nautilus_model::identifiers::TraderId;
+use nautilus_model::{
+    identifiers::TraderId,
+    types::fixed::{FIXED_PRECISION, HIGH_PRECISION_MODE, PRECISION_BYTES},
+};
 use sysinfo::System;
 use ustr::Ustr;
 
 use crate::{enums::LogColor, logging::log_info};
 
 const GIT_COMMIT_LEN: usize = 12;
+static MIMALLOC_REGISTERED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(panic = "abort")]
+const PANIC_STRATEGY: &str = "abort";
+#[cfg(panic = "unwind")]
+const PANIC_STRATEGY: &str = "unwind";
 
 const BUILD_VERSIONS: &[(&str, &str)] = &[
     ("git_commit", env!("NAUTILUS_BUILD_GIT_COMMIT")),
     ("rustc", env!("NAUTILUS_BUILD_RUSTC_VERSION")),
     ("target", env!("NAUTILUS_BUILD_TARGET")),
     ("profile", env!("NAUTILUS_BUILD_PROFILE")),
+    ("panic", PANIC_STRATEGY),
     ("cargo_lock", env!("NAUTILUS_BUILD_CARGO_LOCK_CRC32")),
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     ("libc_crate", env!("NAUTILUS_BUILD_LIBC_VERSION")),
     ("rust_decimal", env!("NAUTILUS_BUILD_RUST_DECIMAL_VERSION")),
-    #[cfg(feature = "python")]
-    ("pyo3", env!("NAUTILUS_BUILD_PYO3_VERSION")),
 ];
+
+#[cfg(feature = "live")]
+const LIVE_VERSIONS: &[(&str, &str)] = &[
+    ("rustls", env!("NAUTILUS_BUILD_RUSTLS_VERSION")),
+    ("aws_lc_rs", env!("NAUTILUS_BUILD_AWS_LC_RS_VERSION")),
+    ("tokio", env!("NAUTILUS_BUILD_TOKIO_VERSION")),
+];
+
+#[cfg(feature = "python")]
+const PYTHON_VERSIONS: &[(&str, &str)] = &[
+    ("pyo3", env!("NAUTILUS_BUILD_PYO3_VERSION")),
+    (
+        "pyo3_async_runtimes",
+        env!("NAUTILUS_BUILD_PYO3_ASYNC_RUNTIMES_VERSION"),
+    ),
+];
+
+/// Records that the final artifact uses mimalloc as its Rust global allocator.
+///
+/// This only affects version header metadata. The final artifact must declare mimalloc as its
+/// global allocator before calling this function.
+pub fn register_allocator_mimalloc() {
+    MIMALLOC_REGISTERED.store(true, Ordering::Release);
+}
 
 #[rustfmt::skip]
 pub fn log_header(trader_id: TraderId, machine_id: &str, instance_id: UUID4, component: Ustr) {
@@ -111,8 +144,7 @@ pub fn log_header(trader_id: TraderId, machine_id: &str, instance_id: UUID4, com
 fn log_rust_versioning(c: Ustr) {
     header_line(c, &format!("nautilus_trader: {NAUTILUS_VERSION_CORE}"));
     log_build_versioning(c);
-    #[cfg(feature = "live")]
-    log_tokio_versioning(c);
+    log_optional_versioning(c);
 }
 
 #[cfg(feature = "python")]
@@ -123,6 +155,7 @@ fn log_python_versioning(c: Ustr) {
     header_line(c, &format!("nautilus_core: {NAUTILUS_VERSION_CORE}"));
     header_line(c, &format!("python: {}", python_version()));
     log_build_versioning(c);
+    log_optional_versioning(c);
 
     // Transitional: these optional-package lines will be removed once v1 support is dropped.
     for package in ["numpy", "pandas", "msgspec", "pyarrow", "pytz", "uvloop"] {
@@ -130,9 +163,6 @@ fn log_python_versioning(c: Ustr) {
             header_line(c, &format!("{package}: {version}"));
         }
     }
-
-    #[cfg(feature = "live")]
-    log_tokio_versioning(c);
 }
 
 #[rustfmt::skip]
@@ -142,12 +172,52 @@ fn log_build_versioning(c: Ustr) {
     }
 }
 
-#[cfg(feature = "live")]
 #[rustfmt::skip]
-fn log_tokio_versioning(c: Ustr) {
-    let version = env!("NAUTILUS_BUILD_TOKIO_VERSION");
-    if !version.is_empty() {
-        header_line(c, &format!("tokio: {version}"));
+fn log_optional_versioning(c: Ustr) {
+    #[cfg(feature = "build-info-event-store")]
+    header_line(c, &format!("event_store: {}", event_store_version()));
+
+    #[cfg(feature = "live")]
+    for (name, version) in live_versions() {
+        header_line(c, &format!("{name}: {version}"));
+    }
+
+    #[cfg(feature = "python")]
+    for (name, version) in python_versions() {
+        header_line(c, &format!("{name}: {version}"));
+    }
+
+    #[cfg(not(any(
+        feature = "live",
+        feature = "python",
+        feature = "build-info-event-store"
+    )))]
+    let _ = c;
+}
+
+#[cfg(feature = "live")]
+fn live_versions() -> impl Iterator<Item = (&'static str, &'static str)> {
+    LIVE_VERSIONS
+        .iter()
+        .copied()
+        .filter(|(_, version)| !version.is_empty())
+}
+
+#[cfg(feature = "python")]
+fn python_versions() -> impl Iterator<Item = (&'static str, &'static str)> {
+    PYTHON_VERSIONS
+        .iter()
+        .copied()
+        .filter(|(_, version)| !version.is_empty())
+}
+
+#[cfg(feature = "build-info-event-store")]
+fn event_store_version() -> String {
+    let version = env!("NAUTILUS_BUILD_REDB_VERSION");
+    if version.is_empty() {
+        "redb".to_string()
+    } else {
+        format!("redb {version}")
     }
 }
 
@@ -158,20 +228,59 @@ fn build_versions() -> Vec<(&'static str, String)> {
         .map(|(name, version)| (*name, display_version(name, version)))
         .collect::<Vec<_>>();
 
+    let mut versions = versions;
+
+    let precision_index = versions
+        .iter()
+        .position(|(name, _)| *name == "panic")
+        .map_or(versions.len(), |index| index + 1);
+    versions.insert(precision_index, ("precision", precision_version()));
+
+    let allocator_index = versions
+        .iter()
+        .position(|(name, _)| *name == "precision")
+        .map_or(versions.len(), |index| index + 1);
+    versions.insert(allocator_index, ("allocator", allocator_version()));
+
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    let versions = {
-        let mut versions = versions;
+    {
         if let Some(version) = libc_runtime_version() {
             let index = versions
                 .iter()
-                .position(|(name, _)| *name == "libc_crate")
-                .map_or(versions.len(), |index| index + 1);
+                .position(|(name, _)| matches!(*name, "cargo_lock" | "libc_crate"))
+                .unwrap_or(versions.len());
             versions.insert(index, ("libc_runtime", version));
         }
-        versions
-    };
+    }
 
     versions
+}
+
+fn precision_version() -> String {
+    let mode = if HIGH_PRECISION_MODE == 1 {
+        "high"
+    } else {
+        "standard"
+    };
+    let bits = PRECISION_BYTES * 8;
+    format!("{mode} ({bits}-bit, {FIXED_PRECISION} dp)")
+}
+
+fn allocator_version() -> String {
+    allocator_version_for(MIMALLOC_REGISTERED.load(Ordering::Acquire))
+}
+
+fn allocator_version_for(mimalloc: bool) -> String {
+    if mimalloc {
+        let version = env!("NAUTILUS_BUILD_MIMALLOC_VERSION");
+        if version.is_empty() {
+            "mimalloc".to_string()
+        } else {
+            format!("mimalloc {version}")
+        }
+    } else {
+        "system".to_string()
+    }
 }
 
 fn display_version(name: &str, version: &str) -> String {
@@ -286,6 +395,86 @@ mod tests {
     }
 
     #[rstest]
+    fn test_build_modes_match_compiled_configuration() {
+        let versions = build_versions();
+        let panic_index = versions
+            .iter()
+            .position(|(name, _)| *name == "panic")
+            .expect("panic version should be present");
+        let precision_index = versions
+            .iter()
+            .position(|(name, _)| *name == "precision")
+            .expect("precision version should be present");
+        let allocator_index = versions
+            .iter()
+            .position(|(name, _)| *name == "allocator")
+            .expect("allocator version should be present");
+
+        assert_eq!(version(&versions, "panic"), Some(PANIC_STRATEGY));
+        assert_eq!(precision_index, panic_index + 1);
+        assert_eq!(allocator_index, precision_index + 1);
+        assert_eq!(
+            version(&versions, "precision"),
+            Some(precision_version().as_str()),
+        );
+        assert_eq!(version(&versions, "allocator"), Some("system"),);
+    }
+
+    #[rstest]
+    fn test_allocator_version_formats() {
+        let mimalloc = env!("NAUTILUS_BUILD_MIMALLOC_VERSION");
+        let expected = if mimalloc.is_empty() {
+            "mimalloc".to_string()
+        } else {
+            format!("mimalloc {mimalloc}")
+        };
+
+        assert_eq!(allocator_version_for(false), "system");
+        assert_eq!(allocator_version_for(true), expected);
+    }
+
+    #[cfg(feature = "live")]
+    #[rstest]
+    fn test_live_versions_match_compiled_metadata() {
+        let versions = live_versions().collect::<Vec<_>>();
+
+        for (_, expected) in LIVE_VERSIONS {
+            assert!(!expected.is_empty());
+        }
+        assert_eq!(versions, LIVE_VERSIONS);
+        assert_eq!(versions.last().map(|(name, _)| *name), Some("tokio"));
+    }
+
+    #[cfg(feature = "python")]
+    #[rstest]
+    fn test_python_versions_follow_tokio() {
+        let live_versions = live_versions().collect::<Vec<_>>();
+        let python_versions = python_versions().collect::<Vec<_>>();
+
+        for (_, expected) in PYTHON_VERSIONS {
+            assert!(!expected.is_empty());
+        }
+        assert_eq!(python_versions, PYTHON_VERSIONS);
+        assert_eq!(live_versions.last().map(|(name, _)| *name), Some("tokio"));
+        assert_eq!(
+            python_versions
+                .iter()
+                .map(|(name, _)| *name)
+                .collect::<Vec<_>>(),
+            ["pyo3", "pyo3_async_runtimes"],
+        );
+    }
+
+    #[cfg(feature = "build-info-event-store")]
+    #[rstest]
+    fn test_event_store_version_matches_compiled_metadata() {
+        let redb = env!("NAUTILUS_BUILD_REDB_VERSION");
+
+        assert!(!redb.is_empty());
+        assert_eq!(event_store_version(), format!("redb {redb}"));
+    }
+
+    #[rstest]
     fn test_cargo_lock_fingerprint_format() {
         const CRC32_HEX_LEN: usize = 8;
 
@@ -319,6 +508,13 @@ mod tests {
     #[rstest]
     fn test_libc_runtime_version_reports_glibc() {
         let version = libc_runtime_version().expect("glibc should report its runtime version");
+        let versions = build_versions();
+        let runtime_index = versions
+            .iter()
+            .position(|(name, _)| *name == "libc_runtime")
+            .expect("libc runtime version should be present");
+        let cargo_lock_index = versions.iter().position(|(name, _)| *name == "cargo_lock");
+        let libc_crate_index = versions.iter().position(|(name, _)| *name == "libc_crate");
 
         assert!(version.starts_with("glibc "));
         assert!(
@@ -326,6 +522,17 @@ mod tests {
                 .bytes()
                 .any(|byte| byte.is_ascii_digit())
         );
+
+        if let Some(cargo_lock_index) = cargo_lock_index {
+            assert_eq!(cargo_lock_index, runtime_index + 1);
+        }
+
+        if let Some(libc_crate_index) = libc_crate_index {
+            assert_eq!(
+                libc_crate_index,
+                cargo_lock_index.unwrap_or(runtime_index) + 1,
+            );
+        }
     }
 
     fn version<'a>(versions: &'a [(&str, String)], name: &str) -> Option<&'a str> {

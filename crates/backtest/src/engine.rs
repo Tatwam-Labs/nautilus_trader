@@ -282,6 +282,7 @@ impl BacktestEngine {
 
         let routing = Some(config.routing);
         let frozen_account = Some(config.frozen_account);
+        let use_message_queue = config.use_message_queue;
 
         let exchange =
             SimulatedExchange::new(config, self.kernel.cache.clone(), self.kernel.clock.clone())?;
@@ -298,6 +299,12 @@ impl BacktestEngine {
             routing,
             frozen_account,
         );
+
+        if !use_message_queue {
+            exchange
+                .borrow_mut()
+                .set_event_handler(exec_client.order_event_handler());
+        }
 
         exchange
             .borrow_mut()
@@ -845,7 +852,6 @@ impl BacktestEngine {
             let d = self.data_iterator.next_item().unwrap();
 
             if ts_init > self.last_ns {
-                self.last_ns = ts_init;
                 self.advance_time_impl(ts_init, &clocks)?;
             }
 
@@ -1463,6 +1469,7 @@ impl BacktestEngine {
         if let Some(ts_event) = shutdown_at {
             self.last_ns = ts_event;
         } else {
+            self.last_ns = ts_now;
             Self::set_all_clocks_time(clocks, ts_now);
             logging_clock_set_static_time(ts_now.as_u64());
         }
@@ -1480,6 +1487,8 @@ impl BacktestEngine {
             self.accumulator.clear();
             return Ok(());
         }
+
+        let last_ns = self.last_ns;
 
         for clock in clocks {
             Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
@@ -1506,6 +1515,10 @@ impl BacktestEngine {
             for clock in clocks {
                 Self::advance_clock_on_accumulator(&mut self.accumulator, clock, ts_now, false);
             }
+        }
+
+        if !self.kernel.is_shutdown_requested() {
+            self.last_ns = last_ns;
         }
 
         Ok(())
@@ -1548,6 +1561,7 @@ impl BacktestEngine {
         ts_event: UnixNanos,
         advance_to: UnixNanos,
     ) {
+        self.last_ns = ts_event;
         while self.accumulator.peek_next_time() == Some(ts_event) {
             let handler = self
                 .accumulator
@@ -2141,13 +2155,15 @@ fn log_portfolio_performance(analyzer: &PortfolioAnalyzer) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use indexmap::IndexMap;
     use nautilus_common::{
         actor::DataActor,
         enums::Environment,
         messages::{
             data::{DataCommand, UnsubscribeCommand},
-            execution::{SubmitOrder, TradingCommand},
+            execution::{ModifyOrder, SubmitOrder, TradingCommand},
         },
         msgbus::{
             self, MessagingSwitchboard, TypedHandler,
@@ -2161,11 +2177,12 @@ mod tests {
             AccountType, BookType, MarketStatus, MarketStatusAction, OmsType, OrderSide,
             OrderStatus, OrderType, TriggerType,
         },
-        identifiers::{AccountId, ActorId, ClientId, PositionId, StrategyId, Venue},
+        events::OrderEventAny,
+        identifiers::{AccountId, ActorId, ClientId, ClientOrderId, PositionId, StrategyId, Venue},
         instruments::{
             CryptoPerpetual, Instrument, InstrumentAny, stubs::crypto_perpetual_ethusdt,
         },
-        orders::{Order, OrderAny, OrderTestBuilder},
+        orders::{Order, OrderAny, OrderTestBuilder, stubs::TestOrderEventStubs},
         types::{Money, Price, Quantity},
     };
     use nautilus_system::{KernelEventStore, RegisteredComponents};
@@ -2261,6 +2278,296 @@ mod tests {
             .unwrap();
         engine.add_venue(venue_config).unwrap();
         engine
+    }
+
+    fn create_immediate_engine(instrument: &CryptoPerpetual) -> BacktestEngine {
+        let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
+        let venue_config = SimulatedVenueConfig::builder()
+            .venue(instrument.id().venue)
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L1_MBP)
+            .starting_balances(vec![Money::from("1_000_000 USDT")])
+            .use_message_queue(false)
+            .build()
+            .unwrap();
+        engine.add_venue(venue_config).unwrap();
+        engine
+            .add_instrument(&InstrumentAny::CryptoPerpetual(instrument.clone()))
+            .unwrap();
+        engine
+            .venues
+            .get(&instrument.id().venue)
+            .unwrap()
+            .borrow_mut()
+            .initialize_account();
+        engine
+    }
+
+    fn send_execution_command(command: TradingCommand) {
+        msgbus::send_trading_command(MessagingSwitchboard::exec_engine_execute(), command);
+    }
+
+    #[rstest]
+    fn test_immediate_submit_defers_order_events(crypto_perpetual_ethusdt: CryptoPerpetual) {
+        let engine = create_immediate_engine(&crypto_perpetual_ethusdt);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .instrument_id(crypto_perpetual_ethusdt.id)
+            .client_order_id(ClientOrderId::from("O-IMMEDIATE-SUBMIT"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00"))
+            .build();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), false)
+            .unwrap();
+
+        send_execution_command(TradingCommand::SubmitOrder(SubmitOrder::new(
+            order.trader_id(),
+            Some(ClientId::from("BINANCE")),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.init_event().clone(),
+            order.exec_algorithm_id(),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        )));
+
+        {
+            let cache = engine.kernel.cache.borrow();
+            let cached_order = cache.order(&order.client_order_id()).unwrap();
+            assert_eq!(cached_order.status(), OrderStatus::Initialized);
+            assert_eq!(cached_order.event_count(), 1);
+        }
+
+        engine.drain_command_queues();
+
+        let cache = engine.kernel.cache.borrow();
+        let cached_order = cache.order(&order.client_order_id()).unwrap();
+        let events = cached_order.events();
+        assert!(matches!(events[1], OrderEventAny::Submitted(_)));
+        assert!(matches!(events[2], OrderEventAny::Accepted(_)));
+    }
+
+    #[rstest]
+    fn test_immediate_modify_submitted_order_defers_updated_event(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let engine = create_immediate_engine(&crypto_perpetual_ethusdt);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .instrument_id(crypto_perpetual_ethusdt.id)
+            .client_order_id(ClientOrderId::from("O-IMMEDIATE-MODIFY"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00"))
+            .build();
+        let account_id = AccountId::from("BINANCE-001");
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), false)
+            .unwrap();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .update_order(&TestOrderEventStubs::submitted(&order, account_id))
+            .unwrap();
+
+        send_execution_command(TradingCommand::ModifyOrder(ModifyOrder::new(
+            order.trader_id(),
+            Some(ClientId::from("BINANCE")),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            None,
+            Some(Quantity::from("2.000")),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::from(1),
+            None,
+            None,
+        )));
+
+        {
+            let cache = engine.kernel.cache.borrow();
+            let cached_order = cache.order(&order.client_order_id()).unwrap();
+            assert_eq!(cached_order.quantity(), Quantity::from("1.000"));
+            assert!(matches!(
+                cached_order.events().last(),
+                Some(OrderEventAny::Submitted(_))
+            ));
+        }
+
+        engine.drain_command_queues();
+
+        let cache = engine.kernel.cache.borrow();
+        let order = cache.order(&order.client_order_id()).unwrap();
+        assert_eq!(order.quantity(), Quantity::from("2.000"));
+        assert!(matches!(
+            order.events().last(),
+            Some(OrderEventAny::Updated(_))
+        ));
+    }
+
+    #[rstest]
+    fn test_immediate_market_data_dispatches_fill_synchronously(
+        crypto_perpetual_ethusdt: CryptoPerpetual,
+    ) {
+        let engine = create_immediate_engine(&crypto_perpetual_ethusdt);
+        let order = OrderTestBuilder::new(OrderType::Limit)
+            .trader_id(engine.trader_id())
+            .instrument_id(crypto_perpetual_ethusdt.id)
+            .client_order_id(ClientOrderId::from("O-IMMEDIATE-QUOTE-FILL"))
+            .side(OrderSide::Buy)
+            .quantity(Quantity::from("1.000"))
+            .price(Price::from("1000.00"))
+            .build();
+        engine
+            .kernel
+            .cache
+            .borrow_mut()
+            .add_order(order.clone(), None, Some(ClientId::from("BINANCE")), false)
+            .unwrap();
+
+        send_execution_command(TradingCommand::SubmitOrder(SubmitOrder::new(
+            order.trader_id(),
+            Some(ClientId::from("BINANCE")),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            order.init_event().clone(),
+            order.exec_algorithm_id(),
+            None,
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+        )));
+        engine.drain_command_queues();
+
+        let quote = QuoteTick::new(
+            order.instrument_id(),
+            Price::from("999.00"),
+            Price::from("1000.00"),
+            Quantity::from("1.000"),
+            Quantity::from("1.000"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        );
+        msgbus::send_quote(
+            format!(
+                "SimulatedExchange.process_new_quote.{}",
+                order.instrument_id().venue
+            )
+            .into(),
+            &quote,
+        );
+
+        let cache = engine.kernel.cache.borrow();
+        let cached_order = cache.order(&order.client_order_id()).unwrap();
+        assert_eq!(cached_order.status(), OrderStatus::Filled);
+        assert!(matches!(
+            cached_order.events().last(),
+            Some(OrderEventAny::Filled(_))
+        ));
+    }
+
+    #[rstest]
+    fn test_timer_handler_sets_last_ns_to_fire_time() {
+        let mut engine = create_engine();
+        engine.last_ns = UnixNanos::from(30);
+        let fired = Rc::new(Cell::new(false));
+        let fired_clone = Rc::clone(&fired);
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+            fired_clone.set(true);
+        }));
+        engine
+            .kernel
+            .clock
+            .borrow_mut()
+            .set_timer_ns(
+                "ROLL",
+                1,
+                Some(UnixNanos::from(20)),
+                None,
+                Some(callback),
+                Some(true),
+                Some(true),
+            )
+            .unwrap();
+        let clocks = engine.collect_all_clocks();
+
+        for clock in &clocks {
+            BacktestEngine::advance_clock_on_accumulator(
+                &mut engine.accumulator,
+                clock,
+                UnixNanos::from(30),
+                false,
+            );
+        }
+        engine.run_timer_handlers_at(&clocks, UnixNanos::from(20), UnixNanos::from(30));
+
+        assert!(fired.get());
+        assert_eq!(engine.last_ns, UnixNanos::from(20));
+    }
+
+    #[rstest]
+    #[case::complete(false, 25)]
+    #[case::shutdown(true, 20)]
+    fn test_flush_accumulator_events_sets_last_ns_for_completion(
+        #[case] shutdown: bool,
+        #[case] expected_last_ns: u64,
+    ) {
+        let mut engine = create_engine();
+        let last_ns = UnixNanos::from(25);
+        let ts_now = UnixNanos::from(30);
+        engine.last_ns = last_ns;
+        let clocks = engine.collect_all_clocks();
+        BacktestEngine::set_all_clocks_time(&clocks, last_ns);
+        let fired = Rc::new(Cell::new(false));
+        let fired_clone = Rc::clone(&fired);
+        let observed_ns = Rc::new(Cell::new(UnixNanos::default()));
+        let observed_ns_clone = Rc::clone(&observed_ns);
+        let clock = Rc::clone(&engine.kernel.clock);
+        let shutdown_requested = engine.kernel.shutdown_flag();
+        let callback = TimeEventCallback::RustLocal(Rc::new(move |_| {
+            fired_clone.set(true);
+            observed_ns_clone.set(clock.borrow().timestamp_ns());
+            shutdown_requested.set(shutdown);
+        }));
+        engine
+            .kernel
+            .clock
+            .borrow_mut()
+            .set_timer_ns(
+                "ROLL",
+                100,
+                Some(UnixNanos::from(20)),
+                None,
+                Some(callback),
+                Some(true),
+                Some(true),
+            )
+            .unwrap();
+
+        engine.flush_accumulator_events(&clocks, ts_now).unwrap();
+
+        assert!(fired.get());
+        assert_eq!(observed_ns.get(), UnixNanos::from(20));
+        assert_eq!(engine.kernel.is_shutdown_requested(), shutdown);
+        assert_eq!(engine.last_ns, UnixNanos::from(expected_last_ns));
     }
 
     #[rstest]

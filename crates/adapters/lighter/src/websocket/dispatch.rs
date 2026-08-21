@@ -81,10 +81,6 @@ pub(crate) const ORDER_EXPIRY_IOC: i64 = 0;
 /// Defensive cap for authenticated reconciliation pagination.
 pub(crate) const MAX_RECONCILIATION_PAGES: usize = 1_000;
 
-/// Largest ten-digit Unix timestamp. Lighter REST orders currently use seconds,
-/// while account WebSocket orders use milliseconds.
-const UNIX_TIMESTAMP_SECONDS_MAX: i64 = 9_999_999_999;
-
 /// Order identity context captured at submit time.
 ///
 /// Used by the consumption loop to construct typed `OrderEventAny` variants
@@ -560,6 +556,9 @@ pub(crate) struct WsDispatchState {
     /// (Lighter has no REST equivalent). `Mutex` not `DashMap` so a reader
     /// never lands between `replace_positions`' clear and repopulate.
     pub(crate) last_positions: Arc<Mutex<AHashMap<InstrumentId, PositionStatusReport>>>,
+    /// Markets omitted from the latest position snapshot because their rows could not be mapped or
+    /// parsed. `None` means no snapshot has completed for the current connection epoch.
+    position_snapshot_skipped: Arc<Mutex<Option<AHashSet<i16>>>>,
     /// Identity context for orders this client submitted. Keyed on the
     /// originating [`ClientOrderId`]; populated by the execution client at
     /// submit time, consumed by the consumption loop to decide whether an
@@ -803,6 +802,7 @@ impl WsDispatchState {
             last_account_state: Arc::new(Mutex::new(None)),
             active_markets: Arc::new(DashSet::new()),
             last_positions: Arc::new(Mutex::new(AHashMap::new())),
+            position_snapshot_skipped: Arc::new(Mutex::new(None)),
             order_identities: Arc::new(DashMap::new()),
             create_registry: Arc::new(Mutex::new(())),
             seen_trade_ids: Arc::new(TradeDedupCache::new(REPLAY_CACHE_CAPACITY)),
@@ -1549,6 +1549,24 @@ impl WsDispatchState {
     /// replaces the cache.
     pub(crate) fn clear_position_cache(&self) {
         self.last_positions.lock().expect(MUTEX_POISONED).clear();
+        self.invalidate_position_snapshot();
+    }
+
+    pub(crate) fn invalidate_position_snapshot(&self) {
+        *self.position_snapshot_skipped.lock().expect(MUTEX_POISONED) = None;
+    }
+
+    pub(crate) fn record_position_snapshot(&self, skipped_market_ids: &[i16]) {
+        *self.position_snapshot_skipped.lock().expect(MUTEX_POISONED) =
+            Some(skipped_market_ids.iter().copied().collect());
+    }
+
+    pub(crate) fn position_snapshot_covers(&self, market_id: i16) -> bool {
+        self.position_snapshot_skipped
+            .lock()
+            .expect(MUTEX_POISONED)
+            .as_ref()
+            .is_some_and(|skipped| !skipped.contains(&market_id))
     }
 
     /// Replace the cache from a complete `account_all_positions` snapshot
@@ -1671,9 +1689,9 @@ pub(crate) fn cache_instruments_for_reports(instruments: &[InstrumentAny]) {
 }
 
 /// Convert a Lighter HTTP `LighterOrder` into a Nautilus
-/// [`OrderStatusReport`], normalizing the REST timestamps before reusing the
-/// WS-side parser once the instrument has been resolved out of the
-/// process-global cache.
+/// [`OrderStatusReport`], reusing the WS-side parser once the instrument has
+/// been resolved out of the process-global cache. Order timestamps are
+/// normalized inside the parser for either seconds or milliseconds input.
 ///
 /// Translates the venue's numeric `client_order_index` echo back to the
 /// originating Nautilus [`ClientOrderId`] when available, so HTTP-driven
@@ -1693,9 +1711,7 @@ pub(crate) fn parse_http_order_to_report(
         }
     };
 
-    let order = normalize_http_order_timestamps(order);
-
-    match parse_ws_order_status_report(&order, &instrument, account_id, ts_init) {
+    match parse_ws_order_status_report(order, &instrument, account_id, ts_init) {
         Ok(report) => Some(report),
         Err(e) => {
             log::warn!(
@@ -1705,20 +1721,6 @@ pub(crate) fn parse_http_order_to_report(
             None
         }
     }
-}
-
-fn normalize_http_order_timestamps(order: &LighterOrder) -> LighterOrder {
-    let mut order = order.clone();
-    for timestamp in [
-        &mut order.timestamp,
-        &mut order.created_at,
-        &mut order.updated_at,
-    ] {
-        if *timestamp > 0 && *timestamp <= UNIX_TIMESTAMP_SECONDS_MAX {
-            *timestamp *= 1_000;
-        }
-    }
-    order
 }
 
 /// Look up an acknowledged create by its exact client index and submission nonce.
@@ -3895,6 +3897,25 @@ mod tests {
         state.clear_position_cache();
 
         assert!(state.snapshot_positions(None).is_empty());
+        assert!(!state.position_snapshot_covers(0));
+    }
+
+    #[rstest]
+    fn position_snapshot_coverage_requires_current_complete_market_row() {
+        let state = WsDispatchState::new();
+
+        assert!(!state.position_snapshot_covers(0));
+
+        state.record_position_snapshot(&[]);
+        assert!(state.position_snapshot_covers(0));
+
+        state.record_position_snapshot(&[0]);
+        assert!(!state.position_snapshot_covers(0));
+        assert!(state.position_snapshot_covers(1));
+
+        state.invalidate_position_snapshot();
+        assert!(!state.position_snapshot_covers(0));
+        assert!(!state.position_snapshot_covers(1));
     }
 
     #[rstest]

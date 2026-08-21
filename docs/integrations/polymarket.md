@@ -144,6 +144,10 @@ The command grants maximum pUSD and CTF approvals to the CTF Exchange, Neg Risk 
 `POLYGON_RPC_URL` to use another Polygon RPC endpoint. Run it again if Polymarket changes the
 required contracts.
 
+The command grants approvals only; it does not revoke approvals for contracts that are no longer
+targets. Treat revocation as a separate on‑chain operation and confirm that no remaining redemption
+or settlement flow depends on the legacy approval before submitting it.
+
 ### Setting smart-wallet allowances
 
 Do not run the EOA command for a proxy, Safe, or Deposit Wallet funder. It signs transactions from
@@ -154,11 +158,23 @@ to submit the approvals from the account wallet. Deposit Wallet approvals use an
 batch authorized by the signer and submitted through the Relayer. Safe and Proxy Wallet approvals
 need their wallet‑specific SDK payloads.
 
+### Refreshing and verifying allowances
+
 After the approval transaction confirms, refresh the CLOB cache. Rust callers can use
 `PolymarketClobHttpClient::update_balance_allowance` with `AssetType::Collateral` for pUSD. Use
 `AssetType::Conditional` with a conditional token ID for a conditional‑token allowance. Both forms
 also need the account's signature type. The authenticated request maps to
 `GET /balance-allowance/update`. Use `SignatureType::Poly1271` for a Deposit Wallet.
+
+The balance‑allowance endpoint has two decoding paths:
+
+| Path                                              | Used for                                             | Allowance handling                                                                                                                                                             | Meaning of success                                                                 |
+| ------------------------------------------------- | ---------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| `PolymarketClobHttpClient::get_balance_allowance` | Reading spender allowance evidence.                  | Requires the plural `allowances` map; rejects a missing map, a non‑null legacy singular value, malformed or non‑canonical keys, and semantic duplicates such as case variants. | Balance plus an unambiguous map; required targets and amounts still need checking. |
+| Internal balance‑only projection                  | Account state refresh and market‑buy fee adjustment. | Ignores allowance fields; its return type cannot expose or grant approval authority.                                                                                           | Balance only; required CLOB spender approvals remain unproven.                     |
+
+Use the strict path whenever a decision depends on allowance evidence so ambiguous wire data cannot
+become approval authority.
 
 ## API keys
 
@@ -183,7 +199,7 @@ public data client does not require these credentials.
 
 When setting up NautilusTrader to work with Polymarket, it's crucial to properly configure the necessary parameters, particularly the private key.
 
-**Key parameters**:
+**Parameters**:
 
 - `private_key`: The private key for your wallet used to sign orders. The interpretation depends on your `signature_type` configuration. If not explicitly provided in the configuration, it will automatically source the `POLYMARKET_PK` environment variable.
 - `funder`: The **pUSD** funding wallet address used for funding trades. If not provided,
@@ -382,8 +398,9 @@ compatibility and keeps the REST check.
 
 A `delayed` response:
 
-- Registers the venue order identity and fill tracking immediately. Later order queries, WebSocket
-  events, and reconciliation reports can then resolve the local `ClientOrderId`.
+- Registers the venue order identity and fill tracking immediately and retains them independently of
+  bounded replay caches. Later order queries, WebSocket events, and reconciliation reports can then
+  resolve the local `ClientOrderId`.
 - Leaves the order `Submitted` until a fill, order update, or REST result proves acceptance.
 - Emits `OrderAccepted` before any fill, cancellation, expiry, or filled status that proves
   acceptance.
@@ -403,6 +420,8 @@ Ambiguous failures include:
 - Response serialization or decoding failures.
 - Local I/O failures.
 - Server‑side failures.
+- HTTP 425 responses.
+- HTTP 429 responses that lack CLOB signer‑limiter headers.
 
 | Outcome                                                                                       | Nautilus result             | Reason                                    |
 | --------------------------------------------------------------------------------------------- | --------------------------- | ----------------------------------------- |
@@ -414,29 +433,48 @@ Ambiguous failures include:
 | Definitive retry error after an earlier ambiguous attempt                                     | Remains `Submitted`         | The earlier attempt may have succeeded.   |
 | Failure before `POST /order`, such as a failed pUSD balance lookup                            | `OrderDenied`               | The adapter did not submit the order.     |
 
+Local denials format the strategy-facing reason from `OrderDeniedReason`. The leading token is the
+stable code, such as `VALIDATION_FAILED` or `UNSUPPORTED_ORDER_TYPE`.
+
 The proven unfilled `FOK` response skips the REST check. After an ambiguous single‑order attempt, a
 later HTTP error or decoded rejection does not prove that the first attempt failed. An accepted
 response carrying the matching valid order ID confirms the deterministic signed order; a rejection
 does not, even with a matching ID.
 
 Diagnostic errors retain the HTTP status and transport or rate‑limit context. For venue HTTP status,
-rate‑limit, and exchange errors, strategy‑facing rejection events contain only the venue reason;
-other failures use the bounded error description. The adapter reads the first non‑blank string from
+rate‑limit, and exchange errors, strategy‑facing rejection events use the venue reason; other
+failures use the bounded error description. The adapter reads the first non‑blank string from
 `error`, then `errorMsg`, and collapses whitespace and control characters. An empty body becomes
 `empty response body`. A plain‑text or malformed response uses the same bounded fallback. Invalid
 UTF‑8 is decoded lossily before that handling. An HTML response uses its title when available, or its
 visible text otherwise. Reasons are limited to 512 characters, including the literal
 `... [truncated]` truncation marker and its preceding space.
 
+On single and batch submit responses, the exact normalized reason `order_version_mismatch` becomes
+`Polymarket CLOB order version mismatch; adapter supports V2 only`. Other submit response reasons
+remain unchanged after normalization.
+
 The venue reports a post‑only crossing as `invalid post-only order: order crosses book`. Only that
 exact normalized reason sets `OrderRejected.due_post_only=true`; other post‑only errors remain
 ordinary rejections.
 
 Retry‑managed single‑order submit and cancel requests retry HTTP 425, 429, and 5xx responses with the
-configured backoff. Without an earlier ambiguous attempt, retry exhaustion makes a 425 or 429 a
-definitive rejection; a 5xx response remains an unknown submit outcome. HTTP 400, 401, 403, and 404
-responses do not retry. A malformed successful submit response also remains unknown and enters
-reconciliation instead of becoming a terminal rejection.
+configured backoff. After retries are exhausted, submit classification is:
+
+| HTTP status                          | Retried | Submit result       | Notes                                                                                                                                |
+| ------------------------------------ | ------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| 425                                  | Yes     | Remains `Submitted` | Too Early does not prove rejection.                                                                                                  |
+| 429 with CLOB signer‑limiter headers | Yes     | `OrderRejected`     | Requires `Poly-RateLimit-Remaining`, `Poly-RateLimit-Reset`, or `Poly-RateLimit-Tier`. An earlier unknown attempt stays `Submitted`. |
+| 429 without those headers            | Yes     | Remains `Submitted` | Cloudflare or another hop may have seen the request.                                                                                 |
+| 5xx                                  | Yes     | Remains `Submitted` | The command may already have been applied.                                                                                           |
+| 400, 401, 403, 404                   | No      | `OrderRejected`     | Non‑retryable client or API error.                                                                                                   |
+
+A malformed successful submit response also remains unknown and enters reconciliation instead of
+becoming a terminal rejection.
+
+Cancel classification uses the same evidence classes. A non‑retryable client or API error after the
+cancel is sent, or a local failure that proves the cancel was never transmitted, emits
+`OrderCancelRejected`. HTTP 425, headerless 429, and 5xx leave the cancel in flight.
 
 #### Unknown-outcome reconciliation
 
@@ -607,7 +645,19 @@ symmetrically toward the extremes, and apply only to taker fills.
 Every order signed by the adapter carries the hard‑coded Nautilus builder code. Its builder fee
 rate is fixed at zero and is not configurable.
 
+### Fill commission handling
+
 `FillReport.commission` is denominated in pUSD and rounds the platform fee to five decimal places.
+If the exact result cannot be represented as `Money`, the adapter returns an error instead of using
+zero or a generic commission. See the
+[commission failure contract](../developer_guide/adapters.md#commission-failure-handling).
+
+A commission construction error fails a direct fill report request, terminal trade‑history recovery,
+or complete mass status. Startup returns a mass‑status error without applying that client's reports.
+When an active order report cannot enrich matched quantity from confirmed fills, the adapter logs
+the error and caps matched quantity to local and previously tracked evidence so reconciliation
+defers the unsupported residual. The adapter does not drop a failed fill while returning an order or
+position report that could recreate its quantity without the Polymarket commission.
 
 :::note
 For the latest public schedule, see Polymarket's
@@ -616,18 +666,41 @@ For the latest public schedule, see Polymarket's
 
 ### Backtest fee model
 
-Use `ProbabilityPriceFeeModel` for the current exponent `1` schedule. It reads maker and taker rates
-from the binary option instrument and applies the same probability‑price curve:
+Use `PolymarketFeeModel` for backtests that include taker fees and maker rebates. The model reads
+`rate`, `rebateRate`, `exponent`, and `takerOnly` from each binary option instrument's
+`fee_schedule`. It requires a maker or taker liquidity side, a fill price in `[0, 1]`, and a
+taker‑only schedule with exponent `1`. Unsupported instruments and invalid inputs return an error;
+an instrument without a fee schedule produces zero commission.
 
-```python
-from nautilus_trader.execution import ProbabilityPriceFeeModel
+```rust tab="Rust"
+use nautilus_execution::models::fee::FeeModelHandle;
+use nautilus_polymarket::models::PolymarketFeeModel;
 
-fee_model = ProbabilityPriceFeeModel()
+let fee_model = FeeModelHandle::new(PolymarketFeeModel);
 ```
 
-Pass this object to `BacktestVenueConfig.fee_model`. It does not support other fee exponents or
-future maker‑rebate distributions, so state those assumptions explicitly in the backtest
-configuration.
+```python tab="Python"
+from nautilus_trader.adapters.polymarket import PolymarketFeeModel
+
+fee_model = PolymarketFeeModel()
+```
+
+Pass the Rust handle through
+`nautilus_backtest::config::SimulatedVenueConfig::builder().fee_model(...)`. In Python, pass the model
+to `BacktestEngine.add_venue` as `fee_model`. `BacktestVenueConfig.fee_model` accepts built‑in fee
+models only.
+
+:::note
+For maker fills, `fee_equivalent` is the platform fee formula above using the schedule's taker
+`rate`. The model credits `fee_equivalent * rebateRate` as negative commission. This approximates
+Polymarket's daily pool allocation because a backtest does not know the total fee equivalent from
+other makers in that market.
+
+Live maker fills have zero commission; Polymarket pays the actual pUSD rebate separately each day.
+The model does not represent that payment as a separate event, and it does not model competition
+between makers, daily aggregation, or the minimum payout threshold. See Polymarket's
+[Maker Rebates Program](https://docs.polymarket.com/programs/maker-rebates) for the venue formula.
+:::
 
 ## Reconciliation
 
@@ -648,11 +721,18 @@ states do not.
 
 Mass-status reconciliation pairs each order report with its venue fill reports. It applies the
 real fills first to preserve trade IDs and commissions, then infers only any residual quantity
-needed to reach the venue-reported status. REST order reports cap matched quantity to the greater
-of locally applied fills and authenticated `CONFIRMED` trade history, so pending settlement cannot
-create an inferred fill. Runtime order checks fetch confirmed trade history when the venue reports
-more matched quantity than the local order and WebSocket fill tracker contain. Unpaired fill reports
-retain the normal fill-only path.
+needed to reach the venue-reported status. When mass status declares no lookback, REST order
+reports cap matched quantity to the greater of locally applied fills and authenticated
+`CONFIRMED` trade history, so pending settlement cannot create an inferred fill. A bounded mass
+status keeps the venue open‑order `size_matched` so a live partial fill outside the lookback
+window is not understated. Runtime order checks fetch confirmed trade history when the venue
+reports more matched quantity than the local order and WebSocket fill tracker contain. Unpaired
+fill reports retain the normal fill-only path.
+
+A commission construction error fails the complete REST report request. Startup returns the error
+without applying a mass status; periodic and targeted reconciliation defer the affected work. The
+adapter does not drop the failed fill because an order or position report could then recreate its
+quantity without the Polymarket commission.
 
 ### Single-order recovery from trades
 
@@ -965,6 +1045,11 @@ history.
 
 ### Execution
 
+Before starting its WebSocket or initializing account state, the execution client queries
+unauthenticated `GET /version`. Startup continues only when the venue reports numeric version `2`.
+Any other version stops startup with an unsupported‑version error; a missing, malformed, or errored
+response stops startup with a version‑query failure.
+
 The execution adapter keeps a `user` channel connection for order and trade events and manages market
 subscriptions as needed for instruments seen during trading.
 
@@ -978,6 +1063,13 @@ Matched WebSocket fills and their corrections are restored from cached order his
 deduplicated across reconnects. If a trade arrives before its instrument is available, the adapter
 leaves it out of the dedup state. A redelivered event or later REST reconciliation can apply it after
 instrument loading completes.
+
+The adapter also constructs every owned fill report for a trade before emitting any of them or
+recording the trade as processed. If commission construction fails, it emits no fill for that trade
+and leaves its deduplication, confirmation, and terminal state unchanged. A duplicate or reconnect
+replay can retry the trade, while scheduled REST reconciliation remains the authoritative recovery
+path.
+
 For a fully matched order, terminal quantity normalization waits for every trade ID in the order's
 `associate_trades` list to confirm before lowering the order quantity to its actual fills. If a
 confirmed trade is recovered through REST after a WebSocket gap, reconciliation applies the same
@@ -1043,8 +1135,8 @@ token cost, tier, remaining balance, and reset time.
 
 A `429 Too Many Requests` response with `Retry-After` blocks the applicable bucket for at least that
 delay before retry. Without `Retry-After`, the retry manager uses its configured exponential
-backoff. A standalone 429 is a definitive venue rejection. Transport failures, timeouts, and any
-submit with an earlier ambiguous attempt remain ambiguous outcomes.
+backoff. Submit classification of 425 and 429 is in
+[Definitive and ambiguous outcomes](#definitive-and-ambiguous-outcomes).
 
 ### Selected IP-based REST limits
 
@@ -1136,7 +1228,7 @@ Class/struct: `PolymarketDataClientConfig`.
 | `resolve_poll_enabled`                 | `true`     | Poll expired watched conditions for resolution.                                           |
 | `resolve_poll_interval_secs`           | `30`       | Resolution polling interval.                                                              |
 | `resolve_poll_grace_secs`              | `10`       | Delay after expiry before polling begins.                                                 |
-| `resolve_poll_max_wait_secs`           | `1800`     | Pause automatic polling after this wait.                                                  |
+| `resolve_poll_max_wait_secs`           | `1,800`    | Pause automatic polling after this wait.                                                  |
 | `transport_backend`                    | `Sockudo`  | WebSocket transport implementation.                                                       |
 
 ### Execution client options
@@ -1155,10 +1247,11 @@ Class/struct: `PolymarketExecClientConfig`.
 | `proxy_url`                                         | `None`                | HTTP or HTTPS proxy for every execution transport.                                                                    |
 | `http_timeout_secs`                                 | `60`                  | HTTP timeout in seconds.                                                                                              |
 | `max_retries`                                       | `3`                   | Retries for single‑order submit/cancel requests and for each batch‑cancel chunk.                                      |
-| `retry_delay_initial_ms`                            | `1000`                | Initial retry delay.                                                                                                  |
-| `retry_delay_max_ms`                                | `10000`               | Maximum retry delay.                                                                                                  |
+| `retry_delay_initial_ms`                            | `1,000`               | Initial retry delay.                                                                                                  |
+| `retry_delay_max_ms`                                | `10,000`              | Maximum retry delay.                                                                                                  |
 | `heartbeat_enabled`                                 | `false`               | Send an authenticated order‑safety heartbeat immediately after execution readiness and every five seconds thereafter. |
 | `transport_backend`                                 | `Sockudo`             | WebSocket transport implementation.                                                                                   |
+| `instrument_config`                                 | `None`                | Same `PolymarketInstrumentProviderConfig` as the data client. Unmapped records use its `load_ids`.                    |
 
 :::warning
 Enabling `heartbeat_enabled` starts Polymarket's order‑safety heartbeat contract for the configured
@@ -1200,7 +1293,15 @@ signing address.
 
 ### Instrument provider options
 
-Pass `PolymarketInstrumentProviderConfig` as `instrument_config` on the data client config.
+Pass the same `PolymarketInstrumentProviderConfig` as `instrument_config` on the data client
+config and the execution client config.
+
+`load_ids` is the only reconciliation scope. When that set is non‑empty, unmapped records
+outside it are expected absences. When `load_ids` is unset or empty, every unmapped open
+order and position is in scope and fails the report request. `event_slugs`, `market_slugs`,
+`series_ids`, `filters`, and `event_slug_builder` discover instruments; they do not classify
+unmapped records. A node that scopes discovery with those fields and still wants scoped
+reconciliation must also set `load_ids`.
 
 | Option               | Default | Description                                             |
 | -------------------- | ------- | ------------------------------------------------------- |

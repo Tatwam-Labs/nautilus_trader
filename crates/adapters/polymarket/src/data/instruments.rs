@@ -23,6 +23,7 @@ use nautilus_model::{
     identifiers::InstrumentId,
     instruments::{Instrument, InstrumentAny},
 };
+use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use super::{PolymarketDataClient, runtime::is_instrument_expired};
@@ -44,11 +45,7 @@ pub(crate) struct TokenMeta {
     pub(crate) neg_risk: Option<bool>,
 }
 
-// Inserts `instrument` into the live instrument cache and updates the
-// `token_meta` routing index in one step. Every path that populates the live
-// cache must go through here so WS messages can always resolve token_id back
-// to an InstrumentId.
-pub(crate) fn cache_instrument(
+pub(super) fn cache_instrument_unchecked(
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
     instrument: &InstrumentAny,
@@ -59,6 +56,71 @@ pub(crate) fn cache_instrument(
         TokenMeta::from_instrument(instrument),
     );
     instruments.insert(instrument_id, instrument.clone());
+}
+
+// Applies one instrument to live cache, routing, and publication state while
+// terminal closure is excluded by the shared condition boundary.
+pub(crate) fn apply_live_instrument(
+    closed_condition_ids: &Arc<std::sync::Mutex<AHashSet<String>>>,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
+    instrument: &InstrumentAny,
+    apply: impl FnOnce(&InstrumentAny),
+) -> bool {
+    // Guard scopes the check and cache write; holding it across `apply` would span dispatch
+    {
+        let terminal_conditions = closed_condition_ids
+            .lock()
+            .expect("closed_condition_ids mutex poisoned");
+        let is_terminal = extract_condition_id(&instrument.id())
+            .is_ok_and(|condition_id| terminal_conditions.contains(&condition_id));
+
+        if is_terminal {
+            return false;
+        }
+
+        cache_instrument_unchecked(instruments, token_meta, instrument);
+    }
+
+    apply(instrument);
+    true
+}
+
+pub(super) fn publish_cached_condition_closed(
+    condition_id: &str,
+    instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
+    data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
+) -> usize {
+    let mut updated = Vec::new();
+
+    instruments.rcu(|map| {
+        updated.clear();
+
+        for (instrument_id, instrument) in map.iter_mut() {
+            if !extract_condition_id(instrument_id).is_ok_and(|candidate| candidate == condition_id)
+            {
+                continue;
+            }
+
+            if let InstrumentAny::BinaryOption(binary) = instrument
+                && binary_market_closed(binary) != Some(true)
+            {
+                set_market_closed(binary, true);
+                updated.push(InstrumentAny::BinaryOption(binary.clone()));
+            }
+        }
+    });
+
+    for instrument in &updated {
+        let instrument_id = instrument.id();
+        if let Some(latest) = instruments.get_cloned(&instrument_id)
+            && let Err(e) = data_sender.send(DataEvent::Instrument(latest))
+        {
+            log::warn!("Failed to publish market closure update for {instrument_id}: {e}");
+        }
+    }
+
+    updated.len()
 }
 
 impl TokenMeta {
@@ -82,6 +144,7 @@ impl TokenMeta {
 
 pub(super) fn cache_instrument_if_active(
     now_ns: UnixNanos,
+    closed_condition_ids: &Arc<std::sync::Mutex<AHashSet<String>>>,
     instruments: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
     instrument: &InstrumentAny,
@@ -90,11 +153,17 @@ pub(super) fn cache_instrument_if_active(
         return false;
     }
 
-    cache_instrument(instruments, token_meta, instrument);
-    true
+    apply_live_instrument(
+        closed_condition_ids,
+        instruments,
+        token_meta,
+        instrument,
+        |_| {},
+    )
 }
 
 pub(super) fn cache_and_publish_instruments(
+    closed_condition_ids: &Arc<std::sync::Mutex<AHashSet<String>>>,
     instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
     data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
@@ -104,7 +173,7 @@ pub(super) fn cache_and_publish_instruments(
     let mut total = 0;
 
     for instrument in instruments {
-        if !cache_instrument_if_active(now_ns, instruments_cache, token_meta, &instrument) {
+        if is_instrument_expired(&instrument, now_ns) {
             log::debug!(
                 "Skipping expired instrument {} during live cache publish",
                 instrument.id()
@@ -113,20 +182,34 @@ pub(super) fn cache_and_publish_instruments(
         }
 
         let instrument_id = instrument.id();
-        total += 1;
 
-        if let Err(e) = data_sender.send(DataEvent::Instrument(instrument)) {
-            log::warn!("Failed to publish instrument {instrument_id}: {e}");
+        if apply_live_instrument(
+            closed_condition_ids,
+            instruments_cache,
+            token_meta,
+            &instrument,
+            |instrument| {
+                if let Err(e) = data_sender.send(DataEvent::Instrument(instrument.clone())) {
+                    log::warn!("Failed to publish instrument {instrument_id}: {e}");
+                }
+            },
+        ) {
+            total += 1;
         }
     }
 
     total
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared adapter state is held in Arcs"
+)]
 pub(super) async fn refresh_scoped_instruments(
     http_client: PolymarketGammaHttpClient,
     instrument_config: Option<crate::config::PolymarketInstrumentProviderConfig>,
     filters: Vec<Arc<dyn InstrumentFilter>>,
+    closed_condition_ids: &Arc<std::sync::Mutex<AHashSet<String>>>,
     instruments_cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     token_meta: &Arc<DashMap<Ustr, TokenMeta>>,
     data_sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
@@ -140,12 +223,39 @@ pub(super) async fn refresh_scoped_instruments(
             .await?;
 
     Ok(cache_and_publish_instruments(
+        closed_condition_ids,
         instruments_cache,
         token_meta,
         data_sender,
         clock.get_time_ns(),
         refreshed,
     ))
+}
+
+// Queries Gamma's positive `closed=true` path and returns only conditions it confirms closed.
+pub(super) async fn query_positive_closed_condition_ids(
+    http: &PolymarketGammaHttpClient,
+    condition_ids: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let requested = condition_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<AHashSet<_>>();
+    let markets = http
+        .request_markets_by_params(GetGammaMarketsParams {
+            condition_ids: Some(condition_ids.to_vec()),
+            closed: Some(true),
+            ..Default::default()
+        })
+        .await?;
+
+    Ok(markets
+        .into_iter()
+        .filter(|market| {
+            market.closed == Some(true) && requested.contains(market.condition_id.as_str())
+        })
+        .map(|market| market.condition_id)
+        .collect())
 }
 
 // Returns the condition IDs Gamma positively reports as `closed=true`.
@@ -182,19 +292,7 @@ async fn probe_closed_condition_ids(
         return Ok(closed_ids);
     }
 
-    let closed = http
-        .request_markets_by_params(GetGammaMarketsParams {
-            condition_ids: Some(missing),
-            closed: Some(true),
-            ..Default::default()
-        })
-        .await?;
-    closed_ids.extend(
-        closed
-            .into_iter()
-            .filter(|market| market.closed == Some(true))
-            .map(|market| market.condition_id),
-    );
+    closed_ids.extend(query_positive_closed_condition_ids(http, &missing).await?);
 
     Ok(closed_ids)
 }
@@ -204,6 +302,9 @@ pub(super) async fn refresh_expired_market_closure(
     cache: &Arc<AtomicMap<InstrumentId, InstrumentAny>>,
     sender: &tokio::sync::mpsc::UnboundedSender<DataEvent>,
     now_ns: UnixNanos,
+    closed_condition_ids: &Arc<std::sync::Mutex<AHashSet<String>>>,
+    ws_sub_mutex: &Arc<tokio::sync::Mutex<()>>,
+    cancellation: Option<&CancellationToken>,
 ) -> anyhow::Result<usize> {
     let mut carried: AHashMap<String, Vec<InstrumentId>> = AHashMap::new();
 
@@ -242,6 +343,26 @@ pub(super) async fn refresh_expired_market_closure(
         .flatten()
         .copied()
         .collect::<Vec<_>>();
+
+    // Serialize terminal application with reset. If reset wins the boundary, this old generation
+    // must not mutate or publish from the cache it captured before the request.
+    for condition_id in &closed_ids {
+        if !crate::data::runtime::register_closed_condition_for_live_data(
+            closed_condition_ids,
+            ws_sub_mutex,
+            condition_id,
+            cancellation,
+        )
+        .await
+        {
+            return Ok(0);
+        }
+    }
+
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Ok(0);
+    }
+
     let mut updated = Vec::new();
 
     // Compose against the latest cached value, so a concurrent tick size change is not discarded.
@@ -286,6 +407,7 @@ impl PolymarketDataClient {
         self.provider.initialize(false).await?;
 
         let total = cache_and_publish_instruments(
+            &self.closed_condition_ids,
             &self.instruments,
             &self.token_meta,
             &self.data_sender,
@@ -323,6 +445,7 @@ impl PolymarketDataClient {
         let instrument_config = self.config.instrument_config.clone();
         let instruments_cache = self.instruments.clone();
         let token_meta = self.token_meta.clone();
+        let closed_condition_ids = self.closed_condition_ids.clone();
         let data_sender = self.data_sender.clone();
         let clock = self.clock;
 
@@ -342,6 +465,7 @@ impl PolymarketDataClient {
                     http_client.clone(),
                     instrument_config.clone(),
                     filters.clone(),
+                    &closed_condition_ids,
                     &instruments_cache,
                     &token_meta,
                     &data_sender,
@@ -373,7 +497,10 @@ impl PolymarketDataClient {
 mod tests {
     use std::{
         net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{
@@ -536,7 +663,7 @@ mod tests {
         let expected_price_precision = price_increment.precision;
         let expected_size_precision = size_increment.precision;
 
-        cache_instrument(&instruments, &token_meta, &inst);
+        cache_instrument_unchecked(&instruments, &token_meta, &inst);
 
         let loaded = instruments.load();
         let cached = loaded
@@ -560,10 +687,10 @@ mod tests {
         let raw_symbol = "token-overwrite";
 
         let first = stub_instrument(raw_symbol, Price::from("0.01"), Quantity::from("0.1"));
-        cache_instrument(&instruments, &token_meta, &first);
+        cache_instrument_unchecked(&instruments, &token_meta, &first);
 
         let second = stub_instrument(raw_symbol, Price::from("0.0001"), Quantity::from("0.001"));
-        cache_instrument(&instruments, &token_meta, &second);
+        cache_instrument_unchecked(&instruments, &token_meta, &second);
 
         let meta = token_meta
             .get(&Ustr::from(raw_symbol))
@@ -586,7 +713,7 @@ mod tests {
         ];
 
         for inst in &samples {
-            cache_instrument(&instruments, &token_meta, inst);
+            cache_instrument_unchecked(&instruments, &token_meta, inst);
         }
 
         let loaded = instruments.load();
@@ -598,6 +725,31 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing token_meta for {token_id}"));
             assert_eq!(meta.instrument_id, inst.id());
         }
+    }
+
+    #[rstest]
+    fn cache_and_publish_skips_terminal_condition() {
+        let instruments = Arc::new(AtomicMap::new());
+        let token_meta = Arc::new(DashMap::new());
+        let closed_condition_ids =
+            Arc::new(StdMutex::new(AHashSet::from_iter(["terminal".to_string()])));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let instrument =
+            stub_instrument("terminal-token", Price::from("0.01"), Quantity::from("0.1"));
+
+        let total = cache_and_publish_instruments(
+            &closed_condition_ids,
+            &instruments,
+            &token_meta,
+            &tx,
+            UnixNanos::default(),
+            vec![instrument],
+        );
+
+        assert_eq!(total, 0);
+        assert!(instruments.load().is_empty());
+        assert!(token_meta.is_empty());
+        assert!(rx.try_recv().is_err());
     }
 
     fn past_end_open_market() -> serde_json::Value {
@@ -681,9 +833,18 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            refresh_expired_market_closure(&client, &instruments, &tx, UnixNanos::from(u64::MAX))
-                .await;
+        let closed_condition_ids = Arc::new(StdMutex::new(AHashSet::new()));
+        let ws_sub_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let result = refresh_expired_market_closure(
+            &client,
+            &instruments,
+            &tx,
+            UnixNanos::from(u64::MAX),
+            &closed_condition_ids,
+            &ws_sub_mutex,
+            None,
+        )
+        .await;
 
         if fail {
             assert!(result.is_err());
@@ -765,9 +926,18 @@ mod tests {
         )
         .unwrap();
 
-        let result =
-            refresh_expired_market_closure(&client, &instruments, &tx, UnixNanos::from(u64::MAX))
-                .await;
+        let closed_condition_ids = Arc::new(StdMutex::new(AHashSet::new()));
+        let ws_sub_mutex = Arc::new(tokio::sync::Mutex::new(()));
+        let result = refresh_expired_market_closure(
+            &client,
+            &instruments,
+            &tx,
+            UnixNanos::from(u64::MAX),
+            &closed_condition_ids,
+            &ws_sub_mutex,
+            None,
+        )
+        .await;
 
         assert!(result.is_err());
 
@@ -778,5 +948,12 @@ mod tests {
             .count();
 
         assert_eq!(closed, GAMMA_CONDITION_IDS_BATCH_SIZE);
+        assert_eq!(
+            closed_condition_ids
+                .lock()
+                .expect("closed_condition_ids mutex poisoned")
+                .len(),
+            GAMMA_CONDITION_IDS_BATCH_SIZE,
+        );
     }
 }

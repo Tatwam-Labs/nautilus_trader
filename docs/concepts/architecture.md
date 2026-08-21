@@ -62,7 +62,7 @@ NautilusTrader draws on [crash‑only design](https://en.wikipedia.org/wiki/Cras
 handling unrecoverable faults. Repository release builds abort on panic, allowing an external
 supervisor to restart the process instead of letting it continue with potentially invalid state.
 
-Key principles:
+Principles:
 
 - **Startup recovery**: Configured cache and event‑store recovery run through normal startup rather
   than through a separate crash‑only entry point. Ordinary startup and focused recovery tests
@@ -440,6 +440,7 @@ stateDiagram-v2
     READY --> DISPOSING : dispose()
     STOPPED --> DISPOSING : dispose()
     DISPOSING --> DISPOSED
+    DISPOSING --> FAULTING : on_dispose() error
 
     DISPOSED --> [*]
 ```
@@ -465,7 +466,8 @@ stateDiagram-v2
 - **FAULTING**: The component is executing its `fault` actions.
 
 Transitional states cover the corresponding lifecycle callback and should remain brief. If a
-callback returns an error, the transition halts in its transitional state.
+callback returns an error, the transition halts in its transitional state. `dispose()` is the
+exception: a failing `on_dispose` moves the component to FAULTED so it can still be retired.
 
 #### Actor vs Component traits
 
@@ -798,11 +800,9 @@ order event handling, and order book maintenance all exercise the heap on every 
 system allocators handle this pattern poorly; profiling shows allocator overhead approaching half
 of hot‑loop time on both the Windows CRT heap and glibc malloc under order‑flow workloads.
 
-The `nautilus` CLI and Python wheels on Linux and Windows use
-[mimalloc](https://github.com/microsoft/mimalloc) for Rust allocations. macOS Python wheels use the
-system allocator to remain compatible with Python packages that embed their own allocator.
-Backtest engine benchmarks run roughly 3% to 44% faster depending on workload, with order‑flow
-heavy paths gaining the most. The trade‑off is a modest increase in resident memory from
+The `nautilus` CLI and Python wheels use [mimalloc](https://github.com/microsoft/mimalloc) for Rust
+allocations. Backtest engine benchmarks run roughly 3% to 44% faster depending on workload, with
+order‑flow heavy paths gaining the most. The trade‑off is a modest increase in resident memory from
 mimalloc's segment caching.
 
 A Rust binary links exactly one global allocator, and libraries do not impose one, so the
@@ -812,4 +812,6 @@ opt in from your own binary (see the [Rust guide](rust.md#memory-allocator)).
 ## Related guides
 
 - [Overview](overview.md): High‑level introduction to NautilusTrader.
+- [Python](python.md): Python ownership, runtime, and public API boundaries.
+- [Rust](rust.md): Native Rust APIs and runtime use.
 - [Message Bus](message_bus.md): Core messaging infrastructure.

@@ -232,7 +232,7 @@ Responsibilities:
 This is the construction fallback when no registered extractor accepts the
 object. Python JSON and Arrow decoders also produce this wrapper directly.
 
-### Native same‑binary Rust payload
+### Native same-binary Rust payload
 
 For Rust types compiled into the process, the inner payload is the concrete
 Rust type and can be downcast directly from `Arc<dyn CustomDataTrait>`.
@@ -277,8 +277,16 @@ On query:
 
 This makes custom‑data query resolution symmetric with write‑time registration.
 When converting a Feather stream to Parquet, such as after a backtest, the
-custom‑data branch transforms the Arrow batches and writes the result directly
-to the matching custom‑data path.
+custom‑data branch is designed to transform the Arrow batches and write the
+result directly to the matching custom‑data path.
+
+:::warning
+Streaming Feather persistence for custom data is not currently available. The
+Python `StreamingFeatherWriter` rejects `CustomData` with an `OSError`, and
+`convert_stream_to_data` does not convert custom‑data Feather streams to
+Parquet. This will be possible in a future version. In the meantime, write
+custom data directly to the catalog with `ParquetDataCatalog.write_custom_data`.
+:::
 
 ## The Arrow C FFI bridge
 

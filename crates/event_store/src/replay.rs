@@ -2164,7 +2164,7 @@ mod tests {
             instrument_id,
             Price::from("1.0001"),
             Quantity::from("100"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::from("T-1"),
             UnixNanos::from(ts_init),
             UnixNanos::from(ts_init),
@@ -2463,9 +2463,23 @@ mod tests {
             &[PAYLOAD_TYPE_ORDER_ACCEPTED, PAYLOAD_TYPE_ORDER_UPDATED],
         ),
         cache_mutation(
+            // Replay restores the current generation only; superseded reverse aliases are
+            // re-registered by live mass-status reconciliation.
+            "index_venue_order_id",
+            CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
+        ),
+        cache_mutation(
             "add_order",
             CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
             &[PAYLOAD_TYPE_ORDER_INITIALIZED],
+        ),
+        cache_mutation(
+            // Cache databases persist the resolved client index, but current EventStore
+            // command payloads do not carry the client selected by runtime routing.
+            "claim_order_clients",
+            CacheMutationRecoveryClass::MissingLiveRecovery,
+            &[],
         ),
         cache_mutation(
             "add_order_list",
@@ -3418,7 +3432,7 @@ mod tests {
             instrument_id,
             Price::from("1.00005"),
             Quantity::from("50000"),
-            AggressorSide::Buyer,
+            AggressorSide::Buy,
             TradeId::from("T-DATA-001"),
             UnixNanos::from(12),
             UnixNanos::from(13),

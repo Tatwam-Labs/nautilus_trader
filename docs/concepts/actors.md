@@ -4,7 +4,7 @@ A data actor receives requested and subscribed data, handles system events, and 
 state. In Python, extend the `DataActor` class; in Rust, implement the `DataActor` trait. A strategy
 adds order‑management capabilities.
 
-**Key capabilities**:
+**Capabilities**:
 
 - Market and custom data subscriptions and requests.
 - Custom data and signal publishing.
@@ -46,7 +46,9 @@ class MyActor(DataActor):
 ## Actor configuration and IDs
 
 Data actors can receive a `DataActorConfig` subclass. The base config accepts an optional `actor_id`.
-If supplied, the actor registers with that ID; otherwise, the system derives a runtime actor ID.
+If supplied, the actor registers with that ID; otherwise a Python actor registers under its class
+name. Give each instance an explicit `actor_id` when running more than one instance of the same
+actor, because a duplicate ID is rejected at registration (a `RuntimeError` in Python).
 
 Treat configuration as construction data for the actor. Read user‑supplied settings through
 `self.config`, and keep runtime state on the actor itself.
@@ -54,6 +56,8 @@ Treat configuration as construction data for the actor. Read user‑supplied set
 :::info Rust implementation
 Rust actors store runtime identity and state in `DataActorCore`. Read the runtime ID through
 `actor_id()` rather than expecting a generated ID to be written back into `DataActorConfig`.
+A Rust actor without a configured `actor_id` registers as `DataActor` whatever its type, so give
+each Rust actor an explicit `actor_id`.
 
 Rust authors implement `DataActor` and use the facade methods on `self`.
 `DataActorNative` is native‑only access for runtime wiring and borrowed
