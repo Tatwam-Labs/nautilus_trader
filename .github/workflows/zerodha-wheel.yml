@@ -38,9 +38,32 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: Branch or SHA to build
-        required: false
-        default: feat/zerodha-adapter
+        # ⛔ REQUIRED, AND DELIBERATELY WITHOUT A DEFAULT.
+        #
+        # This input used to default to `feat/zerodha-adapter`. A BRANCH NAME IS A
+        # MOVING TARGET, so an omitted input built whatever that branch happened to
+        # point at — and on 2026-08-19 that was TWELVE HOURS OLDER THAN and DIVERGED
+        # FROM the commit under test, missing the very change the run existed to
+        # exercise. The run would have gone green for the wrong reason: not because
+        # the fix worked, but because the code was never in the build.
+        #
+        # ⚠️ AND REMOVING THE DEFAULT ALONE WOULD HAVE BEEN WORSE, NOT BETTER: the
+        # checkout below reads `${{ inputs.ref || github.ref }}`, so an EMPTY input
+        # falls through to `github.ref` — which on a dispatch is THIS branch,
+        # `ci/zerodha-wheel`.
+        #
+        # 🔴 AND THAT BRANCH **DOES** CARRY THE ADAPTER — it diverged from the
+        # release line at `4fb3441952` and has its own, older copy. So the build
+        # would NOT fail: it would COMPILE, EXPORT, PASS THE ACCEPTANCE STEP AND
+        # PUBLISH A WHEEL FROM A STALE ADAPTER LINE, version-stamped and entirely
+        # legitimate-looking. A loud failure would have been the better outcome.
+        # `required: true` is what makes an omission fail AT DISPATCH, before a
+        # runner is spent.
+        #
+        # PASS THE FULL 40-CHARACTER SHA. `actions/checkout` resolves a SHORT sha as
+        # a BRANCH NAME, which is a third way to build the wrong tree silently.
+        description: FULL 40-char SHA to build (a branch name is a moving target)
+        required: true
 
 env:
   PACKAGE_DIR: python
