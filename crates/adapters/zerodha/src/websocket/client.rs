@@ -237,9 +237,15 @@ impl ZerodhaWebSocketClient {
             // Empty: Kite authenticates by query parameter, see `authenticated_url`.
             headers: vec![],
             // Kite sends its own heartbeats; we do not need to generate traffic.
-            heartbeat: None,
-            heartbeat_msg: None,
-            reconnect_timeout_ms: Some(RECONNECT_TIMEOUT_MS),
+            //
+            // ⚠️ RENAMED UPSTREAM in 74d57e7e05 "align config naming" — `heartbeat` ->
+            // `heartbeat_interval_secs`, `heartbeat_msg` -> `heartbeat_payload`, and
+            // `reconnect_timeout_ms` -> `connect_timeout_ms`. VERIFIED FROM THAT COMMIT'S OWN DIFF
+            // rather than inferred from the names: the third pair is the one that could have been a
+            // different field wearing a similar name, and it is not — the `-`/`+` sit in one hunk.
+            heartbeat_interval_secs: None,
+            heartbeat_payload: None,
+            connect_timeout_ms: Some(RECONNECT_TIMEOUT_MS),
             reconnect_delay_initial_ms: Some(RECONNECT_DELAY_INITIAL_MS),
             reconnect_delay_max_ms: Some(RECONNECT_DELAY_MAX_MS),
             reconnect_backoff_factor: Some(RECONNECT_BACKOFF_FACTOR),
@@ -248,6 +254,16 @@ impl ZerodhaWebSocketClient {
             // trying, because the give-up is silent from the strategy's point of view.
             reconnect_max_attempts: None,
             idle_timeout_ms: Some(IDLE_TIMEOUT_MS),
+            // ⭐ NEW in 74d57e7e05 ("Add network dead-peer detection"), and DELIBERATELY UNUSED.
+            //
+            // This is plausibly the gap this file's own header describes: `idle_timeout_ms`
+            // "detects a dead SOCKET. It does not detect a dead FEED" — heartbeats keep arriving
+            // while ticks stop. A heartbeat timeout may cover exactly that.
+            //
+            // ⛔ BUT ADOPTING IT IS A BEHAVIOUR CHANGE ON THE RECONNECT PATH, and this merge is
+            // already 807 files of unvalidated upstream. `None` preserves today's behaviour
+            // exactly; turning it on is a separate, deliberate change with its own evidence.
+            heartbeat_timeout_secs: None,
             backend: TransportBackend::default(),
             proxy_url: None,
         };
