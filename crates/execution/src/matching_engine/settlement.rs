@@ -19,7 +19,7 @@ use nautilus_model::{
         LiquiditySide, OptionKind, OrderSide, OrderType, PositionSide, PriceType, TimeInForce,
     },
     events::{OrderEventAny, OrderFilled},
-    identifiers::{ClientOrderId, InstrumentId, PositionId, TradeId, VenueOrderId},
+    identifiers::{ClientOrderId, InstrumentId, PositionId, Symbol, TradeId, VenueOrderId},
     instruments::{Instrument, InstrumentAny},
     orders::{MarketOrder, Order, OrderAny, OrderCore},
     position::Position,
@@ -39,6 +39,17 @@ struct OptionSettlementLeg {
 
 struct OptionSettlementPlan {
     legs: Vec<OptionSettlementLeg>,
+}
+
+/// Outcome of resolving an expiring option's underlying instrument in the cache.
+enum UnderlyingResolution {
+    /// Exactly one instrument in the cache carries the underlying symbol.
+    Resolved(Box<InstrumentAny>),
+    /// More than one venue carries the underlying symbol, so the settlement price
+    /// source cannot be chosen without guessing.
+    Ambiguous(Vec<InstrumentId>),
+    /// No instrument in the cache carries the underlying symbol.
+    NotFound,
 }
 
 impl OrderMatchingEngine {
@@ -67,22 +78,34 @@ impl OrderMatchingEngine {
                 ));
             }
         };
-        let underlying_id = InstrumentId::from(format!("{underlying}.{}", self.venue).as_str());
 
-        let underlying_instrument = {
-            let cache = self.cache.borrow();
-            cache.instrument(&underlying_id).cloned()
-        };
-
-        let underlying_instrument = match underlying_instrument {
-            Some(u) => u,
-            None => {
+        let underlying_instrument = match self.option_resolve_underlying(underlying) {
+            UnderlyingResolution::Resolved(instrument) => *instrument,
+            UnderlyingResolution::Ambiguous(candidates) => {
+                let candidates = candidates
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Ok(self.option_settlement_retry_loudly(
+                    "ambiguous-underlying-instrument",
+                    &format!(
+                        "Underlying '{underlying}' for option {instrument_id} is carried by more \
+                         than one venue ({candidates}); refusing to guess a settlement price source"
+                    ),
+                ));
+            }
+            UnderlyingResolution::NotFound => {
                 return Ok(self.option_settlement_retry(
                     "missing-underlying-instrument",
                     &format!("No underlying instrument for option {instrument_id}"),
                 ));
             }
         };
+
+        // The resolved instrument's own ID keys the price stores. It is not always
+        // `{underlying}.{option venue}`: see `option_resolve_underlying`.
+        let underlying_id = underlying_instrument.id();
 
         // Resolve the underlying price by the underlying's instrument type. An index
         // is disseminated via `IndexPriceUpdate` (it does not trade), so its level is
@@ -122,9 +145,73 @@ impl OrderMatchingEngine {
         Ok(true)
     }
 
+    /// Resolves an expiring option's `underlying` symbol to an instrument in the cache.
+    ///
+    /// The option's own venue is tried first. That is the correct and unambiguous source
+    /// wherever the underlying is listed on the same venue as the option — equity options
+    /// on `XNAS`, `OPRA`-style chains against a same-venue index — and trying it first
+    /// keeps those markets on exactly the lookup they had before.
+    ///
+    /// Many markets list the underlying on a *different* venue from the derivatives segment
+    /// that carries the option, so the same-venue ID is a symbol that was never listed. On
+    /// the Indian exchanges, SENSEX options trade on `BFO` while the SENSEX index itself is
+    /// disseminated as `SENSEX.BSE`; the equivalent NSE split is `NFO` against `NSE`. For
+    /// those, fall back to matching the underlying symbol across every venue in the cache.
+    ///
+    /// A cross-venue match is accepted **only when it is unique**. This value is the
+    /// settlement price source for the whole expiring position, so an underlying symbol
+    /// carried by several venues is reported to the caller as ambiguous rather than
+    /// resolved arbitrarily: deferring settlement is recoverable, settling every position
+    /// against the wrong venue's price is not.
+    fn option_resolve_underlying(&self, underlying: Ustr) -> UnderlyingResolution {
+        let cache = self.cache.borrow();
+        let symbol = Symbol::from_ustr_unchecked(underlying);
+
+        if let Some(instrument) = cache.instrument(&InstrumentId::new(symbol, self.venue)) {
+            return UnderlyingResolution::Resolved(Box::new(instrument.clone()));
+        }
+
+        let mut candidates: Vec<InstrumentId> = cache
+            .instrument_ids(None)
+            .into_iter()
+            .filter(|id| id.symbol == symbol)
+            .copied()
+            .collect();
+
+        match candidates.len() {
+            0 => UnderlyingResolution::NotFound,
+            1 => cache
+                .instrument(&candidates[0])
+                .cloned()
+                .map_or(UnderlyingResolution::NotFound, |instrument| {
+                    UnderlyingResolution::Resolved(Box::new(instrument))
+                }),
+            _ => {
+                // The cache iterates in insertion order, so sort to keep the operator-facing
+                // error message stable across runs.
+                candidates.sort_unstable_by_key(|id| id.venue);
+                UnderlyingResolution::Ambiguous(candidates)
+            }
+        }
+    }
+
     fn option_settlement_retry(&mut self, reason: &'static str, message: &str) -> bool {
         if self.option_settlement_warning != Some(reason) {
             log::warn!("{message}; settlement will retry");
+            self.option_settlement_warning = Some(reason);
+        }
+        false
+    }
+
+    /// As [`Self::option_settlement_retry`], but logs at ERROR.
+    ///
+    /// For deferrals that no amount of waiting can clear on its own: a missing price
+    /// arrives with the next tick, whereas an ambiguous underlying needs a human to
+    /// correct the cache. The latch is shared with the warning path so the message is
+    /// emitted once per distinct reason rather than on every `iterate`.
+    fn option_settlement_retry_loudly(&mut self, reason: &'static str, message: &str) -> bool {
+        if self.option_settlement_warning != Some(reason) {
+            log::error!("{message}; settlement will retry");
             self.option_settlement_warning = Some(reason);
         }
         false

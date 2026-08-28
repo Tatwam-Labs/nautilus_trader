@@ -12950,9 +12950,13 @@ fn crypto_option_call_btc(venue: &str, expiration_ns: UnixNanos, strike: Price) 
 }
 
 fn underlying_index(venue: &str) -> IndexInstrument {
+    underlying_index_on("SPX", venue)
+}
+
+fn underlying_index_on(symbol: &str, venue: &str) -> IndexInstrument {
     IndexInstrument::new(
-        InstrumentId::from(format!("SPX.{venue}").as_str()),
-        Symbol::from("SPX"),
+        InstrumentId::from(format!("{symbol}.{venue}").as_str()),
+        Symbol::from(symbol),
         Currency::USD(),
         2,
         0,
@@ -14261,6 +14265,329 @@ fn test_process_option_expiry_missing_underlying_instrument_defers(account_id: A
     assert!(
         !engine.is_expiration_processed(),
         "Missing underlying instrument must not commit option expiration"
+    );
+}
+
+/// Builds an engine for `option` over `cache`, clocked to `expiration_ns`.
+///
+/// The underlying-resolution tests below differ only in what they put in the cache,
+/// so the engine construction is shared to keep those differences visible.
+fn option_expiry_engine(
+    option: InstrumentAny,
+    cache: Rc<RefCell<Cache>>,
+    expiration_ns: UnixNanos,
+) -> OrderMatchingEngine {
+    let clock = Rc::new(RefCell::new(TestClock::new()));
+    clock.borrow_mut().set_time(expiration_ns);
+
+    OrderMatchingEngine::new(
+        option,
+        1,
+        FillModelHandle::default(),
+        FeeModelAny::default().into(),
+        BookType::L1_MBP,
+        OmsType::Netting,
+        AccountType::Cash,
+        clock,
+        cache,
+        OrderMatchingEngineConfig::default(),
+    )
+}
+
+// The option's own venue must keep winning the underlying lookup. A cross-venue
+// instrument carrying the same symbol is a decoy here: resolving it instead would
+// settle at 999.00 - 149.00 rather than 160.00 - 149.00, and resolving *both* would
+// read as ambiguous and refuse to settle at all.
+#[rstest]
+fn test_option_settlement_prefers_same_venue_underlying_over_cross_venue_match(
+    account_id: AccountId,
+) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let venue = "OPRA";
+    let expiration_ns = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let option = InstrumentAny::OptionContract(option_contract(
+        "SPX",
+        venue,
+        expiration_ns,
+        OptionKind::Call,
+    ));
+    let same_venue = InstrumentAny::IndexInstrument(underlying_index_on("SPX", venue));
+    let other_venue = InstrumentAny::IndexInstrument(underlying_index_on("SPX", "XCBO"));
+
+    cache.borrow_mut().add_instrument(option.clone()).unwrap();
+    for (instrument, level) in [(&same_venue, "160.00"), (&other_venue, "999.00")] {
+        cache
+            .borrow_mut()
+            .add_instrument(instrument.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_index_price(IndexPriceUpdate::new(
+                instrument.id(),
+                Price::from(level),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ))
+            .unwrap();
+    }
+
+    let position = open_long_option_position(
+        &cache,
+        &option,
+        account_id,
+        Quantity::from(1),
+        Price::from("5.00"),
+    );
+
+    let mut engine = option_expiry_engine(option, cache.clone(), expiration_ns);
+    engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+
+    let client_order_id = settlement_client_order_id(&cache, &format!("EXPIRATION_{venue}_CASH"));
+    let settlement_fill = get_order_event_handler_messages(&order_event_handler)
+        .into_iter()
+        .find_map(|e| match e {
+            OrderEventAny::Filled(f) if f.client_order_id == client_order_id => Some(f),
+            _ => None,
+        })
+        .expect("Expected cash settlement fill");
+
+    assert_eq!(
+        settlement_fill.last_px,
+        Price::from("11.00"),
+        "Settlement must price off the same-venue underlying at 160.00, not the decoy at 999.00",
+    );
+    assert_eq!(settlement_fill.position_id, Some(position.id));
+    assert!(engine.is_expiration_processed());
+}
+
+// The SENSEX.BFO / SENSEX.BSE shape: index options trade on the derivatives segment
+// while the index they settle against is disseminated by the cash exchange, so
+// `{underlying}.{option venue}` names an instrument that was never listed. A unique
+// symbol match elsewhere in the cache is the underlying.
+#[rstest]
+fn test_option_settlement_resolves_underlying_listed_on_another_venue(account_id: AccountId) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let venue = "BFO";
+    let expiration_ns = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let option = InstrumentAny::OptionContract(option_contract(
+        "SENSEX",
+        venue,
+        expiration_ns,
+        OptionKind::Call,
+    ));
+    let underlying = InstrumentAny::IndexInstrument(underlying_index_on("SENSEX", "BSE"));
+
+    assert_ne!(
+        underlying.id().venue,
+        option.id().venue,
+        "This test is only meaningful while the underlying sits on another venue",
+    );
+
+    cache.borrow_mut().add_instrument(option.clone()).unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(underlying.clone())
+        .unwrap();
+
+    // ITM call: spot 160 > strike 149 -> cash payout 11.00.
+    cache
+        .borrow_mut()
+        .add_index_price(IndexPriceUpdate::new(
+            underlying.id(),
+            Price::from("160.00"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ))
+        .unwrap();
+
+    let position = open_long_option_position(
+        &cache,
+        &option,
+        account_id,
+        Quantity::from(1),
+        Price::from("5.00"),
+    );
+
+    let mut engine = option_expiry_engine(option.clone(), cache.clone(), expiration_ns);
+    engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+
+    let client_order_id = settlement_client_order_id(&cache, &format!("EXPIRATION_{venue}_CASH"));
+    let settlement_fill = get_order_event_handler_messages(&order_event_handler)
+        .into_iter()
+        .find_map(|e| match e {
+            OrderEventAny::Filled(f) if f.client_order_id == client_order_id => Some(f),
+            _ => None,
+        })
+        .expect("Expected cash settlement fill for the cross-venue underlying");
+
+    assert_eq!(settlement_fill.instrument_id, option.id());
+    assert_eq!(settlement_fill.order_side, OrderSide::Sell);
+    assert_eq!(settlement_fill.last_qty, position.quantity);
+    assert_eq!(
+        settlement_fill.last_px,
+        Price::from("11.00"),
+        "The index price is keyed by the resolved ID, so intrinsic value must be 160.00 - 149.00",
+    );
+    assert_eq!(settlement_fill.position_id, Some(position.id));
+    assert!(
+        engine.is_expiration_processed(),
+        "A resolved cross-venue underlying must commit option expiration"
+    );
+
+    // The matching engine emits the closing events; the position record is updated
+    // downstream by the execution engine. Applying the emitted fill proves the event
+    // stream closes the position that was left open by the failed lookup.
+    let mut closed_position = position;
+    closed_position.apply(&settlement_fill);
+    assert!(closed_position.is_closed());
+}
+
+/// Expires an `SPX` call on `BFO` against an `SPX` index listed on each of `venues`.
+///
+/// Returns the settlement fill price, or `None` when settlement was declined.
+fn settle_spx_option_against_venues(
+    account_id: AccountId,
+    venues: &[(&str, &str)],
+) -> Option<Price> {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let venue = "BFO";
+    let expiration_ns = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let option = InstrumentAny::OptionContract(option_contract(
+        "SPX",
+        venue,
+        expiration_ns,
+        OptionKind::Call,
+    ));
+
+    cache.borrow_mut().add_instrument(option.clone()).unwrap();
+    for (other_venue, level) in venues {
+        let underlying = InstrumentAny::IndexInstrument(underlying_index_on("SPX", other_venue));
+        cache
+            .borrow_mut()
+            .add_instrument(underlying.clone())
+            .unwrap();
+        cache
+            .borrow_mut()
+            .add_index_price(IndexPriceUpdate::new(
+                underlying.id(),
+                Price::from(*level),
+                UnixNanos::from(1),
+                UnixNanos::from(1),
+            ))
+            .unwrap();
+    }
+
+    open_long_option_position(
+        &cache,
+        &option,
+        account_id,
+        Quantity::from(1),
+        Price::from("5.00"),
+    );
+
+    let mut engine = option_expiry_engine(option, cache, expiration_ns);
+    engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+
+    let fill = get_order_event_handler_messages(&order_event_handler)
+        .into_iter()
+        .find_map(|e| match e {
+            OrderEventAny::Filled(f) => Some(f),
+            _ => None,
+        });
+
+    assert_eq!(
+        fill.is_some(),
+        engine.is_expiration_processed(),
+        "A settlement fill and a committed expiration must always agree",
+    );
+    fill.map(|f| f.last_px)
+}
+
+// A settlement price source must never be guessed. When the underlying symbol is
+// carried by more than one venue there is no basis to prefer either, so the engine
+// takes the existing retry path rather than settling every position at a price that
+// may belong to the wrong market.
+//
+// The single-venue case is the control: it fixes everything except the number of
+// candidates, so the refusal below can only be caused by the second listing. Without
+// it, this test would also pass on a build that never resolves a cross-venue
+// underlying at all.
+#[rstest]
+fn test_option_settlement_refuses_ambiguous_cross_venue_underlying(account_id: AccountId) {
+    assert_eq!(
+        settle_spx_option_against_venues(account_id, &[("BSE", "160.00")]),
+        Some(Price::from("11.00")),
+        "A unique cross-venue underlying must settle at its intrinsic value",
+    );
+
+    assert_eq!(
+        settle_spx_option_against_venues(account_id, &[("BSE", "160.00"), ("NSE", "200.00")]),
+        None,
+        "Adding a second venue carrying the same symbol must decline settlement, not pick one",
+    );
+}
+
+// Negative control for the cross-venue fallback: a populated cache that holds no
+// instrument with the underlying's symbol must still defer, exactly as an empty one
+// does. Without this, the two tests above cannot distinguish "the fallback matched
+// the right instrument" from "the fallback matches anything".
+#[rstest]
+fn test_option_settlement_defers_when_no_venue_carries_the_underlying(account_id: AccountId) {
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let order_event_handler = order_event_handler_with_cache(cache.clone());
+
+    let venue = "BFO";
+    let expiration_ns = UnixNanos::from(2_000_000_000_000_000_000u64);
+    let option = InstrumentAny::OptionContract(option_contract(
+        "SENSEX",
+        venue,
+        expiration_ns,
+        OptionKind::Call,
+    ));
+    // A priced index on another venue, under a symbol that is NOT the underlying.
+    let unrelated = InstrumentAny::IndexInstrument(underlying_index_on("BANKEX", "BSE"));
+
+    cache.borrow_mut().add_instrument(option.clone()).unwrap();
+    cache
+        .borrow_mut()
+        .add_instrument(unrelated.clone())
+        .unwrap();
+    cache
+        .borrow_mut()
+        .add_index_price(IndexPriceUpdate::new(
+            unrelated.id(),
+            Price::from("160.00"),
+            UnixNanos::from(1),
+            UnixNanos::from(1),
+        ))
+        .unwrap();
+
+    let _position = open_long_option_position(
+        &cache,
+        &option,
+        account_id,
+        Quantity::from(1),
+        Price::from("5.00"),
+    );
+
+    let mut engine = option_expiry_engine(option, cache, expiration_ns);
+    engine.iterate(expiration_ns, AggressorSide::NoAggressor);
+
+    assert!(
+        get_order_event_handler_messages(&order_event_handler)
+            .iter()
+            .all(|e| !matches!(e, OrderEventAny::Accepted(_) | OrderEventAny::Filled(_))),
+        "A cache with no matching symbol must not settle against an unrelated instrument"
+    );
+    assert!(
+        !engine.is_expiration_processed(),
+        "An unresolvable underlying must not commit option expiration"
     );
 }
 
