@@ -149,9 +149,21 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, Params, UUID4, UnixNanos,
+    Params, UUID4, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+
+/// Panic message for a poisoned registry lock.
+///
+/// v2.0.0rc4 deleted `nautilus_core::MUTEX_POISONED` because upstream moved its own locks to
+/// `parking_lot::Mutex`, which cannot poison. The registry below is still a `std::sync::Mutex`
+/// owned by this adapter, so `lock()` still returns a `LockResult` and the message is still
+/// needed -- it is defined here rather than re-imported.
+///
+/// NOTE: migrating this registry to `parking_lot` would remove the `expect` entirely and match
+/// upstream, but that is a behaviour change to lock semantics and does not belong in a version
+/// bump. Left deliberately for a separate commit.
+const MUTEX_POISONED: &str = "Mutex poisoned";
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce},
@@ -203,7 +215,11 @@ pub struct ZerodhaOrderContext {
     /// The submitting strategy.
     pub strategy_id: StrategyId,
     /// The side, kept so `cancel_all_orders` can honour a side filter without the cache.
-    pub order_side: OrderSide,
+    ///
+    /// `None` means the side is UNKNOWN -- this process did not place the order. It is not a
+    /// third side, and it must never be treated as one: v2.0.0rc4 deleted the `NoOrderSide`
+    /// sentinel that used to carry this state, and `Option` is its type-safe replacement.
+    pub order_side: Option<OrderSide>,
     /// The variety the order was **placed** under.
     pub variety: ZerodhaVariety,
 }
@@ -295,8 +311,10 @@ impl ZerodhaOrderRegistry {
 
     /// Returns the contexts matching an instrument, optionally filtered by side.
     ///
-    /// [`OrderSide::NoOrderSide`] means "every side" — that is how [`CancelAllOrders`] spells an
-    /// unfiltered request, and treating it as a literal side would match nothing.
+    /// `None` means "every side" — that is how [`CancelAllOrders`] spells an unfiltered request.
+    /// Until v2.0.0rc4 it spelled it as the sentinel `OrderSide::NoOrderSide`; upstream replaced
+    /// that with `Option<OrderSide>` and this follows, so the "unfiltered" case is now carried by
+    /// the type rather than by a magic variant.
     ///
     /// ⚠️ **THIS RETURNS TRACKED ORDERS, NOT OPEN ONES, AND THE NAME USED TO LIE ABOUT THAT.**
     ///
@@ -314,13 +332,13 @@ impl ZerodhaOrderRegistry {
     pub fn tracked_for(
         &self,
         instrument_id: InstrumentId,
-        order_side: OrderSide,
+        order_side: Option<OrderSide>,
     ) -> Vec<ZerodhaOrderContext> {
         self.by_client
             .values()
             .filter(|context| {
                 context.instrument_id == instrument_id
-                    && (order_side == OrderSide::NoOrderSide || context.order_side == order_side)
+                    && (order_side.is_none() || context.order_side == order_side)
             })
             .copied()
             .collect()
@@ -336,7 +354,7 @@ impl ZerodhaOrderRegistry {
     pub fn open_for_with<F>(
         &self,
         instrument_id: InstrumentId,
-        order_side: OrderSide,
+        order_side: Option<OrderSide>,
         is_open: F,
     ) -> Vec<ZerodhaOrderContext>
     where
@@ -1328,7 +1346,7 @@ impl ExecutionClient for ZerodhaExecutionClient {
                 venue_order_id: None,
                 instrument_id: order.instrument_id(),
                 strategy_id: order.strategy_id(),
-                order_side: order.order_side(),
+                order_side: Some(order.order_side()),
                 variety,
             });
 
@@ -1588,7 +1606,10 @@ impl ExecutionClient for ZerodhaExecutionClient {
                     venue_order_id: cmd.venue_order_id,
                     instrument_id: cmd.instrument_id,
                     strategy_id: cmd.strategy_id,
-                    order_side: OrderSide::NoOrderSide,
+                    // The side is genuinely unknown: this process did not place the order, so
+                    // there is no context to read it from. `None` says that; a real side here
+                    // would be a fabrication.
+                    order_side: None,
                     variety: self.config.default_variety,
                 },
                 "this process did not place the order, so the variety it was placed under is \
@@ -1831,7 +1852,7 @@ mod tests {
             venue_order_id: venue_order_id.map(VenueOrderId::from),
             instrument_id: InstrumentId::from(NIFTY_OPTION),
             strategy_id: StrategyId::from("S-001"),
-            order_side: OrderSide::Buy,
+            order_side: Some(OrderSide::Buy),
             variety: ZerodhaVariety::Regular,
         }
     }
@@ -2190,25 +2211,26 @@ mod tests {
         );
     }
 
-    // `CancelAllOrders` spells "every side" as `NoOrderSide`. Treating it as a literal side would
+    // `CancelAllOrders` spells "every side" as `None` (a sentinel `NoOrderSide` before v2.0.0rc4).
+    // Treating it as a literal side would
     // match nothing and silently cancel none of the orders.
     #[rstest]
     fn test_no_order_side_means_every_side_not_no_orders() {
         let mut registry = ZerodhaOrderRegistry::new();
         registry.register(context("O-001", Some("V-1")));
         registry.register(ZerodhaOrderContext {
-            order_side: OrderSide::Sell,
+            order_side: Some(OrderSide::Sell),
             ..context("O-002", Some("V-2"))
         });
 
         let instrument_id = InstrumentId::from(NIFTY_OPTION);
         assert_eq!(
-            registry.tracked_for(instrument_id, OrderSide::NoOrderSide).len(),
+            registry.tracked_for(instrument_id, None).len(),
             2,
             "an unfiltered cancel-all must reach both sides",
         );
-        assert_eq!(registry.tracked_for(instrument_id, OrderSide::Buy).len(), 1);
-        assert_eq!(registry.tracked_for(instrument_id, OrderSide::Sell).len(), 1);
+        assert_eq!(registry.tracked_for(instrument_id, Some(OrderSide::Buy)).len(), 1);
+        assert_eq!(registry.tracked_for(instrument_id, Some(OrderSide::Sell)).len(), 1);
     }
 
     #[rstest]
@@ -2222,7 +2244,7 @@ mod tests {
 
         assert_eq!(
             registry
-                .tracked_for(InstrumentId::from(NIFTY_OPTION), OrderSide::NoOrderSide)
+                .tracked_for(InstrumentId::from(NIFTY_OPTION), None)
                 .len(),
             1,
         );
@@ -2245,7 +2267,7 @@ mod tests {
 
         let open = registry.open_for_with(
             InstrumentId::from(NIFTY_OPTION),
-            OrderSide::NoOrderSide,
+            None,
             |client_order_id| client_order_id.as_str() != "O-FILLED",
         );
 
@@ -2263,7 +2285,7 @@ mod tests {
 
         let open = registry.open_for_with(
             InstrumentId::from(NIFTY_OPTION),
-            OrderSide::NoOrderSide,
+            None,
             // Mirrors the real predicate's absent branch: not in the cache -> cancel it anyway.
             |_| true,
         );
