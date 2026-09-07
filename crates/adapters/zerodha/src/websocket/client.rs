@@ -268,10 +268,23 @@ impl ZerodhaWebSocketClient {
             proxy_url: None,
         };
 
-        // `connect` (not `connect_stream`) is the handler-mode entry point, and handler mode is
+        // `connect_url` (not `connect_stream`) is the handler-mode entry point, and handler mode is
         // what carries auto-reconnect, backoff and the idle timeout. `connect_stream` has none of
         // them.
-        let client = WebSocketClient::connect(config, Some(message_handler), None, vec![], None)
+        //
+        // v2.0.0rc4 replaced the `connect(...)` constructor with a `bon` builder whose finish_fn
+        // is `connect`. `keyed_quotas` / `default_quota` -- we passed `vec![]` and `None`, i.e. no
+        // client-side rate limiting -- are now defaults and omitted, so this is equivalent.
+        //
+        // NOTE `message_handler` is REQUIRED here, not `Option`: handler mode is no longer opted
+        // into by passing `Some`, it is the shape of this builder.
+        //
+        // ⚠️ `connect_url` also exists in that file but belongs to `WebSocketClientInner`, a
+        // DIFFERENT type. Reading a signature is not confirming which impl block owns it.
+        let client = WebSocketClient::builder()
+            .config(config)
+            .message_handler(message_handler)
+            .connect()
             .await
             .map_err(|e| anyhow::anyhow!("Zerodha WebSocket connect failed: {e}"))?;
 

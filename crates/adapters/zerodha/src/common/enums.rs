@@ -526,17 +526,20 @@ impl ZerodhaTransactionType {
     ///
     /// # Errors
     ///
-    /// Returns an error for [`OrderSide::NoOrderSide`], which has no venue meaning. It is the
-    /// enum's `Default`, so a partially-built order reaches this with a side that looks valid;
-    /// mapping it to `BUY` would place a real trade in a direction nobody asked for.
+    /// Currently infallible -- `OrderSide` is `Buy | Sell` and both map. The `Result` is retained
+    /// because callers already handle it and because the venue may yet gain a side this cannot
+    /// express.
+    ///
+    /// HISTORY, because the guard that used to live here was load-bearing: until v2.0.0rc4
+    /// `OrderSide` had a third variant, `NoOrderSide`, which was its `Default`. A partially-built
+    /// order therefore reached this function with a side that *looked* valid, and mapping it to
+    /// `BUY` would have placed a real trade in a direction nobody asked for -- so this bailed.
+    /// Upstream deleted that variant, which makes the unset state unrepresentable and retires the
+    /// guard at the type level rather than at runtime. **Do not reintroduce a defaulted side.**
     pub fn from_order_side(side: OrderSide) -> anyhow::Result<Self> {
         match side {
             OrderSide::Buy => Ok(Self::Buy),
             OrderSide::Sell => Ok(Self::Sell),
-            OrderSide::NoOrderSide => anyhow::bail!(
-                "OrderSide::NoOrderSide has no Zerodha transaction_type; it is the enum default, \
-                 so this is an unset side rather than a side the venue cannot express"
-            ),
         }
     }
 

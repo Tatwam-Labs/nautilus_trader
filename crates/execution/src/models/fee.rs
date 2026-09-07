@@ -26,7 +26,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 #[cfg(feature = "python")]
-use crate::python::fee::PyFeeModel;
+use crate::python::fee::{PyFeeModel, PythonFeeModel};
 
 pub trait FeeModel {
     /// Calculates commission for a fill.
@@ -133,13 +133,8 @@ pub enum FeeModelAny {
     ProbabilityPrice(ProbabilityPriceFeeModel),
     CappedOption(CappedOptionFeeModel),
     TieredNotionalOption(TieredNotionalOptionFeeModel),
-    /// A fee model defined in Python, duck-typed on `get_commission`.
-    ///
-    /// Additive and cfg-gated: a build without the `python` feature sees the original six
-    /// variants and is bit-identical. The payload is a `Py<PyAny>`, which is `Send + Sync` —
-    /// more portable than the Rust model structs already held here.
     #[cfg(feature = "python")]
-    Python(crate::python::fee::PythonFeeModel),
+    Python(PythonFeeModel),
 }
 
 impl FeeModel for FeeModelAny {

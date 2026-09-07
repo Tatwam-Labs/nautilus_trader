@@ -352,21 +352,24 @@ impl KiteInstrument {
             Price::from(INDEX_PRICE_INCREMENT)
         };
 
-        Ok(InstrumentAny::IndexInstrument(IndexInstrument::new(
-            instrument_id,
-            raw_symbol,
-            Currency::INR(),
-            price_increment.precision,
-            0, // size_precision
-            price_increment,
-            // An index has no size at all, but `check_positive_quantity` rejects a zero size
-            // increment, so this is a neutral placeholder rather than a claim about tradable size.
-            Quantity::from(1u32),
-            None, // tick_scheme
-            Some(self.venue_info()),
-            ts_init, // ts_event
-            ts_init,
-        )))
+        Ok(InstrumentAny::IndexInstrument(
+            IndexInstrument::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(raw_symbol)
+                .currency(Currency::INR())
+                .price_precision(price_increment.precision)
+                .size_precision(0)
+                .price_increment(price_increment)
+                // An index has no size at all, but `check_positive_quantity` rejects a zero size
+                // increment, so this is a neutral placeholder rather than a claim about tradable
+                // size.
+                .size_increment(Quantity::from(1u32))
+                // tick_scheme omitted -- optional, was None
+                .info(self.venue_info())
+                .ts_event(ts_init) // the dump has no per-row event time
+                .ts_init(ts_init)
+                .build()?,
+        ))
     }
 
     /// Builds the [`InstrumentAny::Equity`] case.
@@ -374,27 +377,26 @@ impl KiteInstrument {
         let (instrument_id, raw_symbol) = self.checked_identity()?;
         let lot_size = self.lot_quantity()?;
 
-        Ok(InstrumentAny::Equity(Equity::new(
-            instrument_id,
-            raw_symbol,
-            None, // isin -- the dump carries no ISIN column
-            Currency::INR(),
-            self.price_precision,
-            self.price_increment()?,
-            Some(lot_size),
-            None, // max_quantity -- the dump publishes no freeze quantity
-            Some(lot_size),
-            None, // max_price
-            None, // min_price
-            None, // margin_init -- SPAN margins come from a different endpoint
-            None, // margin_maint
-            None, // maker_fee -- Zerodha brokerage is per-order, not a rate on notional
-            None, // taker_fee
-            None, // tick_scheme -- NSE ticks are uniform, so the flat increment is exact
-            Some(self.venue_info()),
-            ts_init, // ts_event -- the dump has no per-row event time
-            ts_init,
-        )))
+        Ok(InstrumentAny::Equity(
+            Equity::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(raw_symbol)
+                // isin omitted -- the dump carries no ISIN column
+                .currency(Currency::INR())
+                .price_precision(self.price_precision)
+                .price_increment(self.price_increment()?)
+                .lot_size(lot_size)
+                // max_quantity omitted -- the dump publishes no freeze quantity
+                .min_quantity(lot_size)
+                // max_price / min_price omitted
+                // margin_init / margin_maint omitted -- SPAN margins come from another endpoint
+                // maker_fee / taker_fee omitted -- Zerodha brokerage is per-order, not a rate
+                // tick_scheme omitted -- NSE ticks are uniform, so the flat increment is exact
+                .info(self.venue_info())
+                .ts_event(ts_init) // the dump has no per-row event time
+                .ts_init(ts_init)
+                .build()?,
+        ))
     }
 
     /// Builds the [`InstrumentAny::FuturesContract`] case.
@@ -402,38 +404,36 @@ impl KiteInstrument {
         let (instrument_id, raw_symbol) = self.checked_identity()?;
         let lot_size = self.lot_quantity()?;
 
-        // Note the argument order differs from `OptionContract::new`: futures take `currency`
-        // AFTER the two timestamps, options take it BEFORE them. Both are positional, so a
-        // copy-paste between the two does not fail to compile -- it silently swaps the fields.
+        // [RESOLVED at v2.0.0rc4 -- kept because the hazard is worth knowing it EXISTED.] These
+        // were positional constructors, and futures took `currency` AFTER the two timestamps while
+        // options took it BEFORE, so a copy-paste between the two compiled fine and silently
+        // swapped the fields. Upstream's `bon` builders are NAMED, so that class of error can no
+        // longer be written here. Do not reintroduce a positional constructor.
         //
         // `exchange` is left `None`: Nautilus documents it as an ISO 10383 MIC, and `NFO` is a
         // Zerodha code rather than a MIC. The venue is already carried by the instrument ID.
-        Ok(InstrumentAny::FuturesContract(FuturesContract::new(
-            instrument_id,
-            raw_symbol,
-            asset_class_for_exchange(self.exchange.trim()),
-            None, // exchange
-            self.underlying_symbol()?.inner(),
-            UnixNanos::default(),
-            self.expiration_ns()?,
-            Currency::INR(),
-            self.price_precision,
-            self.price_increment()?,
-            Quantity::from(MULTIPLIER_UNITS),
-            lot_size,
-            None, // max_quantity
-            Some(lot_size),
-            None, // max_price
-            None, // min_price
-            None, // margin_init
-            None, // margin_maint
-            None, // maker_fee
-            None, // taker_fee
-            None, // tick_scheme
-            Some(self.venue_info()),
-            ts_init, // ts_event
-            ts_init,
-        )))
+        Ok(InstrumentAny::FuturesContract(
+            FuturesContract::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(raw_symbol)
+                .asset_class(asset_class_for_exchange(self.exchange.trim()))
+                // exchange omitted
+                .underlying(self.underlying_symbol()?.inner())
+                .activation_ns(UnixNanos::default())
+                .expiration_ns(self.expiration_ns()?)
+                .currency(Currency::INR())
+                .price_precision(self.price_precision)
+                .price_increment(self.price_increment()?)
+                .multiplier(Quantity::from(MULTIPLIER_UNITS))
+                .lot_size(lot_size)
+                // max_quantity omitted
+                .min_quantity(lot_size)
+                // max_price / min_price / margins / fees / tick_scheme omitted
+                .info(self.venue_info())
+                .ts_event(ts_init)
+                .ts_init(ts_init)
+                .build()?,
+        ))
     }
 
     /// Builds the [`InstrumentAny::OptionContract`] case.
@@ -466,41 +466,37 @@ impl KiteInstrument {
             )
         })?;
 
-        Ok(InstrumentAny::OptionContract(OptionContract::new(
-            instrument_id,
-            raw_symbol,
-            asset_class_for_exchange(self.exchange.trim()),
-            None, // exchange -- see the futures case
-            self.underlying_symbol()?.inner(),
-            option_kind,
-            strike_price,
-            Currency::INR(),
-            // The dump publishes no activation or listing date, so this is the epoch. That is the
-            // one value which can never mark a live contract as "not yet active". Back-dating
-            // activation by a fixed window from expiry -- the convention some adapters use -- can:
-            // NSE lists weeklies a few weeks out but monthlies and long-dated series up to three
-            // years out, so any single window is wrong for most of the chain. The same reasoning
-            // applies to the futures case above.
-            UnixNanos::default(),
-            self.expiration_ns()?,
-            self.price_precision,
-            self.price_increment()?,
-            Quantity::from(MULTIPLIER_UNITS),
-            lot_size,
-            None, // max_quantity
-            // The smallest order the venue accepts is one lot, expressed in units.
-            Some(lot_size),
-            None, // max_price
-            None, // min_price
-            None, // margin_init
-            None, // margin_maint
-            None, // maker_fee
-            None, // taker_fee
-            None, // tick_scheme
-            Some(self.venue_info()),
-            ts_init, // ts_event
-            ts_init,
-        )))
+        Ok(InstrumentAny::OptionContract(
+            OptionContract::builder()
+                .instrument_id(instrument_id)
+                .raw_symbol(raw_symbol)
+                .asset_class(asset_class_for_exchange(self.exchange.trim()))
+                // exchange omitted -- see the futures case
+                .underlying(self.underlying_symbol()?.inner())
+                .option_kind(option_kind)
+                .strike_price(strike_price)
+                .currency(Currency::INR())
+                // The dump publishes no activation or listing date, so this is the epoch. That is
+                // the one value which can never mark a live contract as "not yet active".
+                // Back-dating activation by a fixed window from expiry -- the convention some
+                // adapters use -- cannot work here: NSE lists weeklies a few weeks out but
+                // monthlies and long-dated series up to three years out, so any single window is
+                // wrong for most of the chain. The same reasoning applies to the futures case.
+                .activation_ns(UnixNanos::default())
+                .expiration_ns(self.expiration_ns()?)
+                .price_precision(self.price_precision)
+                .price_increment(self.price_increment()?)
+                .multiplier(Quantity::from(MULTIPLIER_UNITS))
+                .lot_size(lot_size)
+                // max_quantity omitted
+                // The smallest order the venue accepts is one lot, expressed in units.
+                .min_quantity(lot_size)
+                // max_price / min_price / margins / fees / tick_scheme omitted
+                .info(self.venue_info())
+                .ts_event(ts_init)
+                .ts_init(ts_init)
+                .build()?,
+        ))
     }
 }
 

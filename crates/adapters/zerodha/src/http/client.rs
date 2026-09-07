@@ -80,15 +80,14 @@ impl ZerodhaHttpClient {
         let mut headers = HashMap::new();
         headers.insert("X-Kite-Version".to_string(), KITE_VERSION.to_string());
 
-        let client = HttpClient::new(
-            headers,
-            vec![],
-            vec![],
-            None,
-            Some(DEFAULT_TIMEOUT_SECS),
-            None,
-        )
-        .map_err(|e| anyhow::anyhow!("failed to build Zerodha HTTP client: {e}"))?;
+        // v2.0.0rc4: `HttpClient::new` became a `bon` builder. `header_keys`, `keyed_quotas`,
+        // `default_quota`, `proxy_url` and `rate_limiters` were all empty/None before and are
+        // omitted here -- the builder defaults match what we passed.
+        let client = HttpClient::builder()
+            .headers(headers)
+            .timeout_secs(DEFAULT_TIMEOUT_SECS)
+            .build()
+            .map_err(|e| anyhow::anyhow!("failed to build Zerodha HTTP client: {e}"))?;
 
         Ok(Self {
             base_url: base_url.unwrap_or_else(|| ZERODHA_HTTP_URL.to_string()),

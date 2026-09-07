@@ -174,8 +174,13 @@ impl ZerodhaExecutionClientFactory {
 }
 
 impl ExecutionClientFactory for ZerodhaExecutionClientFactory {
+    /// v2.0.0rc4 added `trader_id` to this trait method: upstream's own doc says "the trader ID
+    /// comes from the owning node", so the PARAMETER is authoritative and `self.trader_id` — set
+    /// when the factory was constructed — is not consulted here. They should agree; if they ever
+    /// disagree, the node is right and the factory's copy is stale.
     fn create(
         &self,
+        trader_id: TraderId,
         name: &str,
         config: &dyn ClientConfig,
         cache: CacheView,
@@ -195,10 +200,21 @@ impl ExecutionClientFactory for ZerodhaExecutionClientFactory {
             })?
             .clone();
 
+        // The factory was constructed with its own `trader_id`. It is no longer the value used,
+        // but a disagreement means the factory was built for a different node than the one now
+        // creating clients on it -- worth saying out loud rather than silently preferring one.
+        if trader_id != self.trader_id {
+            log::warn!(
+                "Zerodha execution factory was constructed with trader_id {} but the node supplied \
+                 {trader_id}; using the node's. Check how this factory was registered.",
+                self.trader_id,
+            );
+        }
+
         let client = ZerodhaExecutionClient::new(
             ClientId::from(name),
             self.account_id,
-            self.trader_id,
+            trader_id,
             self.account_type,
             cache,
             zerodha_config,

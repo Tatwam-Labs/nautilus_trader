@@ -15,7 +15,9 @@
 
 //! Python bindings for fee model types.
 
-use nautilus_core::python::{to_pynotimplemented_err, to_pyruntime_err, to_pytype_err};
+use nautilus_core::python::{
+    clone_py_object, to_pynotimplemented_err, to_pyruntime_err, to_pytype_err,
+};
 use nautilus_model::{
     instruments::InstrumentAny,
     orders::OrderAny,
@@ -158,39 +160,15 @@ pub struct PythonFeeModel {
     obj: Py<PyAny>,
 }
 
-impl PythonFeeModel {
-    pub fn new(obj: Py<PyAny>) -> Self {
-        Self { obj }
-    }
-
-    /// The wrapped Python object.
-    ///
-    /// Added for the round-trip getter: `fee_model_any_to_pyobject` hands a Python model back
-    /// as the object it came from. The absence of this accessor is itself a signal — nothing
-    /// previously needed to read a Python model BACK OUT, because only backtest accepted one
-    /// and backtest never returns it.
-    #[must_use]
-    pub const fn obj(&self) -> &Py<PyAny> {
-        &self.obj
+impl Clone for PythonFeeModel {
+    fn clone(&self) -> Self {
+        Self::new(clone_py_object(&self.obj))
     }
 }
 
-// `FeeModelAny` derives `Clone`, so every variant payload must be `Clone`. `Py<T>` is NOT `Clone`
-// in this workspace: pyo3 gates `impl<T> Clone for Py<T>` behind the `py-clone` feature
-// (pyo3-0.29.2 `src/instance.rs:2244`), and `Cargo.toml:204-212` enables hashbrown, indexmap,
-// jiff-02, macros, multiple-pymethods, rust_decimal and serde — not `py-clone`.
-//
-// `clone_ref` is ungated and is the intended idiom: it takes a `Python<'_>` token, so the
-// refcount increment provably happens with the interpreter attached. The derived impl could not
-// do that, which is exactly why upstream gates it — the gated `Clone` *panics* if it is not.
-//
-// `Python::attach` rather than `Python::with_gil`: this tree uses `attach` 858 times and
-// `with_gil` zero times.
-impl Clone for PythonFeeModel {
-    fn clone(&self) -> Self {
-        Python::attach(|py| Self {
-            obj: self.obj.clone_ref(py),
-        })
+impl PythonFeeModel {
+    pub fn new(obj: Py<PyAny>) -> Self {
+        Self { obj }
     }
 }
 
@@ -529,10 +507,8 @@ impl TieredNotionalOptionFeeModel {
 ///
 /// # Errors
 ///
-/// Returns an error if `obj` is not a supported fee model binding.
-// NOTE: this now mirrors `pyobject_to_fee_model_handle`'s fallback, so the SANDBOX path accepts
-// what the BACKTEST path already accepted. The two surfaces differed only by which converter
-// their Python constructor called.
+/// Returns an error if `obj` is neither a supported built-in model nor a Python object with
+/// a `get_commission` method.
 pub fn pyobject_to_fee_model_any(obj: &Bound<'_, PyAny>) -> PyResult<FeeModelAny> {
     if let Ok(m) = obj.extract::<PyRef<'_, FixedFeeModel>>() {
         return Ok(FeeModelAny::Fixed((*m).clone()));
@@ -558,18 +534,15 @@ pub fn pyobject_to_fee_model_any(obj: &Bound<'_, PyAny>) -> PyResult<FeeModelAny
         return Ok(FeeModelAny::TieredNotionalOption((*m).clone()));
     }
 
-    // ⭐ FALLBACK, mirroring pyobject_to_fee_model_handle: duck-typed on `get_commission`, so a
-    // plain Python class works and subclassing FeeModel was never the requirement. THIS ONE CALL
-    // is what made the SANDBOX refuse a model the BACKTEST path already accepted.
-    if obj.hasattr("get_commission")? {
-        return Ok(FeeModelAny::Python(PythonFeeModel::new(
-            obj.clone().unbind(),
+    if !obj.hasattr("get_commission")? {
+        let type_name = obj.get_type().name()?;
+        return Err(to_pytype_err(format!(
+            "Cannot convert {type_name} to FeeModel"
         )));
     }
 
-    let type_name = obj.get_type().name()?;
-    Err(to_pytype_err(format!(
-        "Cannot convert {type_name} to FeeModel"
+    Ok(FeeModelAny::Python(PythonFeeModel::new(
+        obj.clone().unbind(),
     )))
 }
 
@@ -580,20 +553,7 @@ pub fn pyobject_to_fee_model_any(obj: &Bound<'_, PyAny>) -> PyResult<FeeModelAny
 /// Returns an error if `obj` is neither a supported built-in model nor a Python object with
 /// a `get_commission` method.
 pub fn pyobject_to_fee_model_handle(obj: &Bound<'_, PyAny>) -> PyResult<FeeModelHandle> {
-    if let Ok(model) = pyobject_to_fee_model_any(obj) {
-        return Ok(model.into());
-    }
-
-    if !obj.hasattr("get_commission")? {
-        let type_name = obj.get_type().name()?;
-        return Err(to_pytype_err(format!(
-            "Cannot convert {type_name} to FeeModel"
-        )));
-    }
-
-    Ok(FeeModelHandle::new(PythonFeeModel::new(
-        obj.clone().unbind(),
-    )))
+    pyobject_to_fee_model_any(obj).map(Into::into)
 }
 
 fn fee_model_into_py<T>(py: Python<'_>, model: T) -> PyResult<Py<PyAny>>
@@ -616,11 +576,7 @@ pub fn fee_model_any_to_pyobject(py: Python<'_>, model: &FeeModelAny) -> PyResul
         FeeModelAny::ProbabilityPrice(model) => fee_model_into_py(py, model.clone()),
         FeeModelAny::CappedOption(model) => fee_model_into_py(py, model.clone()),
         FeeModelAny::TieredNotionalOption(model) => fee_model_into_py(py, model.clone()),
-        // ⭐ THE RETURN LEG, and the reason this variant is the right shape: a Python model
-        // round-trips by handing BACK the object it came from. An Rc<dyn FeeModel> could not
-        // — opaque, no variant, no downcast — which is why widening the field to a handle
-        // would have broken this getter rather than extended it.
-        FeeModelAny::Python(model) => Ok(model.obj().clone_ref(py)),
+        FeeModelAny::Python(model) => Ok(model.obj.clone_ref(py)),
     }
 }
 
@@ -642,25 +598,7 @@ mod tests {
 
         Python::attach(|py| {
             let expected_commission = Money::from("1.23 USD");
-            let locals = PyDict::new(py);
-            locals
-                .set_item("FeeModel", py.get_type::<PyFeeModel>())
-                .unwrap();
-            let model = py
-                .eval(
-                    c_str!(
-                        "type('CustomFeeModel', (FeeModel,), {\
-                            'get_commission': \
-                                lambda self, order, fill_quantity, fill_px, instrument: self.commission\
-                        })()"
-                    ),
-                    None,
-                    Some(&locals),
-                )
-                .unwrap();
-            model
-                .setattr("commission", expected_commission.into_py_any(py).unwrap())
-                .unwrap();
+            let model = fee_model_with_commission(py, expected_commission);
 
             let handle = pyobject_to_fee_model_handle(&model).unwrap();
             let instrument = InstrumentAny::CurrencyPair(audusd_sim());
@@ -679,6 +617,48 @@ mod tests {
                 .unwrap();
 
             assert_eq!(commission, expected_commission);
+        });
+    }
+
+    #[rstest]
+    fn test_python_fee_model_any_clones_and_retains_python_model() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let expected_commission = Money::from("1.23 USD");
+            let model = fee_model_with_commission(py, expected_commission);
+            let fee_model = pyobject_to_fee_model_any(&model).unwrap();
+            let cloned_fee_model = fee_model.clone();
+            let original = fee_model_any_to_pyobject(py, &fee_model).unwrap();
+            let retained = fee_model_any_to_pyobject(py, &cloned_fee_model).unwrap();
+            let (instrument, order) = commission_inputs();
+            let commission = cloned_fee_model
+                .get_commission(
+                    &order,
+                    Quantity::from(100_000),
+                    Price::from("0.80000"),
+                    &instrument,
+                )
+                .unwrap();
+
+            assert!(original.bind(py).is(&model));
+            assert!(retained.bind(py).is(&model));
+            assert_eq!(commission, expected_commission);
+        });
+    }
+
+    #[rstest]
+    fn test_python_fee_model_any_rejects_object_without_get_commission() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            let model = PyDict::new(py);
+            let error = pyobject_to_fee_model_any(model.as_any()).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                "TypeError: Cannot convert dict to FeeModel"
+            );
         });
     }
 
@@ -826,5 +806,29 @@ mod tests {
             .build();
 
         (instrument, order)
+    }
+
+    fn fee_model_with_commission(py: Python<'_>, commission: Money) -> Bound<'_, PyAny> {
+        let locals = PyDict::new(py);
+        locals
+            .set_item("FeeModel", py.get_type::<PyFeeModel>())
+            .unwrap();
+        let model = py
+            .eval(
+                c_str!(
+                    "type('CustomFeeModel', (FeeModel,), {\
+                        'get_commission': \
+                            lambda self, order, fill_quantity, fill_px, instrument: self.commission\
+                    })()"
+                ),
+                None,
+                Some(&locals),
+            )
+            .unwrap();
+        model
+            .setattr("commission", commission.into_py_any(py).unwrap())
+            .unwrap();
+
+        model
     }
 }
